@@ -1,0 +1,27 @@
+# Default-ignore policy (2026-06-07 user rule): ignore build scaffolding, secrets,
+# and temporary/working files by default. Only files we INTEND to commit are tracked
+# — un-ignore them deliberately. Keep this file current as the build creates new
+# temp artifacts. The user is always the one who commits; the assistant never does.
+
+# Build scaffolding — meta-tooling used to BUILD the package, not the shipped package
+.claude/
+CLAUDE.md
+
+# Dependencies & build output
+node_modules/
+dist/
+
+# Secrets & environment
+.env
+*.secret
+
+# Temporary / working files (debug screenshots, scratch, logs, caches)
+*.log
+*.tmp
+tmp/
+scratch/
+screenshots/
+.cache/
+
+# @playwright/mcp run output (navigation snapshot YAMLs, generated at runtime)
+.playwright-mcp/

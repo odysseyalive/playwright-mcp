@@ -1,0 +1,36 @@
+{
+  "name": "@francis/playwright-mcp",
+  "version": "0.1.0",
+  "description": "User-scoped Playwright MCP server: full @playwright/mcp toolset plus web_search/web_fetch/deep_research tools that replace Claude Code's native WebSearch/WebFetch",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "playwright-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test scripts/test-*.mjs",
+    "gate": "npm run build && npm test && npm run smoke"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@mozilla/readability": "^0.6.0",
+    "@playwright/mcp": "0.0.75",
+    "jsdom": "^29.1.1",
+    "pdfjs-dist": "^6.0.227",
+    "playwright": "1.61.0-alpha-1778188671000"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^28.0.3",
+    "@types/node": "^20.17.9",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
