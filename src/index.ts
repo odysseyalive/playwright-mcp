@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
  * playwright-mcp — user-scoped MCP server wrapping @playwright/mcp (headless)
- * and adding custom tools (web_search, web_fetch, deep_research) that replace
- * Claude Code's native WebSearch/WebFetch.
+ * and adding custom tools (web_fetch + session helpers). web_fetch replaces
+ * Claude Code's native WebFetch; web search/discovery uses the native
+ * server-side WebSearch, verified/cited with web_fetch by the session-side
+ * web-search skill (DEC-2026-06-08-native-websearch-webfetch-doublecheck).
  *
  * Architecture: proxy composition. The official @playwright/mcp server runs
  * in-process behind an InMemoryTransport; we connect to it as a client and
@@ -42,14 +44,15 @@ function buildInstructions(
 ): string {
   const names = new Set([...upstreamTools, ...custom].map((t) => t.name));
   const lines = [
-    'playwright-mcp provides headless Playwright browsing for ALL web work:',
-    'reviewing/debugging local dev servers (localhost) and live sites, screenshots, and web search/fetch.',
+    'playwright-mcp provides headless Playwright browsing for web work:',
+    'reviewing/debugging local dev servers (localhost) and live sites, screenshots, and page fetch/render.',
     '',
   ];
-  if (names.has('web_search') || names.has('web_fetch')) {
+  if (names.has('web_fetch')) {
     lines.push(
-      'REPLACES NATIVE TOOLS: use web_search instead of WebSearch and web_fetch instead of WebFetch.' +
-        (names.has('deep_research') ? ' Use deep_research for multi-level cited research.' : ''),
+      'REPLACES NATIVE WebFetch: use web_fetch to fetch a URL — it stealth-renders JS pages and PDFs and ' +
+        'extracts readable text + author/date/CMS citations. For web SEARCH use the native WebSearch tool, ' +
+        'then verify and cite the top results with web_fetch.',
       '',
     );
   }

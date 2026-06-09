@@ -1,7 +1,11 @@
 /**
  * Custom tool registry — tools added on top of the wrapped @playwright/mcp set.
  *
- * Phase 2 adds: web_search (Google), web_fetch, deep_research.
+ * Tools: web_fetch (stealth render + citations) and the session helpers.
+ * Web search/discovery runs on Claude's native server-side WebSearch, layered
+ * with web_fetch as a double-check by the session-side web-search skill — so the
+ * scraping web_search/deep_research tools were removed
+ * (DEC-2026-06-08-native-websearch-webfetch-doublecheck).
  * Each tool lives in src/tools/<name>.ts and registers itself here.
  */
 
@@ -15,13 +19,9 @@ interface CustomTool {
 }
 
 import { webFetch } from './tools/web-fetch.js';
-import { webSearch } from './tools/web-search.js';
-import { deepResearch } from './tools/deep-research.js';
 import { sessionLoginTool, sessionStatusTool } from './tools/session.js';
 
-// Built bottom-up: web_fetch → web_search → deep_research → session. The upper
-// layers call fetchUrl()/runSearch() in-process so the shared budget stays honest.
-const registry: CustomTool[] = [webFetch, webSearch, deepResearch, sessionLoginTool, sessionStatusTool];
+const registry: CustomTool[] = [webFetch, sessionLoginTool, sessionStatusTool];
 
 export const customTools: Tool[] = registry.map((t) => t.definition);
 

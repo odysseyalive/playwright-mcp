@@ -1,11 +1,11 @@
 /**
- * web-fetch.ts — the BOTTOM layer of the web stack. Stealth-renders a URL (HTML
- * or PDF) and returns readable text + CSL-JSON citation + page-health + CMS, and
- * (on request) outbound links + the reference section. Replaces native WebFetch.
+ * web-fetch.ts — stealth-renders a URL (HTML or PDF) and returns readable text +
+ * CSL-JSON citation + page-health + CMS, and (on request) outbound links + the
+ * reference section. Replaces native WebFetch.
  *
- * Owns all rendering and extraction; web_search and deep_research call fetchUrl()
- * IN-PROCESS (not over MCP) so the shared Budget is honest and citations flow up
- * for free. The MCP tool (webFetch) is a thin wrapper over fetchUrl().
+ * Owns all rendering and extraction. The session-side web-search skill drives it
+ * over MCP to verify/cite the top native-WebSearch results (links mode harvests
+ * leads for research). The MCP tool (webFetch) is a thin wrapper over fetchUrl().
  *
  * Spec: /web-fetch-method. Extraction internals live in src/extract.ts.
  */
@@ -14,7 +14,6 @@ import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { getStealthContext, pace } from '../browser.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
-import { Budget } from '../budget.js';
 import {
   classifyHealth,
   extractReadable,
@@ -49,7 +48,6 @@ export interface FetchOptions {
   url: string;
   links?: boolean;
   quality?: 'fast' | 'research';
-  budget?: Budget;
 }
 
 /**
@@ -61,11 +59,6 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   const cacheKey = `${url}|links=${opts.links ? 1 : 0}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
-
-  if (opts.budget && !opts.budget.canFetch()) {
-    return errorResult(url, 'blocked', 'fetch budget exhausted');
-  }
-  opts.budget?.spendFetch();
 
   const context = await getStealthContext();
   const page = await context.newPage();

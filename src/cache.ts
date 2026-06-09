@@ -1,10 +1,9 @@
 /**
- * cache.ts — short-TTL in-memory cache for SERP pages and fetched documents.
+ * cache.ts — short-TTL in-memory cache for fetched documents.
  *
- * Politeness + speed: a deep_research run re-fetches the same URL or re-issues
- * the same query across levels; this collapses those to one hit. Process-local,
- * not persisted — a fresh server starts cold. Keyed by canonical URL (fetches)
- * or normalized query+engine (SERPs).
+ * Politeness + speed: re-fetching the same URL collapses to one hit.
+ * Process-local, not persisted — a fresh server starts cold. Keyed by canonical
+ * URL.
  *
  * `now` is injected on every read/write so tests are deterministic without
  * touching the real clock.
@@ -84,9 +83,4 @@ export function canonicalUrl(raw: string): string {
     u.pathname = u.pathname.slice(0, -1);
   }
   return u.toString();
-}
-
-/** Normalize a query string for SERP cache keys (engine-scoped). */
-export function queryKey(engine: string, query: string): string {
-  return `${engine}:${query.trim().toLowerCase().replace(/\s+/g, ' ')}`;
 }

@@ -1,14 +1,13 @@
 /**
- * browser.ts — the shared STEALTH Chromium context for web_search and web_fetch.
+ * browser.ts — the shared STEALTH Chromium context for web_fetch.
  *
  * Separate from the wrapped @playwright/mcp browser (that one drives debugging;
- * this one is disguised to pass as a real person while scraping engines/pages).
- * One persistent lifecycle reused across both web tools — launch once, reuse.
+ * this one is disguised to pass as a real person while fetching/rendering pages).
+ * One persistent lifecycle — launch once, reuse.
  *
- * Stealth layer applied in the order from /web-search-method § Stealth. Manual
- * only — NO playwright-extra/stealth plugin (it wraps Playwright and is a
- * dedupe/compat hazard against the exact-pinned playwright version). WebGL/canvas
- * spoofing is escalation-only and intentionally absent here.
+ * Stealth layer is manual only — NO playwright-extra/stealth plugin (it wraps
+ * Playwright and is a dedupe/compat hazard against the exact-pinned playwright
+ * version). WebGL/canvas spoofing is escalation-only and intentionally absent.
  *
  * IMPORTANT: never log to stdout (MCP stdio stream). Use stderr.
  */
