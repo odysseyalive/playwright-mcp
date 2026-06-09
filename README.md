@@ -12,7 +12,7 @@ Claude's built-in WebFetch returns page text. That's it. When this server takes 
 
 The other thing the built-in can't do is render. Single-page apps, JavaScript-heavy dashboards, pages behind consent walls. `web_fetch` runs a real headless Chromium with a stealth context, so it sees what a person would see.
 
-This server has nothing to do with web search. Claude runs its own native WebSearch on Anthropic's infrastructure, gets back a list of URLs, and then calls `web_fetch` to actually visit the ones worth reading. The server only handles that last part. The `/web-search` skill that ships with this project is just a set of instructions that tells Claude to follow up its search results with `web_fetch` visits, so the citations and page-health data are there when it summarizes. The `/research-paper` skill takes that further and turns it into a verified 1300 to 1500 word cited paper with a four-agent team.
+This server has nothing to do with web search. Claude runs its own native WebSearch on Anthropic's infrastructure. The optional steering directive the installer adds to `~/.claude/CLAUDE.md` tells Claude to follow up its search results by visiting the top URLs with `web_fetch`, so the citations and page-health data are there when it summarizes. The server only handles that page-visit part. Claude does the searching.
 
 ### The tools
 

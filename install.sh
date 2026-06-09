@@ -4,8 +4,8 @@
 #
 # Builds the server, downloads headless Chromium, registers the server at USER
 # scope with Claude Code (so every project gets it), and offers the
-# WebSearch/WebFetch/claude-in-chrome override (prompted, with a diff — never
-# silent). Idempotent: safe to re-run.
+# WebFetch/claude-in-chrome override (prompted, with a diff — never silent).
+# Native WebSearch stays enabled. Idempotent: safe to re-run.
 #
 # Flags:
 #   --yes        non-interactive: accept the settings + steering changes
@@ -75,10 +75,10 @@ else
   echo "    claude mcp add --scope user playwright-mcp -- node \"$HERE/dist/index.js\""
 fi
 
-# ── 5. Override native WebSearch/WebFetch + claude-in-chrome ──────────────────
+# ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────
 SETTINGS="$HOME/.claude/settings.json"
 if [ "$DO_DENY" = "1" ]; then
-  say "Preparing WebSearch/WebFetch/claude-in-chrome override for $SETTINGS"
+  say "Preparing WebFetch/claude-in-chrome override for $SETTINGS"
   mkdir -p "$HOME/.claude"
   [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
   # Compute the merged result and a diff with Node (guaranteed present).
@@ -91,10 +91,10 @@ if [ "$DO_DENY" = "1" ]; then
     echo "--------------------------------------------"
     if confirm "Apply these deny rules (merge, your other settings untouched)?"; then
       node "$HERE/scripts/merge-deny.mjs" "$SETTINGS" --write
-      say "Applied. Native WebSearch/WebFetch + claude-in-chrome are now denied."
+      say "Applied. WebFetch + claude-in-chrome are now denied; native WebSearch stays enabled."
     else
-      warn "Skipped. Web access will NOT route through playwright-mcp until you add:"
-      echo '    "permissions": { "deny": ["WebSearch","WebFetch","mcp__claude-in-chrome"] }'
+      warn "Skipped. Page fetches will NOT route through playwright-mcp until you add:"
+      echo '    "permissions": { "deny": ["WebFetch","mcp__claude-in-chrome"] }'
     fi
   fi
 fi
@@ -110,10 +110,13 @@ if [ "$DO_STEER" = "1" ]; then
     cat >> "$USER_CLAUDE_MD" <<'EOF'
 
 <!-- playwright-mcp steering -->
-Use playwright-mcp for ALL browser work: reviewing and debugging local dev
-servers (localhost/127.0.0.1) and live sites, screenshots, and web search/fetch.
-Use its web_search/web_fetch instead of the built-in WebSearch/WebFetch, and its
-browser_* tools instead of the claude-in-chrome extension. Clean up temporary
+Use playwright-mcp for browser work: reviewing and debugging local dev servers
+(localhost/127.0.0.1) and live sites, screenshots, and fetching/rendering pages.
+For web SEARCH, use the native WebSearch tool for discovery, then verify and cite
+the top results with playwright-mcp's web_fetch — or just run the /web-search
+skill, which does that discover→verify pass for you. Use web_fetch instead of the
+built-in WebFetch, and playwright-mcp's browser_* tools instead of the
+claude-in-chrome extension. Do NOT scrape search engines. Clean up temporary
 screenshots and files at the end of every debug session.
 EOF
     say "Added steering directive."

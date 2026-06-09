@@ -1,8 +1,8 @@
 # install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
 # Builds the server, downloads headless Chromium, registers it at USER scope with
-# Claude Code, and offers the WebSearch/WebFetch/claude-in-chrome override
-# (prompted, with a diff — never silent). Idempotent: safe to re-run.
+# Claude Code, and offers the WebFetch/claude-in-chrome override (prompted,
+# with a diff — never silent). Native WebSearch stays enabled. Idempotent: safe to re-run.
 #
 #   .\install.ps1            interactive
 #   .\install.ps1 -Yes       accept settings + steering changes
@@ -63,10 +63,10 @@ if ($hasClaude) {
   Write-Host "    claude mcp add --scope user playwright-mcp -- node `"$entry`""
 }
 
-# ── 5. Override native WebSearch/WebFetch + claude-in-chrome ──────────────────
+# ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────
 $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
 if (-not $NoDeny) {
-  Say "Preparing WebSearch/WebFetch/claude-in-chrome override for $settings"
+  Say "Preparing WebFetch/claude-in-chrome override for $settings"
   New-Item -ItemType Directory -Force -Path (Split-Path $settings) | Out-Null
   if (-not (Test-Path $settings)) { '{}' | Set-Content -Encoding utf8 $settings }
   $preview = node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --print
@@ -78,10 +78,10 @@ if (-not $NoDeny) {
     Write-Host "--------------------------------------------"
     if (Confirm "Apply these deny rules (merge, your other settings untouched)?") {
       node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --write
-      Say "Applied. Native WebSearch/WebFetch + claude-in-chrome are now denied."
+      Say "Applied. WebFetch + claude-in-chrome are now denied; native WebSearch stays enabled."
     } else {
-      Warn "Skipped. Web access will NOT route through playwright-mcp until you add:"
-      Write-Host '    "permissions": { "deny": ["WebSearch","WebFetch","mcp__claude-in-chrome"] }'
+      Warn "Skipped. Page fetches will NOT route through playwright-mcp until you add:"
+      Write-Host '    "permissions": { "deny": ["WebFetch","mcp__claude-in-chrome"] }'
     }
   }
 }
@@ -96,10 +96,13 @@ if (-not $NoSteer) {
     $steer = @'
 
 <!-- playwright-mcp steering -->
-Use playwright-mcp for ALL browser work: reviewing and debugging local dev
-servers (localhost/127.0.0.1) and live sites, screenshots, and web search/fetch.
-Use its web_search/web_fetch instead of the built-in WebSearch/WebFetch, and its
-browser_* tools instead of the claude-in-chrome extension. Clean up temporary
+Use playwright-mcp for browser work: reviewing and debugging local dev servers
+(localhost/127.0.0.1) and live sites, screenshots, and fetching/rendering pages.
+For web SEARCH, use the native WebSearch tool for discovery, then verify and cite
+the top results with playwright-mcp's web_fetch — or just run the /web-search
+skill, which does that discover→verify pass for you. Use web_fetch instead of the
+built-in WebFetch, and playwright-mcp's browser_* tools instead of the
+claude-in-chrome extension. Do NOT scrape search engines. Clean up temporary
 screenshots and files at the end of every debug session.
 '@
     Add-Content -Path $userClaudeMd -Value $steer
