@@ -1,16 +1,18 @@
 # install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
-# Builds the server, downloads headless Chromium, registers it at USER scope with
-# Claude Code, and offers the WebFetch/claude-in-chrome override (prompted,
-# with a diff — never silent). Native WebSearch stays enabled. Idempotent: safe to re-run.
+# Builds the server, downloads Chromium, registers it at USER scope with Claude
+# Code, and applies the WebFetch/claude-in-chrome override automatically, printing
+# a diff of what it changes. Native WebSearch stays enabled. Idempotent +
+# non-interactive: safe to re-run, never prompts. Opt out of the global-config
+# edits with -NoDeny / -NoSteer.
 #
-#   .\install.ps1            interactive
-#   .\install.ps1 -Yes       accept settings + steering changes
+#   .\install.ps1            run (non-interactive)
 #   .\install.ps1 -NoDeny    skip the settings.json deny override
 #   .\install.ps1 -NoSteer   skip the CLAUDE.md steering directive
+#   .\install.ps1 -Yes       accepted but no longer needed (back-compat no-op)
 #
 param(
-  [switch]$Yes,
+  [switch]$Yes,     # back-compat no-op: the installer no longer prompts
   [switch]$NoDeny,
   [switch]$NoSteer
 )
@@ -20,11 +22,6 @@ $Here = $PSScriptRoot
 function Say  ($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn ($m) { Write-Host "!   $m" -ForegroundColor Yellow }
 function Die  ($m) { Write-Host "ERR $m" -ForegroundColor Red; exit 1 }
-function Confirm ($q) {
-  if ($Yes) { return $true }
-  $r = Read-Host "$q [y/N]"
-  return ($r -match '^(y|yes)$')
-}
 
 # ── 1. Node >= 18 ─────────────────────────────────────────────────────────────
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node.js is required (>=18)." }
@@ -44,7 +41,10 @@ try {
   npm run build
   if ($LASTEXITCODE -ne 0) { Die "build failed" }
 
-  # ── 3. Download headless Chromium ───────────────────────────────────────────
+  # ── 3. Download Chromium ────────────────────────────────────────────────────
+  # Browser binary only, from Playwright's CDN into %LOCALAPPDATA%\ms-playwright.
+  # No OS package manager, no admin — Windows needs no system-dep step at all
+  # (the apt-only --with-deps flag is a Linux-CI concern and never applies here).
   Say "Downloading Chromium…"
   npx playwright install chromium
 } finally {
@@ -66,23 +66,18 @@ if ($hasClaude) {
 # ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────
 $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
 if (-not $NoDeny) {
-  Say "Preparing WebFetch/claude-in-chrome override for $settings"
+  Say "Applying WebFetch/claude-in-chrome override for $settings"
   New-Item -ItemType Directory -Force -Path (Split-Path $settings) | Out-Null
   if (-not (Test-Path $settings)) { '{}' | Set-Content -Encoding utf8 $settings }
   $preview = node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --print
   if (-not $preview) {
     Say "Deny rules already present — nothing to change."
   } else {
-    Write-Host "----- proposed change to settings.json -----"
+    Write-Host "----- applying this change to settings.json (your other settings untouched) -----"
     Write-Host $preview
-    Write-Host "--------------------------------------------"
-    if (Confirm "Apply these deny rules (merge, your other settings untouched)?") {
-      node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --write
-      Say "Applied. WebFetch + claude-in-chrome are now denied; native WebSearch stays enabled."
-    } else {
-      Warn "Skipped. Page fetches will NOT route through playwright-mcp until you add:"
-      Write-Host '    "permissions": { "deny": ["WebFetch","mcp__claude-in-chrome"] }'
-    }
+    Write-Host "---------------------------------------------------------------------------------"
+    node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --write
+    Say "Applied. WebFetch + claude-in-chrome are now denied; native WebSearch stays enabled."
   }
 }
 
@@ -92,7 +87,8 @@ if (-not $NoSteer) {
   $hasMark = (Test-Path $userClaudeMd) -and (Select-String -Quiet -Path $userClaudeMd -Pattern "playwright-mcp steering")
   if ($hasMark) {
     Say "Steering directive already present in $userClaudeMd"
-  } elseif (Confirm "Add the playwright-mcp steering directive to $userClaudeMd?") {
+  } else {
+    Say "Adding the playwright-mcp steering directive to $userClaudeMd"
     $steer = @'
 
 <!-- playwright-mcp steering -->
@@ -107,8 +103,6 @@ screenshots and files at the end of every debug session.
 '@
     Add-Content -Path $userClaudeMd -Value $steer
     Say "Added steering directive."
-  } else {
-    Warn "Skipped steering directive."
   }
 }
 
