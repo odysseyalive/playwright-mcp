@@ -158,7 +158,9 @@ const loginDefinition: Tool = {
   description:
     'Log into a site once and save the authenticated session (cookies + storage) to a named file ' +
     'for reuse in debugging and generated Playwright tests. Use headed:true for 2FA/SSO. ' +
-    'Credentials come from secrets.env (never embedded); tokens are never echoed back.',
+    'Credentials come from secrets.env (never embedded); tokens are never echoed back. ' +
+    'To freeze a flow as a deterministic test suite that reuses this session, call the ' +
+    'session_scaffold_tests tool.',
   inputSchema: {
     type: 'object',
     properties: {

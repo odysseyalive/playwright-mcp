@@ -1,25 +1,28 @@
 # playwright-mcp
 
-One install, and every Claude Code project gets a real headless browser. Page fetching with citations already attached, site debugging with persistent logins, and the full Playwright toolset underneath. Set it up once at user scope instead of wiring it into every project.
+One install, every Claude Code project gets a real browser. Page fetching with citations already attached, site debugging with persistent logins, and the full Playwright toolset underneath. Wire it up once at user scope and stop thinking about it.
 
 ## What it is
 
-An MCP server that wraps the official `@playwright/mcp` browser tools and adds three of its own. The installer denies Claude's built-in WebFetch and the claude-in-chrome extension, which leaves `web_fetch` as the only page-fetching path Claude has. Every time Claude fetches a page, the extra features come along for free.
+An MCP server that wraps `@playwright/mcp` and adds four tools of its own. The installer denies Claude's built-in WebFetch and the claude-in-chrome extension, so `web_fetch` becomes the only page-fetching path Claude has. The extra features just come along for free.
 
 ### How it layers in
 
-Claude's built-in WebFetch returns page text. That's it. When this server takes over that job, every fetch also comes back with structured citation metadata (author, date, publisher in CSL-JSON), a page-health classification (paywall, soft-404, parked, login-wall, blocked), and CMS detection. Claude doesn't have to ask for any of that. It's in every response, so when Claude summarizes a page or pulls a quote, the citation data is already sitting right there.
+Claude's built-in WebFetch returns page text. That's it.
+
+When this server takes over that job, every fetch also comes back with structured citation metadata (author, date, publisher in CSL-JSON), a page-health classification (paywall, soft-404, parked, login-wall, blocked), and CMS detection. Claude doesn't ask for any of that. It's already sitting there when Claude summarizes a page or pulls a quote.
 
 The other thing the built-in can't do is render. Single-page apps, JavaScript-heavy dashboards, pages behind consent walls. `web_fetch` runs a real headless Chromium with a stealth context, so it sees what a person would see.
 
-This server has nothing to do with web search. Claude runs its own native WebSearch on Anthropic's infrastructure. The optional steering directive the installer adds to `~/.claude/CLAUDE.md` tells Claude to follow up its search results by visiting the top URLs with `web_fetch`, so the citations and page-health data are there when it summarizes. The server only handles that page-visit part. Claude does the searching.
+This server has nothing to do with web search. Claude runs its own native WebSearch on Anthropic's infrastructure. The optional steering directive the installer adds to `~/.claude/CLAUDE.md` just tells Claude to follow up search results by visiting the top URLs with `web_fetch`, so the citations and page-health data are there when it summarizes. The server handles that page-visit part. Claude does the searching.
 
 ### The tools
 
-Twenty-six total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The three custom ones:
+Twenty-seven total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The four custom ones:
 
 - **`web_fetch`** stealth-renders a URL (HTML or PDF), returns readable text plus the citation and health data described above.
 - **`session_login`** and **`session_status`** handle authenticated debugging across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. Headed mode handles 2FA and SSO when you need it.
+- **`session_scaffold_tests`** generates a deterministic Playwright E2E test suite into any project, wired to reuse a session captured by `session_login`. No model in the loop. Just `npx playwright test`.
 
 ## Requirements
 
@@ -29,7 +32,7 @@ Twenty-six total. Twenty-three are the wrapped `browser_*` set (navigate, snapsh
 
 ## Install
 
-The bundled installer handles the whole thing. Checks Node, installs dependencies, builds, downloads Chromium, registers the server at user scope. Before it touches anything global it shows you a diff and asks first.
+The bundled installer handles the whole thing. Checks Node, installs dependencies, builds, downloads Chromium, registers the server at user scope. It prints a diff of what it changes to global config so you can see exactly what happened.
 
 **Linux / macOS**
 
@@ -43,7 +46,7 @@ The bundled installer handles the whole thing. Checks Node, installs dependencie
 .\install.ps1
 ```
 
-It prompts before adding deny rules to `~/.claude/settings.json` that route page fetches and browser work through this server (`WebFetch` and `mcp__claude-in-chrome`). Native WebSearch stays enabled. If you're upgrading from an earlier version that denied WebSearch, the installer removes that deny rule for you. It also offers an optional steering note in `~/.claude/CLAUDE.md`. Skip either with `--no-deny` / `--no-steer` (PowerShell: `-NoDeny` / `-NoSteer`), or accept everything unattended with `--yes` (`-Yes`).
+The installer adds deny rules to `~/.claude/settings.json` that route page fetches and browser work through this server (`WebFetch` and `mcp__claude-in-chrome`). Native WebSearch stays enabled. If you're upgrading from an earlier version that denied WebSearch, the installer removes that stale deny rule for you. It also adds an optional steering note in `~/.claude/CLAUDE.md`. Skip either with `--no-deny` / `--no-steer` (PowerShell: `-NoDeny` / `-NoSteer`).
 
 ### Registering by hand
 
@@ -68,7 +71,7 @@ Restart Claude Code, run `/mcp` in any project, and look for the `mcp__playwrigh
 npm run smoke
 ```
 
-The full deterministic gate (build, 17 tests, then the smoke test) is one command.
+The full deterministic gate (build, tests, smoke) is one command.
 
 ```bash
 npm run gate
@@ -77,6 +80,24 @@ npm run gate
 ## Configuration
 
 Credentials for `session_login` live outside the repo in `~/.config/playwright-mcp/secrets.env`, mode 600 and gitignored. See `.env.example` for the format, and set `PLAYWRIGHT_MCP_SECRETS` if you want the file somewhere else.
+
+## Authenticated end-to-end tests
+
+The session you capture with `session_login` isn't just for interactive debugging. That same mode-600 storageState file can drive deterministic `npx playwright test` suites in any project, too. An agent drives the browser tools to discover a flow, then you freeze the known-good path as a `.spec.ts` that a runner replays with no model in the loop.
+
+Scaffold one without leaving your project. Ask Claude to call `session_scaffold_tests` (it's right there in the tool list), and it writes a `playwright.config.ts`, a freshness-guard setup project, an example spec, and a README into the target directory. No session data, just the wiring.
+
+```text
+session_scaffold_tests({ session: "<name>", outDir: "/path/to/your/project" })
+```
+
+There's a CLI front door over the same generator, too.
+
+```bash
+npm run scaffold:e2e -- --session <name> --out /path/to/your/project
+```
+
+The generated config resolves the storageState from the same path `session_login` writes to. It honors `PLAYWRIGHT_MCP_SESSIONS`, then `XDG_CONFIG_HOME` or `APPDATA`, so it works on any machine without a hard-coded home directory. The setup project never logs in. It guards that the captured session is present and fresh, and points you back to `session_login` (headed for 2FA) if it isn't. For CI, where the gitignored session file won't exist, point `STORAGE_STATE` at a file the job materializes from a masked secret. The generated `README.md` has the details.
 
 ## License
 

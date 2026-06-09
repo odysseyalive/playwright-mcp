@@ -21,7 +21,7 @@ console.log(instructionsOk ? 'instructions: capability map present (+ replaces-n
 
 const { tools } = await client.listTools();
 const names = new Set(tools.map((t) => t.name));
-const expectedCustom = ['web_fetch', 'session_login', 'session_status'];
+const expectedCustom = ['web_fetch', 'session_login', 'session_status', 'session_scaffold_tests'];
 const removed = ['web_search', 'deep_research'];
 const missing = expectedCustom.filter((n) => !names.has(n));
 const resurrected = removed.filter((n) => names.has(n));

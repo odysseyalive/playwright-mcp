@@ -59,6 +59,15 @@ function buildInstructions(
   lines.push(
     'Browse/debug workflow: browser_navigate → browser_snapshot (accessibility tree; prefer over screenshots) → interact by ref (browser_click, browser_type, …) → verify.',
     'Debugging: browser_console_messages, browser_network_requests. Screenshots: browser_take_screenshot.',
+  );
+  if (names.has('session_scaffold_tests')) {
+    lines.push(
+      '',
+      'AUTHENTICATED E2E TESTS: capture a login once with session_login, then call session_scaffold_tests to ' +
+        'generate a deterministic Playwright suite (setup-project + dependencies) that reuses it — no model in the loop.',
+    );
+  }
+  lines.push(
     '',
     `All tools (${names.size}): ${[...names].sort().join(', ')}`,
   );

@@ -20,8 +20,14 @@ interface CustomTool {
 
 import { webFetch } from './tools/web-fetch.js';
 import { sessionLoginTool, sessionStatusTool } from './tools/session.js';
+import { sessionScaffoldTool } from './tools/scaffold.js';
 
-const registry: CustomTool[] = [webFetch, sessionLoginTool, sessionStatusTool];
+const registry: CustomTool[] = [
+  webFetch,
+  sessionLoginTool,
+  sessionStatusTool,
+  sessionScaffoldTool,
+];
 
 export const customTools: Tool[] = registry.map((t) => t.definition);
 
