@@ -23,8 +23,11 @@ RUN npm ci
 
 # 2) Chromium + its system libraries (apt via --with-deps needs root; we are root
 #    at build time). Make the browser dir readable by the unprivileged runtime user.
+# Chromium + its system libraries. Make the browser dir writable by the non-root
+# runtime user — Playwright creates lock/registry dirs under it at launch (mkdir
+# there fails with EACCES otherwise). Same RUN layer, so no image-size duplication.
 RUN npx playwright install --with-deps chromium \
- && chmod -R a+rX /ms-playwright
+ && chmod -R a+rwX /ms-playwright
 
 # 3) Build the TypeScript (.dockerignore keeps host node_modules/dist out, so this
 #    compiles against the clean tree from step 1).
