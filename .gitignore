@@ -22,7 +22,6 @@ tmp/
 scratch/
 screenshots/
 .cache/
-package-lock.json
 
 # @playwright/mcp run output (navigation snapshot YAMLs, generated at runtime)
 .playwright-mcp/

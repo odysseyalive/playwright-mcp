@@ -97,8 +97,14 @@ export function startRemoteServer(opts: RemoteServerOptions): RemoteHandle {
   app.get('/mcp', ...guards, handleSession);
   app.delete('/mcp', ...guards, handleSession);
 
-  const httpServer: http.Server = app.listen(port, '127.0.0.1', () => {
-    log(`ready on http://127.0.0.1:${port}/mcp (public: ${publicUrl}, auth: ${requireAuth ? 'on' : 'OFF'})`);
+  // Bind 127.0.0.1 by default (bare-metal: nginx shares the host loopback). In a
+  // container the public reverse proxy is a *separate* container that reaches this
+  // one by name over the docker network, so set PLAYWRIGHT_MCP_BIND=0.0.0.0 there.
+  // The container boundary + the OAuth gate + nginx are the access controls; the
+  // process is never published to a host port directly.
+  const bindHost = process.env.PLAYWRIGHT_MCP_BIND || '127.0.0.1';
+  const httpServer: http.Server = app.listen(port, bindHost, () => {
+    log(`ready on http://${bindHost}:${port}/mcp (public: ${publicUrl}, auth: ${requireAuth ? 'on' : 'OFF'})`);
   });
 
   return {

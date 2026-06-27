@@ -1,0 +1,13 @@
+# Keep host build artifacts and secrets out of the image build context.
+node_modules
+dist
+.git
+.gitignore
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
+templates/e2e/node_modules
+scratchpad
+.DS_Store
