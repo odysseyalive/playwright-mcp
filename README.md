@@ -99,6 +99,14 @@ npm run scaffold:e2e -- --session <name> --out /path/to/your/project
 
 The generated config resolves the storageState from the same path `session_login` writes to. It honors `PLAYWRIGHT_MCP_SESSIONS`, then `XDG_CONFIG_HOME` or `APPDATA`, so it works on any machine without a hard-coded home directory. The setup project never logs in. It guards that the captured session is present and fresh, and points you back to `session_login` (headed for 2FA) if it isn't. For CI, where the gitignored session file won't exist, point `STORAGE_STATE` at a file the job materializes from a masked secret. The generated `README.md` has the details.
 
+## Remote connector for claude.ai
+
+Everything above is the local setup. The server runs over stdio for Claude Code on your own machine, and that's the default. Nothing changes unless you turn this on.
+
+Set `PLAYWRIGHT_MCP_PUBLIC_URL` and the same server also exposes a remote Streamable-HTTP transport, so claude.ai can use it as a custom connector. The draw is the same reason the rest of this exists. claude.ai's built-in fetch just reads text. This one renders JavaScript and actually interacts with the page.
+
+The remote side is a separate, hardened deployment, not something you run on your laptop. The tools that run code or touch credentials are stripped from what claude.ai can reach. GitHub OAuth locks it to a single login. The instance itself runs with no secrets on it at all. It needs nginx, TLS, and a firewall, so the full walkthrough lives in its own runbook, [docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md).
+
 ## License
 
 MIT
