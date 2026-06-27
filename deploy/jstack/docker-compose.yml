@@ -1,0 +1,39 @@
+# playwright-mcp remote connector for claude.ai — jstack site.
+#
+# Deploy (no database; the env vars just skip jstack's MariaDB prompt):
+#   DBUSER=unused DBPASS=unused ./jstack.sh --install-site sites/<your-domain>
+#
+# All site-specific values live in ./.env (see .env.example). jstack reads
+# DOMAIN / PORT / CONTAINER from it and points nginx at http://${CONTAINER}:${PORT}
+# over the jstack_default network. The port is deliberately NOT host-published —
+# only the jstack nginx container (same network) can reach it.
+name: ${CONTAINER:-connector}
+
+services:
+  connector:
+    # Must equal CONTAINER in .env so nginx's proxy_pass http://${CONTAINER}:${PORT} resolves.
+    container_name: ${CONTAINER:-connector}
+    build:
+      # The connector source lives in the sibling playwright-mcp checkout.
+      context: ../../../playwright-mcp
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    networks:
+      - jstack_default
+    # A prompt-injectable cloud LLM drives the browser in here. Keep Chromium's
+    # renderer sandbox ON (it needs user-namespace syscalls that Docker's default
+    # seccomp blocks, so seccomp is relaxed) but drop ALL Linux capabilities so the
+    # dangerous escape syscalls are useless anyway. Non-root, no privilege escalation.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    cap_drop:
+      - ALL
+    # Chromium crashes with the default 64M /dev/shm; give it room.
+    shm_size: "1gb"
+
+networks:
+  jstack_default:
+    external: true
