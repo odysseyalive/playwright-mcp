@@ -13,6 +13,7 @@
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { getStealthContext, pace } from '../browser.js';
+import { egressRestricted, assertEgressAllowed, installEgressGuard } from '../egress.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
 import {
   classifyHealth,
@@ -60,8 +61,18 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
+  // Remote (claude.ai) instance: refuse SSRF to metadata/localhost/private nets.
+  if (egressRestricted()) {
+    try {
+      await assertEgressAllowed(url);
+    } catch (err) {
+      return errorResult(url, 'blocked', err instanceof Error ? err.message : String(err), opts.links);
+    }
+  }
+
   const context = await getStealthContext();
   const page = await context.newPage();
+  if (egressRestricted()) await installEgressGuard(page);
   try {
     await pace();
     const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: FETCH_TIMEOUT_MS });

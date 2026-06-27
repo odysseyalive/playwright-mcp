@@ -1,7 +1,7 @@
 {
   "name": "@francis/playwright-mcp",
   "version": "0.1.0",
-  "description": "User-scoped Playwright MCP server: full @playwright/mcp toolset plus web_search/web_fetch/deep_research tools that replace Claude Code's native WebSearch/WebFetch",
+  "description": "User-scoped Playwright MCP server: full @playwright/mcp toolset plus web_fetch (replaces native WebFetch) and session helpers, over stdio; optionally exposes a hardened, GitHub-OAuth'd remote Streamable-HTTP transport for claude.ai custom connectors",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
@@ -21,11 +21,13 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
     "@playwright/mcp": "0.0.75",
+    "express": "^5.2.1",
     "jsdom": "^29.1.1",
     "pdfjs-dist": "^6.0.227",
     "playwright": "1.61.0-alpha-1778188671000"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/jsdom": "^28.0.3",
     "@types/node": "^20.17.9",
     "tsx": "^4.19.2",
