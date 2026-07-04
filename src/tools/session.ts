@@ -33,7 +33,8 @@ export interface LoginOptions {
   loginUrl: string;
   successSignal: string; // selector or substring of the post-login URL
   headed?: boolean; // required for 2FA / SSO / hardware keys
-  credKeys?: { user: string; pass: string }; // names of secrets.env keys
+  credKeys?: { user: string; pass: string }; // dotenv key names (project .env / secrets.env)
+  envFile?: string; // explicit dotenv file for credKeys (default: ./.env in cwd, then secrets.env)
   selectors?: { user?: string; pass?: string; submit?: string };
 }
 
@@ -68,9 +69,13 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       await waitForSuccess(page, opts.successSignal, 300_000);
     } else {
       const sel = { ...DEFAULT_SELECTORS, ...opts.selectors };
-      const user = opts.credKeys ? getSecret(opts.credKeys.user) : undefined;
-      const pass = opts.credKeys ? getSecret(opts.credKeys.pass) : undefined;
-      if (!user || !pass) throw new Error('missing credentials in secrets.env (set credKeys)');
+      const lookup = { envFile: opts.envFile };
+      const user = opts.credKeys ? getSecret(opts.credKeys.user, lookup) : undefined;
+      const pass = opts.credKeys ? getSecret(opts.credKeys.pass, lookup) : undefined;
+      if (!user || !pass)
+        throw new Error(
+          'missing credentials — credKeys not found in the project .env, secrets.env, or process.env (set credKeys / envFile)',
+        );
       await page.fill(sel.user, user);
       await page.fill(sel.pass, pass);
       await Promise.all([
@@ -121,7 +126,7 @@ export interface StatusOptions {
 
 export interface StatusResult {
   name: string;
-  state: 'fresh' | 'stale' | 'missing';
+  state: 'fresh' | 'stale' | 'missing' | 'unreachable';
   checkedAt: string;
 }
 
@@ -130,12 +135,25 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
   const checkedAt = new Date().toISOString();
   if (!fs.existsSync(file)) return { name: opts.name, state: 'missing', checkedAt };
 
+  // A corrupt artifact needs a recapture, exactly like an expired one → stale.
+  try {
+    JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return { name: opts.name, state: 'stale', checkedAt };
+  }
+
   let browser: Browser | undefined;
   try {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ storageState: file, ignoreHTTPSErrors: true });
     const page = await context.newPage();
-    await page.goto(opts.probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    try {
+      await page.goto(opts.probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    } catch {
+      // The probe never completed (app down, DNS/network failure) — that says
+      // nothing about the session itself. Never report it as expired.
+      return { name: opts.name, state: 'unreachable', checkedAt };
+    }
 
     const url = page.url();
     let stale = /\/(login|signin|sign-in|auth)(\b|\/|\?)/i.test(url);
@@ -145,7 +163,8 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
     }
     return { name: opts.name, state: stale ? 'stale' : 'fresh', checkedAt };
   } catch {
-    return { name: opts.name, state: 'stale', checkedAt };
+    // Browser/context failure — environmental, not a session verdict.
+    return { name: opts.name, state: 'unreachable', checkedAt };
   } finally {
     await browser?.close().catch(() => {});
   }
@@ -158,7 +177,8 @@ const loginDefinition: Tool = {
   description:
     'Log into a site once and save the authenticated session (cookies + storage) to a named file ' +
     'for reuse in debugging and generated Playwright tests. Use headed:true for 2FA/SSO. ' +
-    'Credentials come from secrets.env (never embedded); tokens are never echoed back. ' +
+    "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
+    'user-scoped secrets.env, then process.env — never embedded; tokens are never echoed back. ' +
     'To freeze a flow as a deterministic test suite that reuses this session, call the ' +
     'session_scaffold_tests tool.',
   inputSchema: {
@@ -170,8 +190,16 @@ const loginDefinition: Tool = {
       headed: { type: 'boolean', description: 'Open a visible browser for 2FA/SSO/hardware keys. Default false.' },
       credKeys: {
         type: 'object',
-        description: 'secrets.env key names for credentials, e.g. {user:"ACME_USER",pass:"ACME_PASS"}.',
+        description:
+          'Dotenv key names for credentials, e.g. {user:"ACME_USER",pass:"ACME_PASS"} — resolved ' +
+          "from the project's .env, then secrets.env, then process.env. Only these keys are read.",
         properties: { user: { type: 'string' }, pass: { type: 'string' } },
+      },
+      envFile: {
+        type: 'string',
+        description:
+          'Path to the dotenv file holding the credKeys values. Default: ./.env in the working ' +
+          'directory (the consuming project), falling back to the user-scoped secrets.env.',
       },
       selectors: {
         type: 'object',
@@ -190,6 +218,7 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
     successSignal: String(args.successSignal ?? ''),
     headed: Boolean(args.headed),
     credKeys: args.credKeys as LoginOptions['credKeys'],
+    envFile: args.envFile ? String(args.envFile) : undefined,
     selectors: args.selectors as LoginOptions['selectors'],
   });
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: !result.ok };
@@ -198,7 +227,9 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
 const statusDefinition: Tool = {
   name: 'session_status',
   description:
-    'Check whether a saved session is still valid before reusing it; reports fresh / stale / missing.',
+    'Check whether a saved session is still valid before reusing it; reports fresh / stale / ' +
+    'missing / unreachable. "unreachable" means the probe itself failed (app down, network error) — ' +
+    'the session may still be fine, so fix reachability instead of re-logging-in.',
   inputSchema: {
     type: 'object',
     properties: {

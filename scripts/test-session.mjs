@@ -2,7 +2,7 @@
 // T1 acceptance — session_login / session_status round-trip vs a fake-login
 // localhost app. Deterministic (localhost, headless, no external network).
 // Asserts: storageState written at mode 600, tokens never echoed, fresh / stale
-// / missing. Run: node --test
+// / missing / unreachable, and project-.env credential precedence. Run: node --test
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -17,6 +17,17 @@ process.env.PLAYWRIGHT_MCP_SECRETS = path.join(TMP, 'secrets.env');
 fs.writeFileSync(process.env.PLAYWRIGHT_MCP_SECRETS, 'DEMO_USER=demo\nDEMO_PASS=secret\n');
 
 const { sessionLogin, sessionStatus } = await import('../dist/tools/session.js');
+const { getSecret } = await import('../dist/secrets.js');
+
+async function withProjectDir(files, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-proj-'));
+  try {
+    for (const [rel, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), body);
+    return await fn(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 // ── fake-login app ────────────────────────────────────────────────────────────
 function startApp() {
@@ -103,4 +114,57 @@ test('session_status: stale when the saved session has no valid cookie', async (
   fs.writeFileSync(stalePath, JSON.stringify({ cookies: [], origins: [] }));
   const s = await sessionStatus({ name: 'staley', probeUrl: `${base}/app`, loginIndicator: '/login' });
   assert.equal(s.state, 'stale');
+});
+
+test('session_status: unreachable when the probe cannot complete (not stale)', async () => {
+  // .invalid is reserved (RFC 2606): resolution always fails, no external network.
+  const s = await sessionStatus({ name: 'demo', probeUrl: 'http://nonexistent.invalid/' });
+  assert.equal(s.state, 'unreachable');
+});
+
+test('session_status: stale (recapture) for a corrupt storageState file', async () => {
+  const corruptPath = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'corrupt.json');
+  fs.writeFileSync(corruptPath, 'not json');
+  const s = await sessionStatus({ name: 'corrupt', probeUrl: `${base}/app` });
+  assert.equal(s.state, 'stale');
+});
+
+// ── credential precedence (project .env → secrets.env → process.env) ──────────
+
+test('getSecret: project .env in cwd wins over user secrets.env', async () => {
+  fs.appendFileSync(process.env.PLAYWRIGHT_MCP_SECRETS, 'OVERRIDE_KEY=from-secrets\n');
+  await withProjectDir({ '.env': 'OVERRIDE_KEY=from-project\n' }, (dir) => {
+    const prev = process.cwd();
+    try {
+      process.chdir(dir);
+      assert.equal(getSecret('OVERRIDE_KEY'), 'from-project');
+    } finally {
+      process.chdir(prev);
+    }
+  });
+  assert.equal(getSecret('OVERRIDE_KEY'), 'from-secrets');
+});
+
+test('getSecret: explicit envFile is honored; a missing envFile throws', async () => {
+  await withProjectDir({ 'creds.env': 'PROJ_ONLY=yes\n' }, (dir) => {
+    assert.equal(getSecret('PROJ_ONLY', { envFile: path.join(dir, 'creds.env') }), 'yes');
+    assert.throws(
+      () => getSecret('PROJ_ONLY', { envFile: path.join(dir, 'missing.env') }),
+      /envFile not found/,
+    );
+  });
+});
+
+test('session_login: credentials from a project envFile, tokens still not echoed', async () => {
+  await withProjectDir({ '.env': 'PROJ_USER=demo\nPROJ_PASS=secret\n' }, async (dir) => {
+    const r = await sessionLogin({
+      name: 'projenv',
+      loginUrl: `${base}/login`,
+      successSignal: 'h1',
+      credKeys: { user: 'PROJ_USER', pass: 'PROJ_PASS' },
+      envFile: path.join(dir, '.env'),
+    });
+    assert.equal(r.ok, true, r.error ?? 'login ok');
+    assert.ok(!JSON.stringify(r).includes('sid'), 'no cookie token in tool result');
+  });
 });

@@ -119,6 +119,12 @@ test('tool writes the suite, bakes the session, echoes the resolved outDir', asy
   }
 });
 
+test('tool documents force as rewriting the whole template set', () => {
+  const force = sessionScaffoldTool.definition.inputSchema.properties.force;
+  assert.match(force.description, /whole template set/i);
+  assert.match(force.description, /customized/i);
+});
+
 test('tool reports collisions as an error result, never throws', async () => {
   const out = mkTmp();
   try {

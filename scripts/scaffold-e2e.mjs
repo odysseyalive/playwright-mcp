@@ -10,7 +10,8 @@
  *
  *   --session <name>  session_login name the suite reuses (default: "default")
  *   --out <dir>       where to write the suite (default: current directory)
- *   --force           overwrite existing files
+ *   --force           overwrite existing files (rewrites the WHOLE template set,
+ *                     including a customized example.spec.ts/config)
  */
 
 import path from 'node:path';
@@ -46,7 +47,8 @@ function main() {
   }
   if (opts.help) {
     console.log(
-      'Usage: node scripts/scaffold-e2e.mjs [--session <name>] [--out <dir>] [--force]',
+      'Usage: node scripts/scaffold-e2e.mjs [--session <name>] [--out <dir>] [--force]\n' +
+        '  --force rewrites the WHOLE template set, including a customized example.spec.ts/config.',
     );
     return;
   }

@@ -39,7 +39,10 @@ const definition: Tool = {
       },
       force: {
         type: 'boolean',
-        description: 'Overwrite existing files instead of refusing. Default false.',
+        description:
+          'Overwrite existing files instead of refusing. WARNING: this rewrites the whole ' +
+          'template set — including a previously scaffolded example.spec.ts or config you have ' +
+          'since customized. Default false.',
       },
     },
   },

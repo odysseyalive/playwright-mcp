@@ -31,8 +31,7 @@ export function sessionsDir(): string {
 }
 
 /** Minimal dotenv-style parser — KEY=value lines, # comments, optional quotes. */
-export function loadSecrets(): Record<string, string> | undefined {
-  const file = secretsPath();
+function parseDotenv(file: string): Record<string, string> | undefined {
   if (!fs.existsSync(file)) return undefined;
   const secrets: Record<string, string> = {};
   for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
@@ -49,7 +48,33 @@ export function loadSecrets(): Record<string, string> | undefined {
   return secrets;
 }
 
-/** Read a single secret by key (from secrets.env, falling back to process.env). */
-export function getSecret(key: string): string | undefined {
+/** The user-scoped secrets.env, parsed (undefined if absent). */
+export function loadSecrets(): Record<string, string> | undefined {
+  return parseDotenv(secretsPath());
+}
+
+export interface GetSecretOptions {
+  /** Explicit dotenv file to read first (e.g. session_login's envFile). Throws if missing. */
+  envFile?: string;
+}
+
+/**
+ * Read a single secret by key. Precedence — most specific scope wins:
+ *   1. the consuming project's .env: opts.envFile if given, else ./.env in the
+ *      server's working directory (the project Claude Code was launched in)
+ *   2. the user-scoped secrets.env
+ *   3. process.env
+ * Only the named key is read out; file contents are never logged or returned.
+ */
+export function getSecret(key: string, opts: GetSecretOptions = {}): string | undefined {
+  if (opts.envFile) {
+    const explicit = path.resolve(opts.envFile);
+    const parsed = parseDotenv(explicit);
+    if (!parsed) throw new Error(`envFile not found: ${explicit}`);
+    if (parsed[key] !== undefined) return parsed[key];
+  } else {
+    const projectEnv = parseDotenv(path.join(process.cwd(), '.env'));
+    if (projectEnv?.[key] !== undefined) return projectEnv[key];
+  }
   return loadSecrets()?.[key] ?? process.env[key];
 }
