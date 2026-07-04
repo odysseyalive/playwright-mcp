@@ -54,8 +54,17 @@ If you'd rather skip the installer, build and register the absolute path yoursel
 
 ```bash
 npm install
+```
+
+```bash
 npm run build
+```
+
+```bash
 npx playwright install chromium
+```
+
+```bash
 claude mcp add --scope user playwright-mcp -- node /ABSOLUTE/PATH/dist/index.js
 ```
 
