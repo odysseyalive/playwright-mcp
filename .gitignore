@@ -4,7 +4,7 @@
 # temp artifacts. The user is always the one who commits; the assistant never does.
 
 # Build scaffolding — meta-tooling used to BUILD the package, not the shipped package
-.claude/
+/.claude/
 CLAUDE.md
 
 # Dependencies & build output
