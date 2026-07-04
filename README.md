@@ -110,6 +110,16 @@ npm run scaffold:e2e -- --session <name> --out /path/to/your/project
 
 The generated config resolves the storageState from the same path `session_login` writes to. It honors `PLAYWRIGHT_MCP_SESSIONS`, then `XDG_CONFIG_HOME` or `APPDATA`, so it works on any machine without a hard-coded home directory. The setup project never logs in. It guards that the captured session is present and fresh, and points you back to `session_login` (headed for 2FA) if it isn't. For CI, where the gitignored session file won't exist, point `STORAGE_STATE` at a file the job materializes from a masked secret. The generated `README.md` has the details.
 
+## Test-suite builder
+
+Beyond the basic scaffold, three `suite_*` tools carry a full, project-agnostic e2e methodology — distilled from running a large production regression suite — so an AI assistant can build, maintain, and audit test suites the same disciplined way in any project. All project specifics (fixtures, selectors, credentials, what "test mode" means) stay in the target repo; the server ships only templates, playbook text, and a report parser.
+
+- **`suite_scaffold`** — writes the full pack into a project: Playwright config with captured-session reuse, an environment guard driven by `e2e-suite.config.json` (your test-mode up/down commands, with took-effect verification), an ENFORCING page-integrity gate (rendered server errors, leaked template tokens, `undefined`/`NaN` text fail the test), report-only error capture, session-isolation rules — plus a generated `.claude/skills/test-suite/` skill that teaches the AI the run/author/audit discipline for that project.
+- **`suite_audit`** — runs a project's suite (`run: true`) or parses its last JSON report (`reportPath`), and returns per-failure dossiers plus the adjudication rubric: every failure is classified TEST-DEFECT (fix the script) or PRODUCT-BUG (report and hand off — never relax an assertion to go green). The judgment stays with the model; the tool makes the evidence cheap and structured.
+- **`suite_methodology`** — the playbook on demand (`overview` / `methodology` / `authoring` / `audit`), served from the same files the scaffolder installs, so there is exactly one source of truth.
+
+`suite_scaffold` and `suite_audit` are local-only (remote-denylisted) like the session tools; `suite_methodology` is available everywhere.
+
 ## Remote connector for claude.ai
 
 Everything above is the local setup. The server runs over stdio for Claude Code on your own machine, and that's the default. Nothing changes unless you turn this on.
