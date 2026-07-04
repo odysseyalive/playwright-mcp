@@ -1,0 +1,32 @@
+{
+  "project": "__PROJECT_NAME__",
+  "session": "__SESSION_NAME__",
+
+  "env": {
+    "up": "",
+    "down": "",
+    "verifyUrl": "",
+    "verifyAbsent": ""
+  },
+
+  "integrity": {
+    "mode": "enforce",
+    "allow": []
+  },
+
+  "errorCapture": {
+    "urlAllowlist": [],
+    "consoleAllowlist": [],
+    "fail4xx": false
+  },
+
+  "_doc": {
+    "env.up": "Shell command that puts the SITE into test mode before a run (e.g. flip a flag + reload the app server). Leave empty if the site needs no mode switch. Must be idempotent. If your app caches config per worker process, the command MUST include the reload (stale-worker lesson).",
+    "env.down": "Shell command that restores normal mode after the run. Skipped when KEEP_ENV=1; both are skipped when SKIP_ENV_GUARD=1.",
+    "env.verifyUrl": "Optional URL fetched after env.up; the run aborts if it is unreachable.",
+    "env.verifyAbsent": "Optional substring that must NOT appear in the verifyUrl response body once test mode is up (e.g. the text of your login gate). Catches a mode switch that silently did not take effect.",
+    "integrity.mode": "enforce | report | off — default for the page-integrity gate (per-spec override: test.use({ pageIntegrity })).",
+    "integrity.allow": "Regex strings matched against '<kind> <detail>' of an integrity finding to suppress it. Grandfather known-latent artifacts here — and track each entry somewhere reviewable so the list shrinks.",
+    "errorCapture.*": "Regex strings for third-party noise (analytics beacons etc.); capture is report-only and never fails tests."
+  }
+}
