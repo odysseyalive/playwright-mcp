@@ -15,7 +15,7 @@ import { isBlockedIp, isBlockedHostSync, assertEgressAllowed, EgressBlockedError
 import { createOutwardServer } from '../dist/index.js';
 import { buildGitHubAuth } from '../dist/auth.js';
 
-const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_scaffold_tests', 'browser_file_upload'];
+const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_scaffold_tests', 'browser_file_upload', 'suite_scaffold', 'suite_audit'];
 const KEEPERS = ['web_fetch', 'browser_evaluate', 'browser_navigate', 'browser_snapshot', 'browser_click'];
 
 // ── egress backstop ───────────────────────────────────────────────────────────

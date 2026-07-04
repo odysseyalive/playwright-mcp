@@ -33,7 +33,7 @@ import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
 import { egressRestricted, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -72,6 +72,14 @@ function buildInstructions(
         'generate a deterministic Playwright suite (setup-project + dependencies) that reuses it — no model in the loop.',
     );
   }
+  if (names.has('suite_scaffold') || names.has('suite_methodology')) {
+    lines.push(
+      '',
+      'TEST-SUITE WORK (create/edit/audit e2e suites): read suite_methodology FIRST; suite_scaffold builds a full ' +
+        'suite + project-local AI test-suite skill into a project; suite_audit runs/parses a suite and returns ' +
+        'per-failure dossiers for TEST-DEFECT vs PRODUCT-BUG adjudication (fix scripts only — never paper over product bugs).',
+    );
+  }
   lines.push(
     '',
     `All tools (${names.size}): ${[...names].sort().join(', ')}`,
@@ -93,6 +101,8 @@ const REMOTE_DENYLIST = new Set([
   'session_status',
   'session_scaffold_tests',
   'browser_file_upload',
+  'suite_scaffold',
+  'suite_audit',
 ]);
 
 interface OutwardServerOptions {

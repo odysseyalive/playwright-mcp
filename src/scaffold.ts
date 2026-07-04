@@ -16,9 +16,25 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PLACEHOLDER = '__SESSION_NAME__';
+const PROJECT_PLACEHOLDER = '__PROJECT_NAME__';
 
 /** templates/e2e, resolved relative to this module (dist/scaffold.js → ../templates/e2e). */
 const TEMPLATE_DIR = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'templates', 'e2e');
+
+/** templates/suite — the full methodology pack + project-local AI skill (suite_scaffold). */
+export const SUITE_TEMPLATE_DIR = path.resolve(
+  fileURLToPath(import.meta.url),
+  '..',
+  '..',
+  'templates',
+  'suite',
+);
+
+/**
+ * Substituted values land inside TS string literals AND parsed JSON
+ * (e2e-suite.config.json) — restrict to characters that are inert in both.
+ */
+const SAFE_NAME = /^[A-Za-z0-9._-]+$/;
 
 export interface ScaffoldOptions {
   /** session_login name the suite reuses (default "default"). */
@@ -27,6 +43,10 @@ export interface ScaffoldOptions {
   out?: string;
   /** Overwrite existing files instead of refusing. */
   force?: boolean;
+  /** Template tree to copy (default templates/e2e; suite_scaffold passes SUITE_TEMPLATE_DIR). */
+  templateDir?: string;
+  /** Value for __PROJECT_NAME__ (suite templates only; default "app"). */
+  project?: string;
 }
 
 /** Collect every file under dir, relative to it. */
@@ -48,11 +68,19 @@ export function scaffold({
   session = 'default',
   out = process.cwd(),
   force = false,
+  templateDir = TEMPLATE_DIR,
+  project = 'app',
 }: ScaffoldOptions = {}): string[] {
-  if (!fs.existsSync(TEMPLATE_DIR)) {
-    throw new Error(`template directory not found: ${TEMPLATE_DIR}`);
+  if (!SAFE_NAME.test(session)) {
+    throw new Error(`invalid session name (allowed: letters, digits, . _ -): ${session}`);
   }
-  const files = walk(TEMPLATE_DIR);
+  if (!SAFE_NAME.test(project)) {
+    throw new Error(`invalid project name (allowed: letters, digits, . _ -): ${project}`);
+  }
+  if (!fs.existsSync(templateDir)) {
+    throw new Error(`template directory not found: ${templateDir}`);
+  }
+  const files = walk(templateDir);
 
   const collisions = files
     .map((rel) => path.join(out, rel))
@@ -66,9 +94,14 @@ export function scaffold({
 
   const written: string[] = [];
   for (const rel of files) {
-    const src = path.join(TEMPLATE_DIR, rel);
+    const src = path.join(templateDir, rel);
     const dest = path.join(out, rel);
-    const body = fs.readFileSync(src, 'utf8').split(PLACEHOLDER).join(session);
+    const body = fs
+      .readFileSync(src, 'utf8')
+      .split(PLACEHOLDER)
+      .join(session)
+      .split(PROJECT_PLACEHOLDER)
+      .join(project);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, body);
     written.push(rel);

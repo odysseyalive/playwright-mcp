@@ -1,6 +1,6 @@
 {
   "name": "@francis/playwright-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "User-scoped Playwright MCP server: full @playwright/mcp toolset plus web_fetch (replaces native WebFetch) and session helpers, over stdio; optionally exposes a hardened, GitHub-OAuth'd remote Streamable-HTTP transport for claude.ai custom connectors",
   "main": "dist/index.js",
   "type": "module",
