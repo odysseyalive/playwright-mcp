@@ -184,7 +184,7 @@ async function main() {
   const playwrightServer = await createConnection({
     browser: {
       browserName: 'chromium',
-      launchOptions: { headless: true },
+      launchOptions: { headless: true, channel: 'chrome' },
     },
     secrets: loadSecrets(),
     // Remote instance: block the wrapped browser_* tools from the metadata

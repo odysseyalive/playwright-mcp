@@ -60,6 +60,7 @@ export function getStealthContext(): Promise<BrowserContext> {
 
 async function launch(): Promise<BrowserContext> {
   const context = await chromium.launchPersistentContext(profileDir(), {
+    channel: 'chrome',
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
     userAgent: USER_AGENT,
