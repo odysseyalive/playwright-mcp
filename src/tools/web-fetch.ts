@@ -10,11 +10,16 @@
  * Spec: /web-fetch-method. Extraction internals live in src/extract.ts.
  */
 
+import fs from 'node:fs';
+
+import { chromium, type Page } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { getStealthContext, pace } from '../browser.js';
 import { egressRestricted, assertEgressAllowed, installEgressGuard } from '../egress.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
+import { sessionFilePath } from '../secrets.js';
+import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 import {
   classifyHealth,
   extractReadable,
@@ -49,6 +54,13 @@ export interface FetchOptions {
   url: string;
   links?: boolean;
   quality?: 'fast' | 'research';
+  /**
+   * Named session_login artifact to read authenticated (paywalled) content with,
+   * e.g. "ft" or "nyt". Loaded into an EPHEMERAL stealth context with its own
+   * cookie jar — the authed identity never touches the shared scraping profile
+   * (the storageState-isolation rule). Local instance only (refused on remote).
+   */
+  session?: string;
 }
 
 /**
@@ -57,7 +69,7 @@ export interface FetchOptions {
  */
 export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   const url = canonicalUrl(opts.url);
-  const cacheKey = `${url}|links=${opts.links ? 1 : 0}`;
+  const cacheKey = `${url}|links=${opts.links ? 1 : 0}|session=${opts.session ?? ''}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -70,9 +82,37 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     }
   }
 
-  const context = await getStealthContext();
-  const page = await context.newPage();
-  if (egressRestricted()) await installEgressGuard(page);
+  // Pick the render context. Anonymous → the shared persistent stealth profile.
+  // Authenticated (opts.session) → an EPHEMERAL context seeded with that session's
+  // storageState, so authed cookies live in their own jar and never bleed into
+  // the shared scraping profile (the storageState-isolation rule). Local-only:
+  // a captured session is never loaded on the prompt-injectable remote surface.
+  let page: Page;
+  let cleanup: () => Promise<void>;
+  if (opts.session) {
+    if (egressRestricted()) {
+      return errorResult(url, 'blocked', 'authenticated web_fetch (session) is disabled on the remote instance', opts.links);
+    }
+    const file = sessionFilePath(opts.session);
+    if (!fs.existsSync(file)) {
+      return errorResult(url, 'blocked', `session "${opts.session}" not found — capture it with session_login first`, opts.links);
+    }
+    const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
+    const context = await browser.newContext({ ...stealthContextOptions, storageState: file, ignoreHTTPSErrors: true });
+    await context.addInitScript(STEALTH_INIT);
+    page = await context.newPage();
+    cleanup = async () => {
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+    };
+  } else {
+    const context = await getStealthContext();
+    page = await context.newPage();
+    if (egressRestricted()) await installEgressGuard(page);
+    cleanup = async () => {
+      await page.close().catch(() => {});
+    };
+  }
   try {
     await pace();
     const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: FETCH_TIMEOUT_MS });
@@ -127,7 +167,7 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   } catch (err) {
     return errorResult(url, 'blocked', err instanceof Error ? err.message : String(err), opts.links);
   } finally {
-    await page.close().catch(() => {});
+    await cleanup();
   }
 }
 
@@ -156,7 +196,8 @@ const definition: Tool = {
     'Fetch a URL via headless Playwright with full JS rendering (handles SPAs and PDFs). ' +
     'Replaces the built-in WebFetch tool. Returns readable main text plus author/date/publisher ' +
     'citation data (CSL-JSON) and page-health status. Set links:true to also harvest outbound ' +
-    'links and the reference section. quality:"research" flags the result for source appraisal.',
+    'links and the reference section. quality:"research" flags the result for source appraisal. ' +
+    'Pass session:"name" to read paywalled content behind a session_login capture (local only).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -169,6 +210,12 @@ const definition: Tool = {
         type: 'string',
         enum: ['fast', 'research'],
         description: 'fast = mechanical (default); research = flag for in-session source-appraiser agent.',
+      },
+      session: {
+        type: 'string',
+        description:
+          'Named session_login artifact (e.g. "ft", "nyt") to read authenticated/paywalled content. ' +
+          'Loaded into an isolated ephemeral context; local instance only.',
       },
     },
     required: ['url'],
@@ -184,6 +231,7 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     url,
     links: Boolean(args.links),
     quality: args.quality === 'research' ? 'research' : 'fast',
+    session: args.session ? String(args.session) : undefined,
   });
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }

@@ -6,26 +6,24 @@
  * browser_* tools via contextOptions.storageState / userDataDir) and generated
  * Playwright suites (setup-project + dependencies) load.
  *
- * Spec: /session-method. The auth context is ISOLATED from the stealth
- * web_fetch context (src/browser.ts) — they never merge. storageState
- * files are secrets: mode 600, gitignored, never echoed into tool output/logs.
+ * Spec: /session-method. Identity stays ISOLATED: the shared persistent
+ * web_fetch scraping profile (src/browser.ts) never carries auth cookies. An
+ * explicit authed read — web_fetch({ session }) — loads a captured storageState
+ * into its OWN ephemeral context (separate cookie jar), so auth and the shared
+ * scraping profile still never merge; only the stealth *disguise* (src/stealth.ts)
+ * is shared. storageState files are secrets: mode 600, gitignored, never echoed
+ * into tool output/logs.
  */
 
 import fs from 'node:fs';
-import path from 'node:path';
 
 import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { sessionsDir, getSecret } from '../secrets.js';
-import { STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
+import { sessionsDir, sessionFilePath, getSecret } from '../secrets.js';
+import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:session]', ...args);
-
-function sessionPath(name: string): string {
-  const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_');
-  return path.join(sessionsDir(), `${safe}.json`);
-}
 
 // ── session_login ─────────────────────────────────────────────────────────────
 
@@ -56,10 +54,10 @@ const DEFAULT_SELECTORS = {
 
 export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   const mode: 'headless' | 'headed' = opts.headed ? 'headed' : 'headless';
-  const out = sessionPath(opts.name);
+  const out = sessionFilePath(opts.name);
   let browser: Browser | undefined;
   try {
-    browser = await chromium.launch({ headless: !opts.headed, args: STEALTH_ARGS });
+    browser = await chromium.launch({ headless: !opts.headed, ...STEALTH_LAUNCH });
     // Disguise the capture context (own cookie jar — never the web_fetch profile)
     // so bot-protected login pages don't flag the headless browser and fail the
     // capture. Identity stays isolated; only the anti-detection technique is shared.
@@ -136,7 +134,7 @@ export interface StatusResult {
 }
 
 export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> {
-  const file = sessionPath(opts.name);
+  const file = sessionFilePath(opts.name);
   const checkedAt = new Date().toISOString();
   if (!fs.existsSync(file)) return { name: opts.name, state: 'missing', checkedAt };
 
@@ -149,7 +147,7 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
 
   let browser: Browser | undefined;
   try {
-    browser = await chromium.launch({ headless: true, args: STEALTH_ARGS });
+    browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
     // Same disguise as capture: a naked headless probe can trip bot detection and
     // land on a challenge page, which would false-report a good session as 'stale'.
     const context = await browser.newContext({

@@ -35,6 +35,17 @@ export const VIEWPORT = { width: 1366, height: 768 };
 /** Launch args that strip the automation tell. Reused by every launch. */
 export const STEALTH_ARGS = ['--disable-blink-features=AutomationControlled'];
 
+/**
+ * Launch options for a stealth browser: the REAL installed Google Chrome
+ * (`channel:'chrome'`) plus the automation-tell strip. Bundled Chromium is a
+ * distinct fingerprint that aggressive bot walls (DataDome, PerimeterX) flag on
+ * sight, and a session captured under one engine is re-challenged when replayed
+ * under another — so capture (session_login), probe (session_status), and authed
+ * read (web_fetch) all launch the same Chrome the shared scraping context uses.
+ * Requires Google Chrome installed on the host. Spread into chromium.launch().
+ */
+export const STEALTH_LAUNCH = { channel: 'chrome', args: STEALTH_ARGS };
+
 /** addInitScript payload: erase the headless tells before any page script runs. */
 export const STEALTH_INIT = `
   Object.defineProperty(navigator, 'webdriver', { get: () => false });

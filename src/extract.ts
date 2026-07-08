@@ -57,9 +57,13 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
 
   const body = bodyText ?? '';
   const short = body.length > 0 && body.length < 600;
+  // Subscription sites (NYT, News Corp titles) embed regwall/paywall markup in
+  // the DOM regardless of entitlement, so PAYWALL_TELL fires even on a full,
+  // authenticated read. Only call it a wall when the content is actually gated —
+  // missing or truncated body — not when a substantial article body came through.
+  const substantial = body.length >= 1500;
   if (LOGIN_TELL.test(head) && short) return 'login-wall';
-  if (PAYWALL_TELL.test(head) && short) return 'paywall';
-  if (PAYWALL_TELL.test(head)) return 'paywall';
+  if (PAYWALL_TELL.test(head) && !substantial) return 'paywall';
   return 'ok';
 }
 

@@ -30,6 +30,16 @@ export function sessionsDir(): string {
   return process.env.PLAYWRIGHT_MCP_SESSIONS ?? path.join(configDir(), 'sessions');
 }
 
+/**
+ * Resolve a named session's storageState artifact path — the mode-600 file
+ * session_login writes and session_status / web_fetch(session) read. Single
+ * owner of the name→path mapping so callers never re-derive the safe-name rule.
+ */
+export function sessionFilePath(name: string): string {
+  const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(sessionsDir(), `${safe}.json`);
+}
+
 /** Minimal dotenv-style parser — KEY=value lines, # comments, optional quotes. */
 function parseDotenv(file: string): Record<string, string> | undefined {
   if (!fs.existsSync(file)) return undefined;
