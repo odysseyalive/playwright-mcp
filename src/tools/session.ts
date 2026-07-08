@@ -7,7 +7,7 @@
  * Playwright suites (setup-project + dependencies) load.
  *
  * Spec: /session-method. The auth context is ISOLATED from the stealth
- * web_search/web_fetch context (src/browser.ts) — they never merge. storageState
+ * web_fetch context (src/browser.ts) — they never merge. storageState
  * files are secrets: mode 600, gitignored, never echoed into tool output/logs.
  */
 
@@ -18,6 +18,7 @@ import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { sessionsDir, getSecret } from '../secrets.js';
+import { STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:session]', ...args);
 
@@ -58,8 +59,12 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   const out = sessionPath(opts.name);
   let browser: Browser | undefined;
   try {
-    browser = await chromium.launch({ headless: !opts.headed });
-    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    browser = await chromium.launch({ headless: !opts.headed, args: STEALTH_ARGS });
+    // Disguise the capture context (own cookie jar — never the web_fetch profile)
+    // so bot-protected login pages don't flag the headless browser and fail the
+    // capture. Identity stays isolated; only the anti-detection technique is shared.
+    const context = await browser.newContext({ ...stealthContextOptions, ignoreHTTPSErrors: true });
+    await context.addInitScript(STEALTH_INIT);
     const page = await context.newPage();
     await page.goto(opts.loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
@@ -144,8 +149,15 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
 
   let browser: Browser | undefined;
   try {
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ storageState: file, ignoreHTTPSErrors: true });
+    browser = await chromium.launch({ headless: true, args: STEALTH_ARGS });
+    // Same disguise as capture: a naked headless probe can trip bot detection and
+    // land on a challenge page, which would false-report a good session as 'stale'.
+    const context = await browser.newContext({
+      ...stealthContextOptions,
+      storageState: file,
+      ignoreHTTPSErrors: true,
+    });
+    await context.addInitScript(STEALTH_INIT);
     const page = await context.newPage();
     try {
       await page.goto(opts.probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });

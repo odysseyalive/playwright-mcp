@@ -17,30 +17,9 @@ import path from 'node:path';
 
 import { chromium, type BrowserContext } from 'playwright';
 
+import { CHROME_MAJOR, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
+
 const log = (...args: unknown[]) => console.error('[playwright-mcp:browser]', ...args);
-
-/**
- * Real desktop UA matching the bundled Chromium MAJOR version, with the
- * `HeadlessChrome` token replaced by `Chrome`. Bundled Chromium is currently
- * major 149 (playwright 1.61.0-alpha; chrome-headless-shell 149.x).
- * MAINTENANCE: bump this major in lockstep with the pinned playwright upgrade.
- */
-const CHROME_MAJOR = 149;
-const USER_AGENT = `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
-
-const LOCALE = 'en-US';
-const TIMEZONE = 'America/New_York';
-const VIEWPORT = { width: 1366, height: 768 };
-
-/** addInitScript payload: erase the headless tells before any page script runs. */
-const STEALTH_INIT = `
-  Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-  Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5].map((i) => ({ name: 'Plugin ' + i })),
-  });
-  window.chrome = window.chrome || { runtime: {} };
-`;
 
 function profileDir(): string {
   const base = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache');
@@ -62,12 +41,8 @@ async function launch(): Promise<BrowserContext> {
   const context = await chromium.launchPersistentContext(profileDir(), {
     channel: 'chrome',
     headless: true,
-    args: ['--disable-blink-features=AutomationControlled'],
-    userAgent: USER_AGENT,
-    locale: LOCALE,
-    timezoneId: TIMEZONE,
-    viewport: VIEWPORT,
-    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+    args: STEALTH_ARGS,
+    ...stealthContextOptions,
   });
   await context.addInitScript(STEALTH_INIT);
   await seedConsent(context);
