@@ -171,6 +171,18 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
       if (url.includes(opts.loginIndicator)) stale = true;
       else stale = (await page.$(opts.loginIndicator).catch(() => null)) !== null;
     }
+    if (!stale) {
+      // Rolling session write-back: a fresh probe just made an authed request,
+      // and the site answered with refreshed cookies. Persisting them turns a
+      // periodic status check into a KEEPALIVE — the session's expiry rolls
+      // forward on every probe instead of aging toward its capture-time expiry.
+      try {
+        await context.storageState({ path: file });
+        fs.chmodSync(file, 0o600);
+      } catch {
+        /* best-effort; the verdict stands either way */
+      }
+    }
     return { name: opts.name, state: stale ? 'stale' : 'fresh', checkedAt };
   } catch {
     // Browser/context failure — environmental, not a session verdict.

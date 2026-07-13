@@ -102,6 +102,20 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     await context.addInitScript(STEALTH_INIT);
     page = await context.newPage();
     cleanup = async () => {
+      // Rolling session write-back: sites extend cookie expiry on every authed
+      // request; persisting the refreshed jar means each read PROLONGS the
+      // session instead of letting the artifact age toward its original expiry.
+      // Skipped when the page landed on a login wall — a logged-out jar must
+      // never overwrite the (possibly recoverable) captured one.
+      try {
+        const landed = page.url();
+        if (!/\/(login|signin|sign-in|auth)(\b|\/|\?)/i.test(landed)) {
+          await context.storageState({ path: file });
+          fs.chmodSync(file, 0o600);
+        }
+      } catch {
+        /* write-back is best-effort; the read result is unaffected */
+      }
       await context.close().catch(() => {});
       await browser.close().catch(() => {});
     };
