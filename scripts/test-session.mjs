@@ -14,7 +14,10 @@ import path from 'node:path';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-sess-'));
 process.env.PLAYWRIGHT_MCP_SESSIONS = path.join(TMP, 'sessions');
 process.env.PLAYWRIGHT_MCP_SECRETS = path.join(TMP, 'secrets.env');
-fs.writeFileSync(process.env.PLAYWRIGHT_MCP_SECRETS, 'DEMO_USER=demo\nDEMO_PASS=secret\n');
+fs.writeFileSync(
+  process.env.PLAYWRIGHT_MCP_SECRETS,
+  'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
+);
 
 const { sessionLogin, sessionStatus } = await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
@@ -97,6 +100,46 @@ test('session_login captures a session at mode 600 without echoing tokens', asyn
   assert.ok(!JSON.stringify(r).includes('sid'), 'no cookie token in tool result');
   // The captured artifact does contain the cookie (that is its job).
   assert.match(fs.readFileSync(r.path, 'utf8'), /sid/);
+});
+
+test('session_login: auto-detects login with NO successSignal (moved past login page)', async () => {
+  // A: omit successSignal entirely — success is detected because after POST the
+  // app lands on /app (different path, no password field).
+  const r = await sessionLogin({
+    name: 'nosignal',
+    loginUrl: `${base}/login`,
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+  });
+  assert.equal(r.ok, true, r.error ?? 'login ok without a marker');
+  assert.ok(fs.existsSync(r.path), 'storageState written');
+});
+
+test('session_login: a VISIBLE-TEXT successSignal matches (not just a CSS selector)', async () => {
+  // B: "Welcome demo" is the h1 text, not a CSS selector — must still resolve.
+  const r = await sessionLogin({
+    name: 'texttext',
+    loginUrl: `${base}/login`,
+    successSignal: 'Welcome demo',
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+  });
+  assert.equal(r.ok, true, r.error ?? 'text-marker login ok');
+});
+
+test('session_login: timeout yields a DIAGNOSTIC error, not "All promises were rejected"', async () => {
+  // C+D: correct key names but a WRONG password value → the form fills and
+  // submits, the app bounces back to /login (password field still present), so
+  // the marker never matches. A bounded timeout must surface an ACTIONABLE
+  // message, never the opaque AggregateError "All promises were rejected".
+  const r = await sessionLogin({
+    name: 'badcreds',
+    loginUrl: `${base}/login`,
+    successSignal: 'nonexistent-marker',
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_BADPASS' },
+    timeoutMs: 2500,
+  });
+  assert.equal(r.ok, false, 'login should fail on a wrong password');
+  assert.doesNotMatch(r.error ?? '', /All promises were rejected/, 'no opaque AggregateError');
+  assert.match(r.error ?? '', /timed out|login form/, 'actionable diagnostic message');
 });
 
 test('session_status: fresh for a valid saved session', async () => {

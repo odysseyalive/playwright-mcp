@@ -30,8 +30,12 @@ const log = (...args: unknown[]) => console.error('[playwright-mcp:session]', ..
 export interface LoginOptions {
   name: string;
   loginUrl: string;
-  successSignal: string; // selector or substring of the post-login URL
+  // Optional confirmation marker: a CSS/XPath selector, visible text, or a
+  // substring of the *post-login* URL. Omit in headed mode to auto-detect
+  // login by "moved past the login page" (see waitForLogin).
+  successSignal?: string;
   headed?: boolean; // required for 2FA / SSO / hardware keys
+  timeoutMs?: number; // how long to wait for login (default 300s headed / 30s headless)
   credKeys?: { user: string; pass: string }; // dotenv key names (project .env / secrets.env)
   envFile?: string; // explicit dotenv file for credKeys (default: ./.env in cwd, then secrets.env)
   selectors?: { user?: string; pass?: string; submit?: string };
@@ -67,9 +71,14 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     await page.goto(opts.loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
     if (opts.headed) {
-      // Human completes the challenge; wait (generously) for the success signal.
-      log(`headed login for "${opts.name}" — complete the challenge in the browser window`);
-      await waitForSuccess(page, opts.successSignal, 300_000);
+      // Human completes the challenge in the SEPARATE automation window this
+      // launched (not their everyday browser). We auto-detect completion when
+      // they move past the login page; an explicit successSignal, if given,
+      // also resolves. Generous timeout for typing + 2FA.
+      log(
+        `headed login for "${opts.name}" — a SEPARATE automation window opened; complete the login in THAT window`,
+      );
+      await waitForLogin(page, opts.loginUrl, opts.successSignal, opts.timeoutMs ?? 300_000);
     } else {
       const sel = { ...DEFAULT_SELECTORS, ...opts.selectors };
       const lookup = { envFile: opts.envFile };
@@ -85,7 +94,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
         page.click(sel.submit).catch(() => page.keyboard.press('Enter')),
         page.waitForLoadState('domcontentloaded').catch(() => {}),
       ]);
-      await waitForSuccess(page, opts.successSignal, 30_000);
+      await waitForLogin(page, opts.loginUrl, opts.successSignal, opts.timeoutMs ?? 30_000);
     }
 
     fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
@@ -107,16 +116,130 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   }
 }
 
-async function waitForSuccess(
-  page: import('playwright').Page,
-  signal: string,
+type PwPage = import('playwright').Page;
+
+/** Compare two URLs by pathname only (ignore query/hash, normalize trailing /). */
+function samePath(a: string, b: string): boolean {
+  const norm = (u: string) => {
+    try {
+      return new URL(u).pathname.replace(/\/+$/, '').toLowerCase() || '/';
+    } catch {
+      return u.toLowerCase();
+    }
+  };
+  return norm(a) === norm(b);
+}
+
+/** Is a password field still on the page? (⇒ almost certainly still the login form.) */
+async function hasPasswordField(page: PwPage): Promise<boolean> {
+  return (await page.locator('input[type="password"]').count().catch(() => 0)) > 0;
+}
+
+/**
+ * Generic "the human got past the login page" detector — no marker needed.
+ * Success = the password field is gone AND the URL is no longer the login page,
+ * held stable briefly so a mid-redirect flicker doesn't false-trigger. Rejects
+ * on timeout so it never counts as success in the race.
+ */
+async function waitPastLogin(page: PwPage, loginUrl: string, timeout: number): Promise<void> {
+  const deadline = Date.now() + timeout;
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    const url = page.url();
+    const movedOff = !samePath(url, loginUrl);
+    const noPassword = !(await hasPasswordField(page).catch(() => false));
+    if (movedOff && noPassword) {
+      if (!stableSince) stableSince = Date.now();
+      else if (Date.now() - stableSince >= 1500) return;
+    } else {
+      stableSince = 0;
+    }
+    await page.waitForTimeout(500).catch(() => {});
+  }
+  throw new Error('waitPastLogin: timed out');
+}
+
+/**
+ * Wait for a successful login, robust to how the caller (often a human or an
+ * LLM) phrased the confirmation. Races several interpretations; the first to
+ * resolve wins. On total timeout, throws a DIAGNOSTIC error (final URL, page
+ * title, whether a login form is still showing, how the marker was read) rather
+ * than the opaque AggregateError "All promises were rejected".
+ */
+async function waitForLogin(
+  page: PwPage,
+  loginUrl: string,
+  signal: string | undefined,
   timeout: number,
 ): Promise<void> {
-  // signal is a selector OR a URL substring — race both interpretations.
-  await Promise.any([
-    page.waitForSelector(signal, { timeout }),
-    page.waitForURL((u) => u.toString().includes(signal), { timeout }),
-  ]);
+  const arms: Promise<unknown>[] = [waitPastLogin(page, loginUrl, timeout)];
+  const sig = signal?.trim();
+  if (sig) {
+    // (a) CSS/XPath/Playwright-engine selector, (b) visible text, (c) URL
+    // substring — but guarded so the login URL itself never counts (D).
+    arms.push(page.waitForSelector(sig, { timeout }).then(() => {}));
+    arms.push(
+      page
+        .getByText(sig)
+        .first()
+        .waitFor({ timeout })
+        .then(() => {}),
+    );
+    arms.push(
+      page
+        .waitForURL((u) => u.toString().includes(sig) && !samePath(u.toString(), loginUrl), { timeout })
+        .then(() => {}),
+    );
+  }
+  try {
+    await Promise.any(arms);
+  } catch {
+    throw new Error(await loginDiagnostic(page, loginUrl, sig, timeout));
+  }
+}
+
+/** Build an actionable timeout message instead of "All promises were rejected". */
+async function loginDiagnostic(
+  page: PwPage,
+  loginUrl: string,
+  signal: string | undefined,
+  timeoutMs: number,
+): Promise<string> {
+  let url = '';
+  let title = '';
+  let pw = false;
+  try {
+    url = page.url();
+  } catch {
+    /* page may be gone */
+  }
+  try {
+    title = await page.title();
+  } catch {
+    /* ignore */
+  }
+  try {
+    pw = await hasPasswordField(page);
+  } catch {
+    /* ignore */
+  }
+  const parts = [
+    `login capture timed out after ${Math.round(timeoutMs / 1000)}s`,
+    `final URL: ${url || 'unknown'}${title ? ` (“${title}”)` : ''}`,
+  ];
+  if (pw || samePath(url, loginUrl)) {
+    parts.push(
+      'the page still shows a login form — a SEPARATE automation window was opened for this capture; ' +
+        'complete the login in THAT window (not your everyday browser), then it saves automatically',
+    );
+  }
+  if (signal) {
+    parts.push(
+      `the success marker ${JSON.stringify(signal)} never matched as a selector, visible text, or a ` +
+        'changed-URL substring — verify it against the post-login page, or omit it in headed mode to auto-detect',
+    );
+  }
+  return parts.join('; ') + '.';
 }
 
 // ── session_status ────────────────────────────────────────────────────────────
@@ -198,7 +321,10 @@ const loginDefinition: Tool = {
   name: 'session_login',
   description:
     'Log into a site once and save the authenticated session (cookies + storage) to a named file ' +
-    'for reuse in debugging and generated Playwright tests. Use headed:true for 2FA/SSO. ' +
+    'for reuse in debugging and generated Playwright tests. Use headed:true for 2FA/SSO — this opens ' +
+    'a SEPARATE automation window; the human must complete the login in THAT window (not their ' +
+    'everyday browser), and it saves automatically once past the login page. successSignal is ' +
+    'OPTIONAL (headed logins auto-detect completion). ' +
     "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
     'user-scoped secrets.env, then process.env — never embedded; tokens are never echoed back. ' +
     'To freeze a flow as a deterministic test suite that reuses this session, call the ' +
@@ -208,8 +334,26 @@ const loginDefinition: Tool = {
     properties: {
       name: { type: 'string', description: 'A name for the saved session (file basename).' },
       loginUrl: { type: 'string', description: 'The login page URL.' },
-      successSignal: { type: 'string', description: 'A post-login selector or URL substring that confirms success.' },
-      headed: { type: 'boolean', description: 'Open a visible browser for 2FA/SSO/hardware keys. Default false.' },
+      successSignal: {
+        type: 'string',
+        description:
+          'OPTIONAL confirmation marker: a CSS/XPath selector, the visible text of a post-login ' +
+          'element (e.g. "Sign out"), or a substring of the post-login URL. Omit in headed mode to ' +
+          'auto-detect login by leaving the login page. Whatever form you give, all three ' +
+          'interpretations are tried.',
+      },
+      headed: {
+        type: 'boolean',
+        description:
+          'Open a visible browser for 2FA/SSO/hardware keys. Default false. A SEPARATE automation ' +
+          'window opens — complete the login there, not in your normal browser.',
+      },
+      timeoutMs: {
+        type: 'number',
+        description:
+          'How long to wait for the login to complete, in ms. Default 300000 (headed) / 30000 ' +
+          '(headless credKeys).',
+      },
       credKeys: {
         type: 'object',
         description:
@@ -229,7 +373,7 @@ const loginDefinition: Tool = {
         properties: { user: { type: 'string' }, pass: { type: 'string' }, submit: { type: 'string' } },
       },
     },
-    required: ['name', 'loginUrl', 'successSignal'],
+    required: ['name', 'loginUrl'],
   },
 };
 
@@ -237,8 +381,9 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
   const result = await sessionLogin({
     name: String(args.name ?? ''),
     loginUrl: String(args.loginUrl ?? ''),
-    successSignal: String(args.successSignal ?? ''),
+    successSignal: args.successSignal != null ? String(args.successSignal) : undefined,
     headed: Boolean(args.headed),
+    timeoutMs: args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
     credKeys: args.credKeys as LoginOptions['credKeys'],
     envFile: args.envFile ? String(args.envFile) : undefined,
     selectors: args.selectors as LoginOptions['selectors'],
