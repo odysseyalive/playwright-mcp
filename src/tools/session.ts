@@ -15,13 +15,23 @@
  * into tool output/logs.
  */
 
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 
 import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { sessionsDir, sessionFilePath, getSecret } from '../secrets.js';
-import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
+import {
+  STEALTH_LAUNCH,
+  STEALTH_INIT,
+  stealthContextOptions,
+  resolveChromePath,
+  defaultChromeUserDataDir,
+} from '../stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:session]', ...args);
 
@@ -35,7 +45,23 @@ export interface LoginOptions {
   // login by "moved past the login page" (see waitForLogin).
   successSignal?: string;
   headed?: boolean; // required for 2FA / SSO / hardware keys
-  timeoutMs?: number; // how long to wait for login (default 300s headed / 30s headless)
+  // Capture via a plain, human-solved Chrome (connectOverCDP) instead of a
+  // Playwright-driven browser. Use for sites behind a Cloudflare/Turnstile
+  // challenge that rejects CDP-driven automation (the challenge loops forever
+  // otherwise). A real Chrome window opens; the human clears the challenge and
+  // logs in, and the authenticated storageState is harvested passively.
+  attach?: boolean;
+  // Which Chrome profile the attach capture uses:
+  //   'temp'   (default) — a fresh throwaway profile; correct for soft walls.
+  //   'system' — the host's REAL default Chrome profile, so an established
+  //              browser's earned trust (cf_clearance, history) carries the
+  //              capture past a HARD Cloudflare wall that hard-challenges a
+  //              fresh profile. The user must fully quit Chrome first. Export
+  //              is auto-scoped to the login site's domain (never the whole jar).
+  //   <path>   — an explicit user-data-dir (e.g. a dedicated persistent capture
+  //              profile that accumulates trust across runs).
+  profile?: 'temp' | 'system' | string;
+  timeoutMs?: number; // how long to wait for login (default 300s headed/attach / 30s headless)
   credKeys?: { user: string; pass: string }; // dotenv key names (project .env / secrets.env)
   envFile?: string; // explicit dotenv file for credKeys (default: ./.env in cwd, then secrets.env)
   selectors?: { user?: string; pass?: string; submit?: string };
@@ -45,7 +71,7 @@ export interface LoginResult {
   name: string;
   path: string;
   capturedAt: string;
-  mode: 'headless' | 'headed';
+  mode: 'headless' | 'headed' | 'attach';
   ok: boolean;
   error?: string;
 }
@@ -114,6 +140,278 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   } finally {
     await browser?.close().catch(() => {});
   }
+}
+
+// ── session_login (attach mode) ─────────────────────────────────────────────────
+// For sites behind a Cloudflare/Turnstile "Just a moment…" managed challenge that
+// rejects CDP-driven browsers (the challenge loops: 403 → challenge → 403). We do
+// NOT try to out-stealth it — that is an arms race. Instead we spawn a PLAIN real
+// Chrome (a normal child process, not chromium.launch — so it carries none of
+// Playwright's automation instrumentation while the human solves the challenge),
+// let the person clear the challenge + log in, then connectOverCDP and read the
+// authenticated storageState back out. A dedicated throwaway profile keeps the
+// user's real Chrome profile untouched.
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** GET a JSON document from the local DevTools HTTP endpoint. */
+function devtoolsJson(port: number, route: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port, path: route, timeout: 4000 }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('devtools endpoint timeout')));
+  });
+}
+
+/** Chrome writes its chosen port to <profile>/DevToolsActivePort once it is up. */
+async function readDevtoolsPort(profile: string, timeout: number): Promise<number> {
+  const f = path.join(profile, 'DevToolsActivePort');
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      const port = parseInt(fs.readFileSync(f, 'utf8').split('\n')[0], 10);
+      if (port > 0) return port;
+    } catch {
+      /* not written yet */
+    }
+    await sleep(300);
+  }
+  throw new Error('Chrome did not open a debugging port (is Google Chrome installed? set PLAYWRIGHT_MCP_CHROME_PATH)');
+}
+
+/** True once the human has moved off the login page (host changed, or path left it). */
+export function leftLoginPage(currentUrl: string, loginUrl: string): boolean {
+  try {
+    const cur = new URL(currentUrl);
+    const lg = new URL(loginUrl);
+    if (cur.host !== lg.host) return true;
+    return !samePath(currentUrl, loginUrl);
+  } catch {
+    return false;
+  }
+}
+
+/** Poll the DevTools endpoint until a page target leaves the login page (challenge cleared + logged in). */
+async function pollAttachedLogin(port: number, loginUrl: string, timeout: number): Promise<void> {
+  const deadline = Date.now() + timeout;
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    let pages: Array<{ type?: string; url?: string; title?: string }> = [];
+    try {
+      pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
+    } catch {
+      /* endpoint hiccup — keep waiting */
+    }
+    const done = pages.some(
+      (p) =>
+        p.type === 'page' &&
+        typeof p.url === 'string' &&
+        leftLoginPage(p.url, loginUrl) &&
+        !/just a moment/i.test(p.title ?? ''),
+    );
+    if (done) {
+      if (!stableSince) stableSince = Date.now();
+      else if (Date.now() - stableSince >= 2000) return;
+    } else {
+      stableSince = 0;
+    }
+    await sleep(1000);
+  }
+  throw new Error(
+    'attach: login was not completed before the timeout — solve the Cloudflare check and finish logging in ' +
+      'in the Chrome window that opened, then it captures automatically',
+  );
+}
+
+const TEMP_PROFILE_MARK = 'pwmcp-attach-';
+
+/** Resolve which Chrome profile the attach capture drives. */
+function resolveAttachProfile(profile: LoginOptions['profile']): { dir: string; isTemp: boolean } {
+  if (!profile || profile === 'temp')
+    return { dir: fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PROFILE_MARK)), isTemp: true };
+  if (profile === 'system') return { dir: defaultChromeUserDataDir(), isTemp: false };
+  return { dir: profile, isTemp: false };
+}
+
+/** Chrome keeps a SingletonLock in its user-data-dir while running → refuse to fight the lock. */
+function profileInUse(dir: string): boolean {
+  return fs.existsSync(path.join(dir, 'SingletonLock')) || fs.existsSync(path.join(dir, 'SingletonSocket'));
+}
+
+/** The registrable-ish domain of a URL (last two labels) — good enough to scope a cookie jar. */
+function siteDomain(u: string): string {
+  try {
+    return new URL(u).hostname.split('.').slice(-2).join('.').toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+type StorageState = { cookies?: Array<{ domain?: string }>; origins?: Array<{ origin?: string }> };
+
+/** Keep only cookies/origins belonging to `domain` (and its subdomains) — never persist the whole jar. */
+export function scopeStorageState(state: StorageState, domain: string): StorageState {
+  if (!domain) return state;
+  const onSite = (host: string) => host === domain || host.endsWith('.' + domain);
+  return {
+    cookies: (state.cookies ?? []).filter((c) => onSite((c.domain ?? '').replace(/^\./, '').toLowerCase())),
+    origins: (state.origins ?? []).filter((o) => {
+      try {
+        return onSite(new URL(o.origin ?? '').hostname.toLowerCase());
+      } catch {
+        return false;
+      }
+    }),
+  };
+}
+
+// ── orphan-proof cleanup ────────────────────────────────────────────────────────
+// A spawned Chrome must never be left running if the tool is interrupted mid-wait.
+// We spawn it in its own process group and record it; the next attach run reaps any
+// TEMP-profile Chrome a prior interrupted run orphaned (verified by cmdline so a
+// reused PID is never mis-killed). A real/system profile is NEVER force-reaped.
+
+interface AttachRec {
+  pid: number;
+  profile: string;
+  startedAt: string;
+}
+const registryPath = () => path.join(sessionsDir(), '.attach-chromes.json');
+function readRegistry(): AttachRec[] {
+  try {
+    return JSON.parse(fs.readFileSync(registryPath(), 'utf8'));
+  } catch {
+    return [];
+  }
+}
+function writeRegistry(recs: AttachRec[]): void {
+  try {
+    fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(registryPath(), JSON.stringify(recs));
+  } catch {
+    /* best effort */
+  }
+}
+function cmdlineMatches(pid: number, needle: string): boolean {
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(needle);
+  } catch {
+    // /proc unavailable (non-Linux) — the temp path is unique enough to trust the record.
+    return process.platform !== 'linux';
+  }
+}
+function killGroup(pid: number): void {
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+}
+/** Reap any TEMP-profile Chrome an interrupted prior run left behind (safe: never touches a real profile). */
+function reapOrphans(): void {
+  const recs = readRegistry();
+  if (!recs.length) return;
+  for (const r of recs) {
+    if (!r.profile.includes(TEMP_PROFILE_MARK)) continue; // only temp spawns are auto-reaped
+    if (cmdlineMatches(r.pid, r.profile)) killGroup(r.pid);
+    try {
+      fs.rmSync(r.profile, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+  writeRegistry([]);
+}
+
+export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
+  reapOrphans(); // clean up anything a previous interrupted run left running
+  const out = sessionFilePath(opts.name);
+  const { dir: profileDir, isTemp } = resolveAttachProfile(opts.profile);
+  const chromePath = resolveChromePath();
+  let child: ReturnType<typeof spawn> | undefined;
+  let cdp: Browser | undefined;
+  try {
+    if (!isTemp && profileInUse(profileDir))
+      throw new Error(
+        `attach: Chrome is already running on ${profileDir} — fully quit Chrome first so this can drive that ` +
+          'profile (needed to ride its established trust past a hard bot wall), then retry',
+      );
+
+    const args = [
+      `--user-data-dir=${profileDir}`,
+      '--remote-debugging-port=0', // 0 = free port, reported via DevToolsActivePort
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--new-window',
+      opts.loginUrl,
+    ];
+    child = spawn(chromePath, args, { stdio: 'ignore', detached: true }); // own process group → clean tree-kill
+    child.on('error', (e) => log(`attach: chrome spawn error: ${e.message}`));
+    if (child.pid && isTemp) registerAttachRecord(child.pid, profileDir);
+    log(
+      `attach login for "${opts.name}" — a real Chrome window opened (${isTemp ? 'temp profile' : profileDir}); ` +
+        'solve the challenge and log in there',
+    );
+
+    const port = await readDevtoolsPort(profileDir, 20_000);
+    await pollAttachedLogin(port, opts.loginUrl, opts.timeoutMs ?? 300_000);
+
+    // Challenge cleared + logged in. Attach passively and read the session out.
+    cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    const ctx = cdp.contexts()[0];
+    if (!ctx) throw new Error('attach: no browser context to export');
+    let state = (await ctx.storageState()) as StorageState;
+    // A real/shared profile carries the user's whole cookie jar — persist ONLY the
+    // login site's cookies. A throwaway temp profile only ever holds the target site.
+    if (!isTemp) state = scopeStorageState(state, siteDomain(opts.loginUrl));
+    fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(out, JSON.stringify(state));
+    fs.chmodSync(out, 0o600);
+    log(
+      `saved session "${opts.name}" → ${out} (mode 600, attach${isTemp ? '' : ', domain-scoped'}, ` +
+        `${state.cookies?.length ?? 0} cookies)`,
+    );
+    return { name: opts.name, path: out, capturedAt: new Date().toISOString(), mode: 'attach', ok: true };
+  } catch (err) {
+    return {
+      name: opts.name,
+      path: out,
+      capturedAt: new Date().toISOString(),
+      mode: 'attach',
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    await cdp?.close().catch(() => {}); // detaches the CDP client — does not close the browser
+    if (child?.pid) {
+      killGroup(child.pid); // kill the Chrome WE spawned (its own process group), whatever profile
+      unregisterAttachRecord(child.pid);
+    }
+    if (isTemp) fs.rmSync(profileDir, { recursive: true, force: true }); // NEVER delete a real profile
+  }
+}
+
+function registerAttachRecord(pid: number, profile: string): void {
+  const recs = readRegistry();
+  recs.push({ pid, profile, startedAt: new Date().toISOString() });
+  writeRegistry(recs);
+}
+function unregisterAttachRecord(pid: number): void {
+  writeRegistry(readRegistry().filter((r) => r.pid !== pid));
 }
 
 type PwPage = import('playwright').Page;
@@ -327,6 +625,9 @@ const loginDefinition: Tool = {
     'OPTIONAL (headed logins auto-detect completion). ' +
     "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
     'user-scoped secrets.env, then process.env — never embedded; tokens are never echoed back. ' +
+    'For a site behind a Cloudflare/Turnstile "Just a moment…" challenge that loops forever under ' +
+    'automation, set attach:true — a real Chrome window opens, the human clears the challenge and ' +
+    'logs in, and the session is harvested passively (no CDP driving during the solve). ' +
     'To freeze a flow as a deterministic test suite that reuses this session, call the ' +
     'session_scaffold_tests tool.',
   inputSchema: {
@@ -348,10 +649,27 @@ const loginDefinition: Tool = {
           'Open a visible browser for 2FA/SSO/hardware keys. Default false. A SEPARATE automation ' +
           'window opens — complete the login there, not in your normal browser.',
       },
+      attach: {
+        type: 'boolean',
+        description:
+          'Capture by attaching to a plain, human-solved real Chrome (connectOverCDP) instead of a ' +
+          'Playwright-driven browser. Use for Cloudflare/Turnstile-gated sites whose challenge loops ' +
+          'under automation. A real Chrome window opens; the human clears the challenge and logs in, ' +
+          'then the authenticated session is read out passively. Ignores successSignal/credKeys.',
+      },
+      profile: {
+        type: 'string',
+        description:
+          'attach-mode Chrome profile. "temp" (default) = fresh throwaway, fine for soft walls. ' +
+          '"system" = the host\'s REAL Chrome profile, so an established browser\'s trust ' +
+          '(cf_clearance, history) carries the capture past a HARD Cloudflare wall that ' +
+          'hard-challenges a fresh profile; the user must fully quit Chrome first and the export is ' +
+          'auto-scoped to the login site\'s domain. Or an explicit user-data-dir path.',
+      },
       timeoutMs: {
         type: 'number',
         description:
-          'How long to wait for the login to complete, in ms. Default 300000 (headed) / 30000 ' +
+          'How long to wait for the login to complete, in ms. Default 300000 (headed/attach) / 30000 ' +
           '(headless credKeys).',
       },
       credKeys: {
@@ -378,16 +696,21 @@ const loginDefinition: Tool = {
 };
 
 async function loginHandler(args: Record<string, unknown>): Promise<CallToolResult> {
-  const result = await sessionLogin({
+  const opts: LoginOptions = {
     name: String(args.name ?? ''),
     loginUrl: String(args.loginUrl ?? ''),
     successSignal: args.successSignal != null ? String(args.successSignal) : undefined,
     headed: Boolean(args.headed),
+    attach: Boolean(args.attach),
+    profile: args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
     timeoutMs: args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
     credKeys: args.credKeys as LoginOptions['credKeys'],
     envFile: args.envFile ? String(args.envFile) : undefined,
     selectors: args.selectors as LoginOptions['selectors'],
-  });
+  };
+  // attach mode harvests a human-solved real Chrome (Cloudflare/Turnstile sites);
+  // otherwise the standard Playwright-driven capture runs.
+  const result = opts.attach ? await sessionAttach(opts) : await sessionLogin(opts);
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: !result.ok };
 }
 

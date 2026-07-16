@@ -19,7 +19,9 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus } = await import('../dist/tools/session.js');
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState } = await import(
+  '../dist/tools/session.js'
+);
 const { getSecret } = await import('../dist/secrets.js');
 
 async function withProjectDir(files, fn) {
@@ -140,6 +142,43 @@ test('session_login: timeout yields a DIAGNOSTIC error, not "All promises were r
   assert.equal(r.ok, false, 'login should fail on a wrong password');
   assert.doesNotMatch(r.error ?? '', /All promises were rejected/, 'no opaque AggregateError');
   assert.match(r.error ?? '', /timed out|login form/, 'actionable diagnostic message');
+});
+
+test('attach: leftLoginPage detects login-complete (host change or path off the login page)', () => {
+  const login = 'https://signin.carsforsale.com/';
+  // Still on the Cloudflare challenge / login page → not done.
+  assert.equal(leftLoginPage('https://signin.carsforsale.com/', login), false);
+  assert.equal(leftLoginPage('https://signin.carsforsale.com/?ReturnUrl=x', login), false);
+  // Redirected to the app on a different host → done.
+  assert.equal(leftLoginPage('https://dealer.carsforsale.com/dashboard', login), true);
+  assert.equal(leftLoginPage('https://www.carsforsale.com/account/', login), true);
+  // Same host but path left the login page → done.
+  const login2 = 'https://app.example.com/login';
+  assert.equal(leftLoginPage('https://app.example.com/login', login2), false);
+  assert.equal(leftLoginPage('https://app.example.com/home', login2), true);
+});
+
+test('attach (profile:system): scopeStorageState keeps ONLY the login domain — never the whole cookie jar', () => {
+  const state = {
+    cookies: [
+      { name: 'cf_clearance', domain: '.carsforsale.com' },
+      { name: 'sess', domain: 'dealer.carsforsale.com' },
+      { name: 'ga', domain: '.google.com' }, // unrelated site — must be dropped
+      { name: 'ftsession', domain: '.ft.com' }, // unrelated site — must be dropped
+    ],
+    origins: [
+      { origin: 'https://signin.carsforsale.com' },
+      { origin: 'https://mail.google.com' }, // dropped
+    ],
+  };
+  const scoped = scopeStorageState(state, 'carsforsale.com');
+  const domains = scoped.cookies.map((c) => c.domain).sort();
+  assert.deepEqual(domains, ['.carsforsale.com', 'dealer.carsforsale.com']);
+  assert.equal(scoped.origins.length, 1);
+  assert.equal(scoped.origins[0].origin, 'https://signin.carsforsale.com');
+  // The privacy invariant: nothing from an unrelated site survives.
+  assert.ok(!JSON.stringify(scoped).includes('google.com'));
+  assert.ok(!JSON.stringify(scoped).includes('ft.com'));
 });
 
 test('session_status: fresh for a valid saved session', async () => {

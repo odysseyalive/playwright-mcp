@@ -17,16 +17,94 @@
  * version). WebGL/canvas spoofing is escalation-only and intentionally absent.
  */
 
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+
 import type { BrowserContextOptions } from 'playwright';
 
 /**
- * Real desktop UA matching the bundled Chromium MAJOR version, with the
- * `HeadlessChrome` token replaced by `Chrome`. Bundled Chromium is currently
- * major 149 (playwright 1.61.0-alpha; chrome-headless-shell 149.x).
- * MAINTENANCE: bump this major in lockstep with the pinned playwright upgrade.
+ * Resolve the host's REAL Google Chrome executable — the same binary
+ * STEALTH_LAUNCH starts (`channel:'chrome'`) and the attach-mode capture spawns.
+ * Override with PLAYWRIGHT_MCP_CHROME_PATH. Shared so the UA below and
+ * tools/session.ts resolve Chrome identically.
  */
-export const CHROME_MAJOR = 149;
-export const STEALTH_UA = `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
+export function resolveChromePath(): string {
+  const env = process.env.PLAYWRIGHT_MCP_CHROME_PATH;
+  if (env && fs.existsSync(env)) return env;
+  const candidates =
+    process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        ]
+      : process.platform === 'win32'
+        ? [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+          ]
+        : [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/opt/google/chrome/chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+          ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  return process.platform === 'win32' ? 'chrome.exe' : 'google-chrome-stable';
+}
+
+/**
+ * The host's default Google Chrome user-data-dir — the REAL profile a person
+ * browses with. attach-mode capture can ride this profile so an established
+ * browser's earned trust (e.g. a Cloudflare `cf_clearance` cookie, real history)
+ * carries the capture past a hard bot wall that hard-challenges a fresh profile.
+ * Override with PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR.
+ */
+export function defaultChromeUserDataDir(): string {
+  const env = process.env.PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR;
+  if (env) return env;
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (process.platform === 'darwin') return `${home}/Library/Application Support/Google/Chrome`;
+  if (process.platform === 'win32')
+    return `${process.env.LOCALAPPDATA || `${home}\\AppData\\Local`}\\Google\\Chrome\\User Data`;
+  return `${home}/.config/google-chrome`;
+}
+
+/** OS platform token the real Chrome reports in its UA, keyed off this host. */
+const PLATFORM_TOKEN =
+  process.platform === 'darwin'
+    ? 'Macintosh; Intel Mac OS X 10_15_7'
+    : process.platform === 'win32'
+      ? 'Windows NT 10.0; Win64; x64'
+      : 'X11; Linux x86_64';
+
+/**
+ * Detect the host's installed Chrome MAJOR at startup so the UA can never drift
+ * out of lockstep with the browser we actually launch. Chrome's own reduced UA
+ * is `<major>.0.0.0`, so the major is all we need for a self-consistent string.
+ * A UA that lies about the version (vs `navigator.userAgentData` Client Hints)
+ * is a Cloudflare/Turnstile tell — this reads the truth instead of hardcoding it.
+ * Runs once at module load (~1 subprocess); falls back to a recent major if the
+ * binary can't be queried. NOTE: attach-mode capture uses the plain real Chrome's
+ * NATIVE UA and never touches this — this only masks the Playwright-driven path.
+ */
+function detectChromeMajor(): number {
+  const FALLBACK = 150;
+  try {
+    const out = execFileSync(resolveChromePath(), ['--version'], {
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString();
+    const m = out.match(/\b(\d+)\.\d+\.\d+/);
+    if (m) return parseInt(m[1], 10);
+  } catch {
+    /* Chrome not queryable — use the fallback below */
+  }
+  return FALLBACK;
+}
+
+export const CHROME_MAJOR = detectChromeMajor();
+export const STEALTH_UA = `Mozilla/5.0 (${PLATFORM_TOKEN}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 
 export const LOCALE = 'en-US';
 export const TIMEZONE = 'America/New_York';
