@@ -65,6 +65,13 @@ function buildInstructions(
     'Browse/debug workflow: browser_navigate → browser_snapshot (accessibility tree; prefer over screenshots) → interact by ref (browser_click, browser_type, …) → verify.',
     'Debugging: browser_console_messages, browser_network_requests. Screenshots: browser_take_screenshot.',
   );
+  if (names.has('session_solve_challenge')) {
+    lines.push(
+      '',
+      'BLOCKED BY A CAPTCHA / BOT WALL: session_solve_challenge opens a real Chrome for the human to solve it once, ' +
+        'then saves the cleared session — reuse it with web_fetch({url, session}). Short-lived (minutes).',
+    );
+  }
   if (names.has('session_scaffold_tests')) {
     lines.push(
       '',
@@ -99,6 +106,7 @@ const REMOTE_DENYLIST = new Set([
   'browser_run_code_unsafe',
   'session_login',
   'session_status',
+  'session_solve_challenge',
   'session_scaffold_tests',
   'browser_file_upload',
   'suite_scaffold',

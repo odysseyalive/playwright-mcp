@@ -19,9 +19,8 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState } = await import(
-  '../dist/tools/session.js'
-);
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp } =
+  await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
 
 async function withProjectDir(files, fn) {
@@ -156,6 +155,95 @@ test('attach: leftLoginPage detects login-complete (host change or path off the 
   const login2 = 'https://app.example.com/login';
   assert.equal(leftLoginPage('https://app.example.com/login', login2), false);
   assert.equal(leftLoginPage('https://app.example.com/home', login2), true);
+});
+
+// The wall states every capture mode must agree on. Both modes compose wallUp(),
+// so this corpus is the shared contract between them — extend it, never fork it.
+const WALLED = [
+  ['https://docs.example.com/guide', 'Just a moment...'],
+  ['https://docs.example.com/guide', 'Attention Required! | Cloudflare'],
+  ['https://docs.example.com/guide', 'Checking your browser before accessing'],
+  ['https://docs.example.com/guide', 'Verifying you are human'],
+  ['https://docs.example.com/guide', 'Access denied'],
+  ['https://docs.example.com/cdn-cgi/challenge-platform/h/b', 'Guide'],
+  ['https://www.google.com/sorry/index', 'Google'],
+];
+
+test('DRIFT GUARD: wallUp() is the ONLY definition of a wall — no second inline check exists', () => {
+  // Two notions of "is the wall still up" is the failure mode this feature is most
+  // prone to: login mode had its own inline /just a moment/i before wallUp() existed.
+  // Catch a reintroduced literal at build time rather than by field bug report.
+  const src = fs.readFileSync(new URL('../src/tools/session.ts', import.meta.url), 'utf8');
+  const wallRegexLiterals = src.match(/\/[^/\n]*(just a moment|challenge-platform|verifying you are human)[^/\n]*\/i/gi) ?? [];
+  assert.equal(
+    wallRegexLiterals.length,
+    2, // WALL_TITLE and WALL_PATH — nothing else may pattern-match a wall
+    `expected exactly the WALL_TITLE + WALL_PATH constants, found ${wallRegexLiterals.length}:\n${wallRegexLiterals.join('\n')}`,
+  );
+});
+
+test('DRIFT GUARD: both capture modes agree on every walled state (shared wallUp corpus)', () => {
+  const loginUrl = 'https://docs.example.com/guide';
+  for (const [url, title] of WALLED) {
+    assert.equal(wallUp(url, title), true, `wallUp missed a wall: ${title} @ ${url}`);
+    // Challenge mode must not complete...
+    assert.equal(challengeCleared(url, loginUrl, title), false, `challenge mode completed on a wall: ${title}`);
+    // ...and neither may login mode, which composes the same predicate. A page that
+    // navigated away but still shows a wall is NOT a finished login.
+    assert.equal(
+      leftLoginPage(url, 'https://docs.example.com/login') && !wallUp(url, title),
+      false,
+      `login mode completed on a wall: ${title}`,
+    );
+  }
+  // A cleared page is cleared for both modes.
+  assert.equal(wallUp('https://docs.example.com/guide', 'Getting Started'), false);
+});
+
+test('challenge: cleared only when the markers vanish on the SAME url (a solve never navigates away)', () => {
+  const walled = 'https://docs.example.com/guide';
+  // The wall is still up — every one of these must keep waiting.
+  assert.equal(challengeCleared(walled, walled, 'Just a moment...'), false);
+  assert.equal(challengeCleared(walled, walled, 'Attention Required! | Cloudflare'), false);
+  assert.equal(challengeCleared(walled, walled, 'Verifying you are human'), false);
+  // A blank title is the challenge shell mid-load, not a cleared page.
+  assert.equal(challengeCleared(walled, walled, ''), false);
+  assert.equal(challengeCleared(walled, walled, '   '), false);
+  // Parked on a dedicated challenge path → still walled, whatever the title says.
+  assert.equal(challengeCleared('https://docs.example.com/cdn-cgi/challenge-platform/x', walled, 'Guide'), false);
+  assert.equal(challengeCleared('https://www.google.com/sorry/index', 'https://www.google.com/search?q=x', 'Google'), false);
+  // Another tab the human opened proves nothing about our wall.
+  assert.equal(challengeCleared('https://mail.example.com/inbox', walled, 'Inbox'), false);
+  // Cleared: same host, real title, no challenge path — the whole point of the mode.
+  assert.equal(challengeCleared(walled, walled, 'Getting Started — Example Docs'), true);
+  // Query/fragment churn on the same page still counts as cleared.
+  assert.equal(challengeCleared(walled + '?ref=1', walled, 'Getting Started'), true);
+  // Garbage in never reads as success.
+  assert.equal(challengeCleared('not a url', walled, 'Guide'), false);
+});
+
+test('challenge: clearanceSummary reports expiry, and WARNS when nothing was actually cleared', () => {
+  const soon = Math.floor(Date.now() / 1000) + 1800; // a cf_clearance is minutes, not days
+  const later = soon + 86_400;
+  // Earliest clearance expiry wins — that is when the artifact really dies.
+  const ok = clearanceSummary({
+    cookies: [
+      { name: 'cf_clearance', expires: later },
+      { name: '__cf_bm', expires: soon },
+      { name: 'unrelated', expires: 1 },
+    ],
+  });
+  assert.equal(ok.expiresAt, new Date(soon * 1000).toISOString());
+  assert.equal(ok.warning, undefined);
+  // A capture with no clearance cookie "succeeded" but is empty — must not pass silently.
+  const none = clearanceSummary({ cookies: [{ name: 'lang', expires: later }] });
+  assert.equal(none.expiresAt, undefined);
+  assert.match(none.warning, /no clearance cookie/i);
+  assert.match(clearanceSummary({}).warning, /no clearance cookie/i);
+  // Playwright encodes a session cookie as expires:-1 — it dies with the browser we kill.
+  const sess = clearanceSummary({ cookies: [{ name: 'cf_clearance', expires: -1 }] });
+  assert.equal(sess.expiresAt, undefined);
+  assert.match(sess.warning, /SESSION cookie/);
 });
 
 test('attach (profile:system): scopeStorageState keeps ONLY the login domain — never the whole cookie jar', () => {

@@ -15,7 +15,7 @@ import { isBlockedIp, isBlockedHostSync, assertEgressAllowed, EgressBlockedError
 import { createOutwardServer } from '../dist/index.js';
 import { buildGitHubAuth } from '../dist/auth.js';
 
-const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_scaffold_tests', 'browser_file_upload', 'suite_scaffold', 'suite_audit'];
+const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_solve_challenge', 'session_scaffold_tests', 'browser_file_upload', 'suite_scaffold', 'suite_audit'];
 const KEEPERS = ['web_fetch', 'browser_evaluate', 'browser_navigate', 'browser_snapshot', 'browser_click'];
 
 // ── egress backstop ───────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ test('egress: assertEgressAllowed throws for blocked, resolves for public', asyn
 
 function stubUpstream() {
   const tools = [...DENYLISTED, ...KEEPERS, 'browser_close']
-    .filter((n) => !['web_fetch', 'session_login', 'session_status', 'session_scaffold_tests'].includes(n)) // these are custom, not upstream
+    .filter((n) => !['web_fetch', 'session_login', 'session_status', 'session_solve_challenge', 'session_scaffold_tests'].includes(n)) // these are custom, not upstream
     .map((name) => ({ name, inputSchema: { type: 'object' } }));
   return {
     listTools: async () => ({ tools }),

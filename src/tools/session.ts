@@ -61,6 +61,12 @@ export interface LoginOptions {
   //   <path>   — an explicit user-data-dir (e.g. a dedicated persistent capture
   //              profile that accumulates trust across runs).
   profile?: 'temp' | 'system' | string;
+  // Capture a CLEARED BOT WALL rather than a login: the human solves the CAPTCHA
+  // and nothing else, so the page never leaves `loginUrl` and the login-shaped
+  // "moved past the login page" predicate can never fire. Completion is instead
+  // "the challenge markers are gone on the SAME url". Implies attach (a wall that
+  // needs a human is exactly the wall that rejects a driven browser).
+  challenge?: boolean;
   timeoutMs?: number; // how long to wait for login (default 300s headed/attach / 30s headless)
   credKeys?: { user: string; pass: string }; // dotenv key names (project .env / secrets.env)
   envFile?: string; // explicit dotenv file for credKeys (default: ./.env in cwd, then secrets.env)
@@ -71,10 +77,24 @@ export interface LoginResult {
   name: string;
   path: string;
   capturedAt: string;
-  mode: 'headless' | 'headed' | 'attach';
+  mode: 'headless' | 'headed' | 'attach' | 'challenge';
   ok: boolean;
   error?: string;
+  // Challenge captures are SHORT-LIVED in a way logins are not — a cf_clearance
+  // measures in minutes, and it expires without ever redirecting to a login page,
+  // so session_status's login-shaped staleness check cannot see it die. Report the
+  // earliest clearance-cookie expiry so the caller can decide, and warn loudly when
+  // no clearance cookie was captured at all (the capture "succeeded" but is empty).
+  expiresAt?: string;
+  warning?: string;
 }
+
+/**
+ * Cookies a bot wall issues to mark a browser as cleared. Presence of one is the
+ * only positive proof a challenge capture actually got something; their expiry is
+ * the real lifetime of the artifact.
+ */
+const CLEARANCE_COOKIES = /^(cf_clearance|__cf_bm|datadome|_abck|bm_sz|reese84|visid_incap_|incap_ses_)/i;
 
 const DEFAULT_SELECTORS = {
   user: 'input[type="email"], input[name="username"], input[name="email"], input[type="text"]',
@@ -201,8 +221,75 @@ export function leftLoginPage(currentUrl: string, loginUrl: string): boolean {
   }
 }
 
-/** Poll the DevTools endpoint until a page target leaves the login page (challenge cleared + logged in). */
-async function pollAttachedLogin(port: number, loginUrl: string, timeout: number): Promise<void> {
+// Markers that say a bot wall is still in front of the human. Titles cover the
+// interstitials; the URL patterns cover walls that park the browser on a dedicated
+// challenge path. DevTools /json/list exposes only type/url/title, so these two are
+// the entire signal available WITHOUT attaching over CDP — and we deliberately do
+// not attach mid-solve, because driving the page is what makes the wall loop.
+const WALL_TITLE =
+  /just a moment|attention required|checking your browser|verifying you are human|one moment,? please|please wait|access denied|are you a robot|security check/i;
+const WALL_PATH = /\/(sorry|cdn-cgi\/challenge|challenge-platform|captcha|_incapsula_)/i;
+
+/**
+ * THE single authority on "is a bot wall still in front of the human". Both capture
+ * modes compose this one predicate rather than carrying their own idea of a wall:
+ *
+ *   login mode     → navigated away  AND NOT wallUp()
+ *   challenge mode → still on target AND NOT wallUp()
+ *
+ * The modes genuinely differ in the FIRST half — a login navigates, a CAPTCHA solve
+ * does not — and share the second half completely. Keeping the shared half in one
+ * place is what stops the two from drifting as new wall vendors get added.
+ *
+ * NEVER inline a challenge-title/path check anywhere else in this file. A second
+ * definition is the whole failure mode this exists to prevent, and
+ * scripts/test-session.mjs fails the build if one appears.
+ */
+export function wallUp(currentUrl: string, title: string): boolean {
+  if (WALL_TITLE.test(title)) return true;
+  try {
+    return WALL_PATH.test(new URL(currentUrl).pathname);
+  } catch {
+    return false; // an unparseable url is not evidence of a wall
+  }
+}
+
+/**
+ * True once the bot wall on `targetUrl` appears cleared — the SAME-url counterpart
+ * to leftLoginPage(). A CAPTCHA solve ends where it started, so "moved off the page"
+ * proves nothing here; what we look for is wallUp() going false while still on the
+ * target host.
+ *
+ * Deliberately conservative: an empty title is the challenge shell mid-load, and a
+ * foreign host is some other tab the human opened — neither is evidence of success.
+ * A false negative costs a longer wait; a false positive saves a worthless artifact.
+ */
+export function challengeCleared(currentUrl: string, targetUrl: string, title: string): boolean {
+  let cur: URL;
+  let tgt: URL;
+  try {
+    cur = new URL(currentUrl);
+    tgt = new URL(targetUrl);
+  } catch {
+    return false;
+  }
+  if (cur.host !== tgt.host) return false; // another tab says nothing about our wall
+  if (!title.trim()) return false; // the challenge shell before the real document
+  return !wallUp(currentUrl, title);
+}
+
+/**
+ * Poll the DevTools endpoint until `isDone` holds for one of the open page targets,
+ * stable for 2s (a challenge clear flickers through intermediate states before the
+ * real document settles). Passive by construction: HTTP reads of /json/list only,
+ * never a CDP attach, so nothing drives the page while the human works.
+ */
+async function pollAttached(
+  port: number,
+  isDone: (page: { url: string; title: string }) => boolean,
+  timeout: number,
+  timeoutMessage: string,
+): Promise<void> {
   const deadline = Date.now() + timeout;
   let stableSince = 0;
   while (Date.now() < deadline) {
@@ -213,11 +300,7 @@ async function pollAttachedLogin(port: number, loginUrl: string, timeout: number
       /* endpoint hiccup — keep waiting */
     }
     const done = pages.some(
-      (p) =>
-        p.type === 'page' &&
-        typeof p.url === 'string' &&
-        leftLoginPage(p.url, loginUrl) &&
-        !/just a moment/i.test(p.title ?? ''),
+      (p) => p.type === 'page' && typeof p.url === 'string' && isDone({ url: p.url, title: p.title ?? '' }),
     );
     if (done) {
       if (!stableSince) stableSince = Date.now();
@@ -227,20 +310,91 @@ async function pollAttachedLogin(port: number, loginUrl: string, timeout: number
     }
     await sleep(1000);
   }
-  throw new Error(
+  throw new Error(timeoutMessage);
+}
+
+/** Wait for the human to clear the wall AND finish logging in (page leaves the login url). */
+const pollAttachedLogin = (port: number, loginUrl: string, timeout: number): Promise<void> =>
+  pollAttached(
+    port,
+    (p) => leftLoginPage(p.url, loginUrl) && !wallUp(p.url, p.title),
+    timeout,
     'attach: login was not completed before the timeout — solve the Cloudflare check and finish logging in ' +
       'in the Chrome window that opened, then it captures automatically',
   );
-}
+
+/** Wait for the human to clear the wall only — no login expected, same url throughout. */
+const pollAttachedChallenge = (port: number, url: string, timeout: number): Promise<void> =>
+  pollAttached(
+    port,
+    (p) => challengeCleared(p.url, url, p.title),
+    timeout,
+    'attach: the challenge was not cleared before the timeout — solve the CAPTCHA in the Chrome window ' +
+      'that opened and stay on the page; it captures automatically once the real content loads',
+  );
 
 const TEMP_PROFILE_MARK = 'pwmcp-attach-';
+const mkTempProfile = () => fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PROFILE_MARK));
 
-/** Resolve which Chrome profile the attach capture drives. */
-function resolveAttachProfile(profile: LoginOptions['profile']): { dir: string; isTemp: boolean } {
-  if (!profile || profile === 'temp')
-    return { dir: fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PROFILE_MARK)), isTemp: true };
-  if (profile === 'system') return { dir: defaultChromeUserDataDir(), isTemp: false };
-  return { dir: profile, isTemp: false };
+interface AttachProfile {
+  dir: string; // the user-data-dir Chrome actually drives
+  cleanup: boolean; // rm `dir` afterwards (fresh temp + profile copies; NEVER a real profile)
+  scope: boolean; // domain-scope the export (a real cookie jar is involved)
+  guardDir?: string; // a running Chrome on this dir blocks the capture (SingletonLock)
+  copyFrom?: string; // copy trust-bearing essentials from here into `dir` before launch
+}
+
+/**
+ * Resolve which Chrome profile the attach capture drives.
+ *  - 'temp'   → fresh throwaway (fine for soft walls).
+ *  - 'system' → Chrome 136+ DISABLES --remote-debugging-port on the DEFAULT
+ *               user-data-dir (an anti-cookie-theft security fix), so we cannot
+ *               drive it in place. Instead copy its trust-bearing essentials
+ *               (Local State + cookies) into a fresh NON-default dir and drive
+ *               that — the copy carries the same cf_clearance the real browser
+ *               earned, and the debug port is allowed. Export is domain-scoped.
+ *  - <path>   → an explicit non-default user-data-dir, driven in place.
+ */
+function resolveAttachProfile(profile: LoginOptions['profile']): AttachProfile {
+  if (!profile || profile === 'temp') return { dir: mkTempProfile(), cleanup: true, scope: false };
+  if (profile === 'system') {
+    const src = defaultChromeUserDataDir();
+    return { dir: mkTempProfile(), cleanup: true, scope: true, guardDir: src, copyFrom: src };
+  }
+  return { dir: profile, cleanup: false, scope: true, guardDir: profile };
+}
+
+/**
+ * Copy just the trust-bearing profile files (cookies + the Local State that
+ * holds the OS-keyring-wrapped cookie key, so the copied cookies still decrypt)
+ * into a fresh dir. Small and fast — never the multi-GB caches.
+ */
+function copyProfileEssentials(src: string, dst: string): void {
+  const rels = [
+    'Local State',
+    'Default/Cookies',
+    'Default/Cookies-journal',
+    'Default/Network/Cookies',
+    'Default/Network/Cookies-journal',
+    'Default/Preferences',
+    'Default/Secure Preferences',
+  ];
+  for (const rel of rels) {
+    const s = path.join(src, rel);
+    if (!fs.existsSync(s)) continue;
+    const d = path.join(dst, rel);
+    try {
+      fs.mkdirSync(path.dirname(d), { recursive: true });
+      fs.copyFileSync(s, d);
+    } catch {
+      /* skip a file we can't read */
+    }
+  }
+  try {
+    fs.writeFileSync(path.join(dst, 'First Run'), ''); // skip the first-run UI
+  } catch {
+    /* ignore */
+  }
 }
 
 /** Chrome keeps a SingletonLock in its user-data-dir while running → refuse to fight the lock. */
@@ -257,7 +411,29 @@ function siteDomain(u: string): string {
   }
 }
 
-type StorageState = { cookies?: Array<{ domain?: string }>; origins?: Array<{ origin?: string }> };
+type StorageState = {
+  cookies?: Array<{ domain?: string; name?: string; expires?: number }>;
+  origins?: Array<{ origin?: string }>;
+};
+
+/**
+ * Summarise what a challenge capture actually caught. Playwright records `expires`
+ * as a Unix SECONDS float, with -1 for a session cookie (dies with the browser —
+ * useless to us, since the browser is killed on the way out).
+ */
+export function clearanceSummary(state: StorageState): { expiresAt?: string; warning?: string } {
+  const cleared = (state.cookies ?? []).filter((c) => CLEARANCE_COOKIES.test(c.name ?? ''));
+  if (!cleared.length)
+    return {
+      warning:
+        'no clearance cookie (cf_clearance/datadome/_abck/…) was captured — the wall may not have been ' +
+        'cleared, or it marks trust some other way; verify with a web_fetch({session}) read before relying on this',
+    };
+  const expiries = cleared.map((c) => c.expires ?? -1).filter((e) => e > 0);
+  if (!expiries.length)
+    return { warning: 'the clearance cookie is a SESSION cookie — it does not survive the captured browser closing' };
+  return { expiresAt: new Date(Math.min(...expiries) * 1000).toISOString() };
+}
 
 /** Keep only cookies/origins belonging to `domain` (and its subdomains) — never persist the whole jar. */
 export function scopeStorageState(state: StorageState, domain: string): StorageState {
@@ -340,19 +516,22 @@ function reapOrphans(): void {
 export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   reapOrphans(); // clean up anything a previous interrupted run left running
   const out = sessionFilePath(opts.name);
-  const { dir: profileDir, isTemp } = resolveAttachProfile(opts.profile);
+  const prof = resolveAttachProfile(opts.profile);
   const chromePath = resolveChromePath();
   let child: ReturnType<typeof spawn> | undefined;
   let cdp: Browser | undefined;
   try {
-    if (!isTemp && profileInUse(profileDir))
+    if (prof.guardDir && profileInUse(prof.guardDir))
       throw new Error(
-        `attach: Chrome is already running on ${profileDir} — fully quit Chrome first so this can drive that ` +
-          'profile (needed to ride its established trust past a hard bot wall), then retry',
+        `attach: Chrome is running on ${prof.guardDir} — fully quit it first (all windows AND any ` +
+          "background process) so its trust cookies can be read cleanly, then retry",
       );
+    // 'system' rides the real profile's trust: copy its cookies into the fresh
+    // (non-default) dir we drive, so Chrome 136+ still allows the debug port.
+    if (prof.copyFrom) copyProfileEssentials(prof.copyFrom, prof.dir);
 
     const args = [
-      `--user-data-dir=${profileDir}`,
+      `--user-data-dir=${prof.dir}`,
       '--remote-debugging-port=0', // 0 = free port, reported via DevToolsActivePort
       '--no-first-run',
       '--no-default-browser-check',
@@ -361,14 +540,17 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     ];
     child = spawn(chromePath, args, { stdio: 'ignore', detached: true }); // own process group → clean tree-kill
     child.on('error', (e) => log(`attach: chrome spawn error: ${e.message}`));
-    if (child.pid && isTemp) registerAttachRecord(child.pid, profileDir);
+    if (child.pid && prof.cleanup) registerAttachRecord(child.pid, prof.dir); // temp/copy dirs are reap-eligible
     log(
-      `attach login for "${opts.name}" — a real Chrome window opened (${isTemp ? 'temp profile' : profileDir}); ` +
-        'solve the challenge and log in there',
+      opts.challenge
+        ? `attach challenge for "${opts.name}" — a real Chrome window opened; solve the CAPTCHA there and stay on the page`
+        : `attach login for "${opts.name}" — a real Chrome window opened; solve the challenge and log in there`,
     );
 
-    const port = await readDevtoolsPort(profileDir, 20_000);
-    await pollAttachedLogin(port, opts.loginUrl, opts.timeoutMs ?? 300_000);
+    const port = await readDevtoolsPort(prof.dir, 20_000);
+    const waitMs = opts.timeoutMs ?? 300_000;
+    if (opts.challenge) await pollAttachedChallenge(port, opts.loginUrl, waitMs);
+    else await pollAttachedLogin(port, opts.loginUrl, waitMs);
 
     // Challenge cleared + logged in. Attach passively and read the session out.
     cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
@@ -377,31 +559,43 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     let state = (await ctx.storageState()) as StorageState;
     // A real/shared profile carries the user's whole cookie jar — persist ONLY the
     // login site's cookies. A throwaway temp profile only ever holds the target site.
-    if (!isTemp) state = scopeStorageState(state, siteDomain(opts.loginUrl));
+    if (prof.scope) state = scopeStorageState(state, siteDomain(opts.loginUrl));
     fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
     fs.writeFileSync(out, JSON.stringify(state));
     fs.chmodSync(out, 0o600);
+    const kind = opts.challenge ? 'challenge' : 'attach';
     log(
-      `saved session "${opts.name}" → ${out} (mode 600, attach${isTemp ? '' : ', domain-scoped'}, ` +
+      `saved session "${opts.name}" → ${out} (mode 600, ${kind}${prof.scope ? ', domain-scoped' : ''}, ` +
         `${state.cookies?.length ?? 0} cookies)`,
     );
-    return { name: opts.name, path: out, capturedAt: new Date().toISOString(), mode: 'attach', ok: true };
+    // Only challenge captures get clearance telemetry — for a login the meaningful
+    // lifetime is the auth cookie's, which session_status already probes for.
+    const clearance = opts.challenge ? clearanceSummary(state) : {};
+    if (clearance.warning) log(`warning: ${clearance.warning}`);
+    return {
+      name: opts.name,
+      path: out,
+      capturedAt: new Date().toISOString(),
+      mode: opts.challenge ? 'challenge' : 'attach',
+      ok: true,
+      ...clearance,
+    };
   } catch (err) {
     return {
       name: opts.name,
       path: out,
       capturedAt: new Date().toISOString(),
-      mode: 'attach',
+      mode: opts.challenge ? 'challenge' : 'attach',
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };
   } finally {
     await cdp?.close().catch(() => {}); // detaches the CDP client — does not close the browser
     if (child?.pid) {
-      killGroup(child.pid); // kill the Chrome WE spawned (its own process group), whatever profile
+      killGroup(child.pid); // kill the Chrome WE spawned (its own process group)
       unregisterAttachRecord(child.pid);
     }
-    if (isTemp) fs.rmSync(profileDir, { recursive: true, force: true }); // NEVER delete a real profile
+    if (prof.cleanup) fs.rmSync(prof.dir, { recursive: true, force: true }); // NEVER delete a real profile
   }
 }
 
@@ -628,6 +822,8 @@ const loginDefinition: Tool = {
     'For a site behind a Cloudflare/Turnstile "Just a moment…" challenge that loops forever under ' +
     'automation, set attach:true — a real Chrome window opens, the human clears the challenge and ' +
     'logs in, and the session is harvested passively (no CDP driving during the solve). ' +
+    'To capture a CLEARED BOT WALL with NO login at all (the human just solves the CAPTCHA), use the ' +
+    'session_solve_challenge tool instead. ' +
     'To freeze a flow as a deterministic test suite that reuses this session, call the ' +
     'session_scaffold_tests tool.',
   inputSchema: {
@@ -661,9 +857,10 @@ const loginDefinition: Tool = {
         type: 'string',
         description:
           'attach-mode Chrome profile. "temp" (default) = fresh throwaway, fine for soft walls. ' +
-          '"system" = the host\'s REAL Chrome profile, so an established browser\'s trust ' +
-          '(cf_clearance, history) carries the capture past a HARD Cloudflare wall that ' +
-          'hard-challenges a fresh profile; the user must fully quit Chrome first and the export is ' +
+          '"system" = copy the host\'s REAL Chrome profile\'s trust cookies (cf_clearance) into the ' +
+          'driven profile, so an established browser\'s trust carries the capture past a HARD ' +
+          'Cloudflare wall that hard-challenges a fresh profile (Chrome 136+ blocks the debug port on ' +
+          'the default dir, hence the copy); the user must fully quit Chrome first and the export is ' +
           'auto-scoped to the login site\'s domain. Or an explicit user-data-dir path.',
       },
       timeoutMs: {
@@ -740,5 +937,62 @@ async function statusHandler(args: Record<string, unknown>): Promise<CallToolRes
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
 
+// ── session_solve_challenge ───────────────────────────────────────────────────
+// A separate FRONT DOOR over the same capture engine (sessionAttach) and the same
+// wall predicate (wallUp). It exists because the two jobs read nothing alike to a
+// caller — "log in" wants credentials and a success marker, "clear this wall" wants
+// neither and would have to document them as ignored. The IMPLEMENTATION is shared
+// on purpose: a second copy of the capture logic, or a second idea of what a wall
+// is, is exactly the drift this split must not introduce.
+
+const solveChallengeDefinition: Tool = {
+  name: 'session_solve_challenge',
+  description:
+    'Get past a CAPTCHA / bot wall (Cloudflare, Turnstile, DataDome) by having the human solve it ' +
+    'ONCE, then save the cleared session for reuse — the no-login counterpart to session_login. ' +
+    'A real Chrome window opens on the walled page; the person solves the challenge and stays put; ' +
+    'the cleared session is harvested passively (never CDP-driven during the solve, which is what ' +
+    'makes a managed challenge loop forever) and written to a mode-600 storageState file. Reuse it ' +
+    'with web_fetch({url, session}) to read a page that is otherwise unreachable. NOTE the artifact ' +
+    'is SHORT-LIVED — a clearance cookie lasts minutes, not days; the result reports expiresAt, and ' +
+    'session_status cannot detect this kind of expiry. If a fresh profile keeps getting hard-' +
+    'challenged, retry with profile:"system" to ride your real browser\'s established trust.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'A name for the saved session (file basename).' },
+      url: { type: 'string', description: 'The walled page to open and clear.' },
+      profile: {
+        type: 'string',
+        description:
+          '"temp" (default) = fresh throwaway profile, fine for soft walls. "system" = copy the host\'s ' +
+          "REAL Chrome profile's trust cookies (cf_clearance) into the driven profile so an established " +
+          'browser\'s trust carries the capture past a HARD wall (the user must fully quit Chrome first; ' +
+          'the export is auto-scoped to the site\'s domain). Or an explicit user-data-dir path.',
+      },
+      timeoutMs: {
+        type: 'number',
+        description: 'How long to wait for the human to clear the challenge, in ms. Default 300000.',
+      },
+    },
+    required: ['name', 'url'],
+  },
+};
+
+async function solveChallengeHandler(args: Record<string, unknown>): Promise<CallToolResult> {
+  // Delegates to the SAME engine session_login's attach mode uses — only the
+  // completion predicate differs, and that difference lives in sessionAttach.
+  const result = await sessionAttach({
+    name: String(args.name ?? ''),
+    loginUrl: String(args.url ?? ''),
+    challenge: true,
+    attach: true,
+    profile: args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
+    timeoutMs: args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
+  });
+  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: !result.ok };
+}
+
 export const sessionLoginTool = { definition: loginDefinition, handler: loginHandler };
 export const sessionStatusTool = { definition: statusDefinition, handler: statusHandler };
+export const sessionSolveChallengeTool = { definition: solveChallengeDefinition, handler: solveChallengeHandler };
