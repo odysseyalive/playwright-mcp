@@ -79,7 +79,8 @@ function buildInstructions(
     lines.push(
       '',
       'BLOCKED BY A CAPTCHA / BOT WALL: session_solve_challenge opens a real Chrome for the human to solve it once, ' +
-        'then saves the cleared session — reuse it with web_fetch({url, session}). Short-lived (minutes).',
+        'then saves the cleared session AND binds it exactly as session_login does — browser_* and ' +
+        'web_fetch({url, session}) both get past the wall afterwards. Short-lived (minutes); re-solve when it lapses.',
     );
   }
   if (names.has('session_scaffold_tests')) {

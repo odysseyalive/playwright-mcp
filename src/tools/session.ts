@@ -1067,28 +1067,35 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
   // otherwise the standard Playwright-driven capture runs.
   const result = opts.attach ? await sessionAttach(opts) : await sessionLogin(opts);
 
-  // Bind the browser to what we just captured. "Log in once" has to mean the
-  // WHOLE toolset is logged in — otherwise browser_* stay anonymous and the
-  // caller has to log in a second time by hand to click anything, which is the
-  // gap this package existed to close. Read paths (web_fetch) and interactive
-  // paths (browser_*) now come from the same capture.
-  let bound: string | undefined;
+  return bindAndReport(result);
+}
+
+/**
+ * Point the browser_* tools at a capture that just succeeded, then report it.
+ *
+ * Shared by session_login AND session_solve_challenge on purpose: both write the
+ * same kind of storageState artifact into the same store, so both must leave the
+ * interactive tools able to USE it. A cleared bot wall that browser_* cannot see
+ * is exactly as useless as a login they cannot see — and two copies of this
+ * logic would be two chances for the modes to drift apart.
+ *
+ * A bind failure never masquerades as a capture failure: the artifact is on disk
+ * either way, so `ok` still reflects the capture and the bind problem is
+ * reported alongside it.
+ */
+async function bindAndReport(result: LoginResult): Promise<CallToolResult> {
+  let boundTo: string | undefined;
   let bindError: string | undefined;
   if (result.ok) {
     try {
-      await bindSession(opts.name);
-      bound = opts.name;
+      await bindSession(result.name);
+      boundTo = result.name;
     } catch (err) {
-      // The capture itself succeeded and is on disk — surface the bind failure
-      // without pretending the login failed.
       bindError = err instanceof Error ? err.message : String(err);
     }
   }
-
   return {
-    content: [
-      { type: 'text', text: JSON.stringify({ ...result, boundTo: bound, bindError }, null, 2) },
-    ],
+    content: [{ type: 'text', text: JSON.stringify({ ...result, boundTo, bindError }, null, 2) }],
     isError: !result.ok,
   };
 }
@@ -1221,7 +1228,10 @@ async function solveChallengeHandler(args: Record<string, unknown>): Promise<Cal
     profile: args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
     timeoutMs: args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
   });
-  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: !result.ok };
+  // Same binding as a login: clearing a wall is only worth doing if the tools
+  // that hit the wall can then get past it. Note the clearance is short-lived
+  // (see clearanceSummary's expiresAt) — the bind lasts as long as the cookies do.
+  return bindAndReport(result);
 }
 
 export const sessionLoginTool = { definition: loginDefinition, handler: loginHandler };

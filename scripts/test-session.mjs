@@ -300,6 +300,28 @@ test('makeAttachLoginCheck: an SSO redirect is the START of a login, not the end
   assert.equal(done3({ url: 'https://app.example.com/home', title: 'Just a moment...' }), false);
 });
 
+// Both capture modes write the same kind of artifact to the same store, so both
+// must leave browser_* able to use it. A cleared wall the interactive tools
+// cannot see is as useless as a login they cannot see. Assert the two handlers
+// share ONE bind path rather than each carrying their own copy to drift.
+test('session_login and session_solve_challenge share one bind path', async () => {
+  const src = fs.readFileSync(new URL('../src/tools/session.ts', import.meta.url), 'utf8');
+
+  const loginTail = src.slice(src.indexOf('async function loginHandler'));
+  const challengeTail = src.slice(src.indexOf('async function solveChallengeHandler'));
+  assert.match(loginTail.slice(0, 1200), /return bindAndReport\(/, 'login binds via the shared helper');
+  assert.match(challengeTail.slice(0, 1200), /return bindAndReport\(/, 'challenge binds via the shared helper');
+
+  // Exactly one implementation of the bind, so the modes cannot diverge.
+  const impls = src.match(/async function bindAndReport\(/g) ?? [];
+  assert.equal(impls.length, 1, 'exactly one bindAndReport implementation');
+
+  // ...and it is the ONLY place bindSession is called from the tool handlers,
+  // aside from session_attach's own explicit re-bind.
+  const callers = src.match(/await bindSession\(/g) ?? [];
+  assert.ok(callers.length <= 2, `bindSession called from ${callers.length} sites; expected <= 2`);
+});
+
 // The wall states every capture mode must agree on. Both modes compose wallUp(),
 // so this corpus is the shared contract between them — extend it, never fork it.
 const WALLED = [
