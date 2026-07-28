@@ -717,6 +717,32 @@ function samePath(a: string, b: string): boolean {
   return norm(a) === norm(b);
 }
 
+/**
+ * Does `sig` identify the page we LANDED on, read as a post-login URL marker?
+ *
+ * Matched against origin+pathname, never the query string. An OAuth login page
+ * carries its own callback in the query — DocuSign's is
+ * `…/oauth/auth?redirect_uri=https%3A%2F%2Fapps.docusign.com%2Fauthenticate` —
+ * so a perfectly sensible marker like "apps.docusign.com" is already present on
+ * the login page and matches instantly. A marker describes where the human ends
+ * up, not what is embedded in the URL of where they are.
+ *
+ * The samePath() guard is kept for the case the marker names the login host
+ * itself: the flow may walk several paths on that host before it is done.
+ */
+export function urlMarkerHit(currentUrl: string, sig: string, loginUrl: string): boolean {
+  const bare = (u: string) => {
+    try {
+      const { origin, pathname } = new URL(u);
+      return (origin + pathname).toLowerCase();
+    } catch {
+      return u.toLowerCase();
+    }
+  };
+  if (!bare(currentUrl).includes(sig.toLowerCase())) return false;
+  return !samePath(currentUrl, loginUrl);
+}
+
 /** Is a password field still on the page? (⇒ almost certainly still the login form.) */
 async function hasPasswordField(page: PwPage): Promise<boolean> {
   return (await page.locator('input[type="password"]').count().catch(() => 0)) > 0;
@@ -782,7 +808,7 @@ async function waitForLogin(
     );
     arms.push(
       page
-        .waitForURL((u) => u.toString().includes(sig) && !samePath(u.toString(), loginUrl), { timeout })
+        .waitForURL((u) => urlMarkerHit(u.toString(), sig, loginUrl), { timeout })
         .then(() => {}),
     );
   }

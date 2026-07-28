@@ -19,7 +19,7 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit } =
   await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
 
@@ -238,6 +238,32 @@ test('siteCookies: target-site evidence, matching scopeStorageState host rules',
   // the two helpers share one host rule so they cannot disagree.
   const scoped = scopeStorageState(state, 'docusign.com');
   assert.equal(siteCookies(scoped, 'docusign.com').length, scoped.cookies.length);
+});
+
+// Regression: an OAuth login page embeds its own callback in the query string,
+// so a post-login marker naming the app host was already present ON the login
+// page and matched instantly. Markers describe where you LAND, not what is
+// embedded in the URL of where you are.
+test('urlMarkerHit: a marker in the OAuth query string is not a landing', () => {
+  const login =
+    'https://account.docusign.com/oauth/auth?redirect_uri=https%3A%2F%2Fapps.docusign.com%2Fauthenticate&state=x';
+  const step2 =
+    'https://account.docusign.com/username?redirect_uri=https%3A%2F%2Fapps.docusign.com%2Fauthenticate&state=x';
+
+  // Still mid-login: the marker appears ONLY inside the query string.
+  assert.equal(urlMarkerHit(login, 'apps.docusign.com', login), false, 'login page must not self-match');
+  assert.equal(urlMarkerHit(step2, 'apps.docusign.com', login), false, 'email step must not match either');
+
+  // Actually landed on the app.
+  assert.equal(urlMarkerHit('https://apps.docusign.com/send', 'apps.docusign.com', login), true);
+
+  // A marker naming the login HOST still needs the path to have moved on.
+  assert.equal(urlMarkerHit(login, 'account.docusign.com', login), false, 'same path = not done');
+  assert.equal(urlMarkerHit(step2, 'account.docusign.com', login), true, 'moved to a new path = done');
+
+  // Case-insensitive, and an unparseable URL must not throw.
+  assert.equal(urlMarkerHit('https://APPS.docusign.com/send', 'apps.docusign.com', login), true);
+  assert.doesNotThrow(() => urlMarkerHit('not a url', 'x', login));
 });
 
 // The wall states every capture mode must agree on. Both modes compose wallUp(),
