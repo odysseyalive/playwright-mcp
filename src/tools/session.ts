@@ -759,8 +759,16 @@ async function waitForLogin(
   signal: string | undefined,
   timeout: number,
 ): Promise<void> {
-  const arms: Promise<unknown>[] = [waitPastLogin(page, loginUrl, timeout)];
   const sig = signal?.trim();
+  // The generic heuristic is a FALLBACK, not a co-equal racer. Multi-step logins
+  // walk through several pages that all satisfy it — DocuSign goes
+  // /oauth/auth → /username for email entry: new path, no password field, so
+  // waitPastLogin() calls it done while the human is still on step one. Under
+  // Promise.any the loosest signal always wins, which silently defeats the very
+  // marker the caller supplied to prevent that. When the caller has said what
+  // success looks like, only that counts; a marker that never matches must
+  // surface as a diagnostic timeout, not as a wrong success.
+  const arms: Promise<unknown>[] = sig ? [] : [waitPastLogin(page, loginUrl, timeout)];
   if (sig) {
     // (a) CSS/XPath/Playwright-engine selector, (b) visible text, (c) URL
     // substring — but guarded so the login URL itself never counts (D).

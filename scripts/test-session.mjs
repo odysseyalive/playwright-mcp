@@ -126,6 +126,24 @@ test('session_login: a VISIBLE-TEXT successSignal matches (not just a CSS select
   assert.equal(r.ok, true, r.error ?? 'text-marker login ok');
 });
 
+test('session_login: an explicit successSignal is NOT preempted by the generic heuristic', async () => {
+  // Multi-step logins walk through pages that satisfy waitPastLogin() (new path,
+  // no password field) while the human is still mid-login. Racing the heuristic
+  // against the caller's marker means the loosest signal wins and the marker is
+  // pointless. Here /app IS reachable and DOES move off /login, so the heuristic
+  // would resolve — but the marker names something that never appears, so the
+  // call must TIME OUT rather than report a success the caller did not ask for.
+  const r = await sessionLogin({
+    name: 'signal-wins',
+    loginUrl: `${base}/login`,
+    successSignal: 'this-marker-never-appears-anywhere',
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+    timeoutMs: 2500,
+  });
+  assert.equal(r.ok, false, 'an unmatched marker must not be rescued by the heuristic');
+  assert.doesNotMatch(r.error ?? '', /All promises were rejected/, 'still a readable diagnostic');
+});
+
 test('session_login: timeout yields a DIAGNOSTIC error, not "All promises were rejected"', async () => {
   // C+D: correct key names but a WRONG password value → the form fills and
   // submits, the app bounces back to /login (password field still present), so
