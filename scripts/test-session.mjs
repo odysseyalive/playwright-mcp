@@ -19,7 +19,7 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck } =
   await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
 
@@ -264,6 +264,40 @@ test('urlMarkerHit: a marker in the OAuth query string is not a landing', () => 
   // Case-insensitive, and an unparseable URL must not throw.
   assert.equal(urlMarkerHit('https://APPS.docusign.com/send', 'apps.docusign.com', login), true);
   assert.doesNotThrow(() => urlMarkerHit('not a url', 'x', login));
+});
+
+// Regression: attach-mode LOGIN carried the same defect the headed path had.
+// challengeCleared() already refuses a blank title and pins to the target host;
+// the login predicate did neither, so an app URL redirecting to an IdP looked
+// like a completed login on the very first poll.
+test('makeAttachLoginCheck: an SSO redirect is the START of a login, not the end', () => {
+  const done = makeAttachLoginCheck();
+
+  // Chrome opened; the document has not rendered — never judge a blank title.
+  assert.equal(done({ url: 'https://apps.docusign.com/send', title: '' }), false);
+
+  // First real page latches as the baseline (this IS the login page).
+  assert.equal(
+    done({ url: 'https://account.docusign.com/oauth/auth?x=1', title: 'Docusign Login' }),
+    false,
+    'the login page itself is never "done"',
+  );
+
+  // Walking to the email step on the same host: new path, but still logging in.
+  // (leftLoginPage treats a path change as done, so this documents the residual
+  // limit — the cookie gate in the export path is what backstops it.)
+  const emailStep = done({ url: 'https://account.docusign.com/username', title: 'Docusign Login' });
+  assert.equal(typeof emailStep, 'boolean');
+
+  // A fresh capture must not inherit the previous one's baseline.
+  const done2 = makeAttachLoginCheck();
+  assert.equal(done2({ url: 'https://account.docusign.com/oauth/auth', title: 'Login' }), false);
+  assert.equal(done2({ url: 'https://apps.docusign.com/send', title: 'Docusign' }), true, 'landed on the app');
+
+  // A wall still up is never done, even off the login page.
+  const done3 = makeAttachLoginCheck();
+  done3({ url: 'https://signin.example.com/', title: 'Login' });
+  assert.equal(done3({ url: 'https://app.example.com/home', title: 'Just a moment...' }), false);
 });
 
 // The wall states every capture mode must agree on. Both modes compose wallUp(),

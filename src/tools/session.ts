@@ -355,11 +355,39 @@ async function pollAttached(
   throw new Error(timeoutMessage);
 }
 
+/**
+ * "Has the human finished logging in", for attach mode.
+ *
+ * Two traps, both of which challengeCleared() already avoids and this did not:
+ *
+ *  1. The caller's URL is usually an APP url that redirects to the identity
+ *     provider. leftLoginPage()'s host rule then fires on the redirect INTO the
+ *     login screen — the redirect that STARTS an SSO login reads as finishing
+ *     one. So latch the first page actually observed as the real login page,
+ *     the same settled-URL baseline sessionLogin() takes.
+ *  2. A page whose title has not rendered yet is not evidence of anything;
+ *     judging it races the browser. challengeCleared() guards this explicitly.
+ *
+ * Exported as a factory because the latch is per-capture state: each call gets
+ * its own baseline, and tests can drive the sequence directly.
+ */
+export function makeAttachLoginCheck(): (p: { url: string; title: string }) => boolean {
+  let baseline: string | undefined;
+  return (p) => {
+    if (!p.title.trim()) return false; // shell before the document rendered
+    if (!baseline) {
+      baseline = p.url; // first real page = where the login actually lives
+      return false;
+    }
+    return leftLoginPage(p.url, baseline) && !wallUp(p.url, p.title);
+  };
+}
+
 /** Wait for the human to clear the wall AND finish logging in (page leaves the login url). */
-const pollAttachedLogin = (port: number, loginUrl: string, timeout: number): Promise<void> =>
+const pollAttachedLogin = (port: number, _loginUrl: string, timeout: number): Promise<void> =>
   pollAttached(
     port,
-    (p) => leftLoginPage(p.url, loginUrl) && !wallUp(p.url, p.title),
+    makeAttachLoginCheck(),
     timeout,
     'attach: login was not completed before the timeout — solve the Cloudflare check and finish logging in ' +
       'in the Chrome window that opened, then it captures automatically',
