@@ -70,9 +70,11 @@ function buildInstructions(
       '',
       'SITE BEHIND A LOGIN: capture it ONCE with session_login({name, loginUrl, headed:true}) — a real window opens ' +
         'for the human to log in (2FA/SSO fine; credentials never pass through the model). Point loginUrl at the app ' +
-        'page you want; redirects to the identity provider are followed. Afterwards the browser_* tools stay logged in ' +
-        '(one shared persistent profile) and web_fetch({url, session}) reads authenticated pages. ' +
-        'session_status({name, probeUrl}) checks a saved session before you rely on it.',
+        'page you want; redirects to the identity provider are followed, and the capture FAILS LOUDLY rather than ' +
+        'saving an unauthenticated session. Then read authenticated pages with web_fetch({url, session:"name"}); ' +
+        'session_status({name, probeUrl}) checks it first. The capture is a portable storageState artifact — the ' +
+        'browser_* tools have their OWN persistent profile and do NOT inherit it, so clicking through an authed UI ' +
+        'interactively still needs its own login.',
     );
   }
   if (names.has('session_solve_challenge')) {
