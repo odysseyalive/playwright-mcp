@@ -12,7 +12,7 @@
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 
-export type FetchStatus = 'ok' | 'paywall' | '404' | 'parked' | 'login-wall' | 'blocked';
+export type FetchStatus = 'ok' | 'paywall' | '404' | 'parked' | 'login-wall' | 'blocked' | 'consent-wall';
 export type ContentType = 'html' | 'pdf';
 
 export interface CslAuthor {
@@ -37,6 +37,16 @@ const LOGIN_TELL = /sign in to continue|log ?in to continue|please sign in|you m
 const PAYWALL_TELL = /subscribe to (read|continue)|subscribers only|this article is for subscribers|create a free account to (read|continue)|metered/i;
 const NOTFOUND_TELL = /\b(404|page not found|page can.?t be found|no longer exists|content (is )?unavailable)\b/i;
 const PARKED_TELL = /domain (is )?for sale|buy this domain|parked (free|domain)|courtesy of (godaddy|sedo)/i;
+/**
+ * Consent-notice prose. Matched against the START of the extracted body, never
+ * the raw HTML: nearly every site embeds a cookie banner somewhere, so a markup
+ * match proves nothing. What matters is whether the banner is what Readability
+ * RETURNED, which happens on link-dense index pages where the notice is the only
+ * substantial prose block. Scoped this way it will not fire on an article that
+ * merely discusses cookies.
+ */
+const CONSENT_TELL =
+  /privacy settings|we use cookies|cookies and similar technologies|this (site|website) uses cookies|manage (your )?cookie|accept all cookies/i;
 
 /**
  * Classify page health from the rendered HTML + HTTP status. Callers branch on
@@ -64,6 +74,10 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
   const substantial = body.length >= 1500;
   if (LOGIN_TELL.test(head) && short) return 'login-wall';
   if (PAYWALL_TELL.test(head) && !substantial) return 'paywall';
+  // Consent notice returned AS the content. Only a real failure when the notice
+  // opens the body and no substantial article came through with it; an article
+  // about cookie law stays 'ok'.
+  if (!substantial && CONSENT_TELL.test(body.slice(0, 300))) return 'consent-wall';
   return 'ok';
 }
 
@@ -244,11 +258,28 @@ export interface Leads {
 }
 
 /**
- * Harvest outbound links from the main content and, separately, the links in any
+ * Which links `harvestLinks` returns.
+ *
+ *   outbound    only links leaving this host. The research-lead default, and the
+ *               historical behaviour: every existing caller relies on it.
+ *   same-origin only links staying on this host. What site enumeration needs
+ *               (archives, indexes, tables of contents) and what `outbound`
+ *               silently returns nothing for.
+ *   all         both.
+ */
+export type LinkScope = 'outbound' | 'same-origin' | 'all';
+
+/**
+ * Harvest links from the page and, separately, the links in any
  * reference/bibliography section. Returned apart so the upstream harvester does
  * not re-parse. Only called when web_fetch is invoked with links:true.
+ *
+ * Scope defaults to `outbound` so existing callers are unaffected. Outbound
+ * harvesting stays scoped to the main content (leads live in prose); the
+ * on-site scopes scan the whole body, because navigation and listing markup
+ * usually sits outside <main>/<article>.
  */
-export function harvestLinks(html: string, url: string): Leads {
+export function harvestLinks(html: string, url: string, scope: LinkScope = 'outbound'): Leads {
   const doc = new JSDOM(html, { url }).window.document;
   let origin = '';
   try {
@@ -287,13 +318,52 @@ export function harvestLinks(html: string, url: string): Leads {
   }
 
   const links: string[] = [];
-  const main = doc.querySelector('main, article') ?? doc.body;
-  for (const a of main?.querySelectorAll('a[href]') ?? []) {
+  const root = scope === 'outbound' ? doc.querySelector('main, article') ?? doc.body : doc.body;
+  const wanted = (u: string) =>
+    scope === 'all' ? true : scope === 'outbound' ? outbound(u) : !outbound(u);
+  for (const a of root?.querySelectorAll('a[href]') ?? []) {
     const u = abs(a.getAttribute('href') ?? '');
-    if (u && isHttp(u) && outbound(u)) links.push(u);
+    if (u && isHttp(u) && wanted(u)) links.push(u);
   }
 
-  return { links: dedup(links).slice(0, 100), references: dedup(references).slice(0, 100) };
+  const cap = scope === 'outbound' ? 100 : 500;
+  return { links: dedup(links).slice(0, cap), references: dedup(references).slice(0, 100) };
+}
+
+/**
+ * Render a link-dense page as a readable index: one "text | url" line per
+ * on-site link that carries a label. Used as the body when Readability returned
+ * a consent notice (or near-nothing) on a page that is plainly a listing, so an
+ * archive or table of contents stops being a dead end.
+ */
+export function extractLinkIndex(html: string, url: string, max = 300): string {
+  const doc = new JSDOM(html, { url }).window.document;
+  let origin = '';
+  try {
+    origin = new URL(url).hostname;
+  } catch {
+    /* no origin means no same-host filter */
+  }
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const a of doc.body?.querySelectorAll('a[href]') ?? []) {
+    if (lines.length >= max) break;
+    let abs: URL;
+    try {
+      abs = new URL(a.getAttribute('href') ?? '', url);
+    } catch {
+      continue;
+    }
+    if (!/^https?:$/i.test(abs.protocol)) continue;
+    if (origin && abs.hostname !== origin) continue;
+    const label = (a.textContent ?? '').replace(/\s+/g, ' ').trim();
+    if (!label || label.length > 200) continue;
+    const href = abs.toString();
+    if (seen.has(href)) continue;
+    seen.add(href);
+    lines.push(`${label} | ${href}`);
+  }
+  return lines.join('\n');
 }
 
 function dedup(xs: string[]): string[] {

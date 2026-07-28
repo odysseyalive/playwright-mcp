@@ -17,6 +17,7 @@ import path from 'node:path';
 
 import { chromium, type BrowserContext } from 'playwright';
 
+import { seedConsent } from './consent.js';
 import { CHROME_MAJOR, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:browser]', ...args);
@@ -48,18 +49,6 @@ async function launch(): Promise<BrowserContext> {
   await seedConsent(context);
   log(`stealth context up (chrome/${CHROME_MAJOR}, profile=${profileDir()})`);
   return context;
-}
-
-/** Pre-seed engine consent cookies so the SERP renders instead of a wall. */
-async function seedConsent(context: BrowserContext): Promise<void> {
-  try {
-    await context.addCookies([
-      { name: 'SOCS', value: 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg', domain: '.google.com', path: '/' },
-      { name: 'CONSENT', value: 'YES+cb', domain: '.google.com', path: '/' },
-    ]);
-  } catch (err) {
-    log('consent seed skipped:', err instanceof Error ? err.message : err);
-  }
 }
 
 /**

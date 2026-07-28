@@ -16,6 +16,7 @@ import { chromium, type Page } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { getStealthContext, pace } from '../browser.js';
+import { dismissConsent } from '../consent.js';
 import { egressRestricted, assertEgressAllowed, installEgressGuard } from '../egress.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
 import { sessionFilePath } from '../secrets.js';
@@ -26,10 +27,12 @@ import {
   extractCitation,
   detectCms,
   harvestLinks,
+  extractLinkIndex,
   extractPdfText,
   type Citation,
   type FetchStatus,
   type ContentType,
+  type LinkScope,
 } from '../extract.js';
 
 const FETCH_TIMEOUT_MS = 20_000;
@@ -47,6 +50,8 @@ export interface FetchResult {
   /** Present only when quality:"research" — a marker for the session to run the
    *  source-appraiser agent (the server has no LLM; it never fills this). */
   appraisalRequested?: boolean;
+  /** Set when the body is not article prose (e.g. a rescued link index). */
+  note?: string;
   error?: string;
 }
 
@@ -61,6 +66,12 @@ export interface FetchOptions {
    * (the storageState-isolation rule). Local instance only (refused on remote).
    */
   session?: string;
+  /**
+   * Which links `links:true` returns. Defaults to `outbound` (research leads),
+   * which is what every pre-existing caller expects. Use `same-origin` to
+   * enumerate a site's own pages (archives, indexes, tables of contents).
+   */
+  linkScope?: LinkScope;
 }
 
 /**
@@ -69,7 +80,8 @@ export interface FetchOptions {
  */
 export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   const url = canonicalUrl(opts.url);
-  const cacheKey = `${url}|links=${opts.links ? 1 : 0}|session=${opts.session ?? ''}`;
+  const linkScope: LinkScope = opts.linkScope ?? 'outbound';
+  const cacheKey = `${url}|links=${opts.links ? 1 : 0}|scope=${linkScope}|session=${opts.session ?? ''}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -155,11 +167,31 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
       };
     } else {
       await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
+      // Dismiss any cookie-consent banner BEFORE extracting. On a link-dense
+      // index page the notice is the only substantial prose block, so
+      // Readability would otherwise select the privacy text AS the article and
+      // discard the real content silently. The shared profile is persistent, so
+      // this costs one click per domain, ever.
+      await dismissConsent(page);
       const html = await page.content();
-      const readable = extractReadable(html, finalUrl);
-      const fetchStatus = classifyHealth(html, status, readable.text);
+      let readable = extractReadable(html, finalUrl);
+      let fetchStatus = classifyHealth(html, status, readable.text);
       const citation = extractCitation(html, finalUrl);
       if (!citation.title) citation.title = readable.title || finalUrl;
+
+      // Index rescue: the page carries no usable prose (a surviving banner, or
+      // simply a listing) but is dense with on-site links. Return that index as
+      // the body rather than a privacy notice or an empty string.
+      let note: string | undefined;
+      if (fetchStatus === 'consent-wall' || readable.text.length < 600) {
+        const index = extractLinkIndex(html, finalUrl);
+        if (index.split('\n').length >= 10) {
+          readable = { title: readable.title, text: index };
+          fetchStatus = 'ok';
+          note = 'index page: body is a "label | url" list of on-site links, not prose';
+        }
+      }
+
       result = {
         url: finalUrl,
         fetchStatus,
@@ -168,8 +200,14 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
         text: readable.text,
         citation,
       };
+      if (note) result.note = note;
+      if (fetchStatus === 'consent-wall') {
+        result.error =
+          'a cookie-consent notice was returned instead of page content and could not be dismissed; ' +
+          'the real content may still be in the DOM. Retry, or add an accept selector to ACCEPT_SELECTORS in src/consent.ts';
+      }
       if (opts.links) {
-        const leads = harvestLinks(html, finalUrl);
+        const leads = harvestLinks(html, finalUrl, linkScope);
         result.links = leads.links;
         result.references = leads.references;
       }
@@ -210,8 +248,11 @@ const definition: Tool = {
     'Fetch a URL via headless Playwright with full JS rendering (handles SPAs and PDFs). ' +
     'Replaces the built-in WebFetch tool. Returns readable main text plus author/date/publisher ' +
     'citation data (CSL-JSON) and page-health status. Set links:true to also harvest outbound ' +
-    'links and the reference section. quality:"research" flags the result for source appraisal. ' +
-    'Pass session:"name" to read paywalled content behind a session_login capture (local only).',
+    'links and the reference section, and linkScope:"same-origin" to enumerate a site\'s own pages ' +
+    '(archives, indexes, tables of contents). quality:"research" flags the result for source appraisal. ' +
+    'Pass session:"name" to read paywalled content behind a session_login capture (local only). ' +
+    'Cookie-consent banners are dismissed automatically; a notice that survives returns ' +
+    'fetchStatus:"consent-wall" rather than being handed back as page content.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -231,6 +272,13 @@ const definition: Tool = {
           'Named session_login artifact (e.g. "ft", "nyt") to read authenticated/paywalled content. ' +
           'Loaded into an isolated ephemeral context; local instance only.',
       },
+      linkScope: {
+        type: 'string',
+        enum: ['outbound', 'same-origin', 'all'],
+        description:
+          'Which links to return when links:true. "outbound" (default) = research leads leaving the host. ' +
+          '"same-origin" = the site\'s own pages, for enumerating an archive, index or table of contents. "all" = both.',
+      },
     },
     required: ['url'],
   },
@@ -241,11 +289,13 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
   if (!url) {
     return { content: [{ type: 'text', text: 'Error: url is required' }], isError: true };
   }
+  const scope = String(args.linkScope ?? 'outbound');
   const result = await fetchUrl({
     url,
     links: Boolean(args.links),
     quality: args.quality === 'research' ? 'research' : 'fast',
     session: args.session ? String(args.session) : undefined,
+    linkScope: scope === 'same-origin' || scope === 'all' ? scope : 'outbound',
   });
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
