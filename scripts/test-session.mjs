@@ -19,7 +19,7 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies } =
   await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
 
@@ -155,6 +155,71 @@ test('attach: leftLoginPage detects login-complete (host change or path off the 
   const login2 = 'https://app.example.com/login';
   assert.equal(leftLoginPage('https://app.example.com/login', login2), false);
   assert.equal(leftLoginPage('https://app.example.com/home', login2), true);
+});
+
+// Regression: the capture used to report ok:true after an anonymous visit.
+// An app URL redirects to the IdP (apps.docusign.com/send → account.docusign.com),
+// and the IdP's first screen asks only for an email — so the URL moved AND no
+// password field is present, satisfying both wait heuristics before the human has
+// typed anything. Cookies are the backstop: no new cookie ⇒ no login.
+test('newCookies: only genuinely new (domain,name) pairs count as auth evidence', () => {
+  const before = {
+    cookies: [
+      { domain: 'apps.docusign.com', name: '_ga' },
+      { domain: '.apps.docusign.com', name: 'consent' },
+    ],
+  };
+
+  // Anonymous visit: same cookies re-observed (one with a leading-dot domain
+  // variant, which must NOT read as new) ⇒ nothing gained.
+  assert.deepEqual(
+    newCookies(before, {
+      cookies: [
+        { domain: '.apps.docusign.com', name: '_ga' },
+        { domain: 'apps.docusign.com', name: 'consent' },
+      ],
+    }),
+    [],
+    'unchanged jar must yield no auth evidence',
+  );
+
+  // Real login: a session cookie appears on the IdP host.
+  const gained = newCookies(before, {
+    cookies: [
+      { domain: 'apps.docusign.com', name: '_ga' },
+      { domain: '.apps.docusign.com', name: 'consent' },
+      { domain: 'account.docusign.com', name: 'AUTH_SESSION' },
+    ],
+  });
+  assert.equal(gained.length, 1, 'exactly the new cookie is reported');
+  assert.equal(gained[0].name, 'AUTH_SESSION');
+
+  // Empty/missing jars must not throw.
+  assert.deepEqual(newCookies({}, {}), []);
+  assert.equal(newCookies({}, { cookies: [{ domain: 'x.test', name: 's' }] }).length, 1);
+});
+
+// Regression (attach/challenge): the export path wrote the artifact and returned
+// ok:true with no evidence check at all for attach LOGIN — clearanceSummary only
+// ran for challenge captures. attach has no before/after delta (it connects after
+// the human finishes), so the invariant both profile modes share is "the target
+// site issued something".
+test('siteCookies: target-site evidence, matching scopeStorageState host rules', () => {
+  const state = {
+    cookies: [
+      { domain: 'account.docusign.com', name: 'AUTH' },   // subdomain of target
+      { domain: '.docusign.com', name: 'shared' },        // leading dot, apex
+      { domain: 'evil.example', name: 'x' },              // unrelated site
+    ],
+  };
+  assert.equal(siteCookies(state, 'docusign.com').length, 2, 'subdomain + apex count');
+  assert.equal(siteCookies(state, 'example.com').length, 0, 'no partial-suffix match');
+  assert.equal(siteCookies({ cookies: [] }, 'docusign.com').length, 0, 'empty jar = no evidence');
+  assert.equal(siteCookies({}, 'docusign.com').length, 0, 'missing jar = no evidence');
+  // A capture scoped to the site must never pass the check while being empty:
+  // the two helpers share one host rule so they cannot disagree.
+  const scoped = scopeStorageState(state, 'docusign.com');
+  assert.equal(siteCookies(scoped, 'docusign.com').length, scoped.cookies.length);
 });
 
 // The wall states every capture mode must agree on. Both modes compose wallUp(),

@@ -65,6 +65,16 @@ function buildInstructions(
     'Browse/debug workflow: browser_navigate → browser_snapshot (accessibility tree; prefer over screenshots) → interact by ref (browser_click, browser_type, …) → verify.',
     'Debugging: browser_console_messages, browser_network_requests. Screenshots: browser_take_screenshot.',
   );
+  if (names.has('session_login')) {
+    lines.push(
+      '',
+      'SITE BEHIND A LOGIN: capture it ONCE with session_login({name, loginUrl, headed:true}) — a real window opens ' +
+        'for the human to log in (2FA/SSO fine; credentials never pass through the model). Point loginUrl at the app ' +
+        'page you want; redirects to the identity provider are followed. Afterwards the browser_* tools stay logged in ' +
+        '(one shared persistent profile) and web_fetch({url, session}) reads authenticated pages. ' +
+        'session_status({name, probeUrl}) checks a saved session before you rely on it.',
+    );
+  }
   if (names.has('session_solve_challenge')) {
     lines.push(
       '',

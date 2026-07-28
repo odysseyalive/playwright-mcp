@@ -87,6 +87,12 @@ export interface LoginResult {
   // no clearance cookie was captured at all (the capture "succeeded" but is empty).
   expiresAt?: string;
   warning?: string;
+  // Proof the capture is authenticated rather than an anonymous visit: how many
+  // cookies appeared between landing on the login page and finishing, and which
+  // hosts issued them. A caller (or a human reading the tool result) can sanity-
+  // check that the auth domain is present instead of trusting `ok` alone.
+  cookiesGained?: number;
+  authHosts?: string[];
 }
 
 /**
@@ -116,6 +122,18 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     const page = await context.newPage();
     await page.goto(opts.loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
+    // An app URL usually REDIRECTS to the identity provider (apps.docusign.com/send
+    // → account.docusign.com/oauth/auth). Comparing against the caller's URL then
+    // reads that redirect as "left the login page" and completes instantly. Let the
+    // redirect chain settle and treat where we LAND as the real login page.
+    await page.waitForLoadState('networkidle').catch(() => {});
+    const loginUrl = page.url() || opts.loginUrl;
+    if (loginUrl !== opts.loginUrl) log(`login page resolved: ${opts.loginUrl} → ${loginUrl}`);
+
+    // Baseline for the auth-delta check below, taken AFTER landing on the login
+    // page so cookies the site drops on arrival are already accounted for.
+    const before = (await context.storageState()) as StorageState;
+
     if (opts.headed) {
       // Human completes the challenge in the SEPARATE automation window this
       // launched (not their everyday browser). We auto-detect completion when
@@ -124,7 +142,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       log(
         `headed login for "${opts.name}" — a SEPARATE automation window opened; complete the login in THAT window`,
       );
-      await waitForLogin(page, opts.loginUrl, opts.successSignal, opts.timeoutMs ?? 300_000);
+      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 300_000);
     } else {
       const sel = { ...DEFAULT_SELECTORS, ...opts.selectors };
       const lookup = { envFile: opts.envFile };
@@ -140,14 +158,38 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
         page.click(sel.submit).catch(() => page.keyboard.press('Enter')),
         page.waitForLoadState('domcontentloaded').catch(() => {}),
       ]);
-      await waitForLogin(page, opts.loginUrl, opts.successSignal, opts.timeoutMs ?? 30_000);
+      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 30_000);
+    }
+
+    // The wait heuristics can resolve while the human is still mid-login (see
+    // newCookies). Writing an anonymous storageState and reporting ok:true is the
+    // worst outcome: every later web_fetch({session}) silently reads as a logged-out
+    // visitor. Require evidence — no new cookies means no login happened.
+    const after = (await context.storageState()) as StorageState;
+    const gained = newCookies(before, after);
+    if (!gained.length) {
+      throw new Error(
+        `no session was captured — the browser gained no new cookies, so the login did not complete ` +
+          `(final URL: ${page.url()}). Nothing was saved. ` +
+          `If the site uses a multi-step login (email first, password/2FA after), pass a successSignal ` +
+          `naming something only visible AFTER login — e.g. a post-login URL fragment or on-page text.`,
+      );
     }
 
     fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
     await context.storageState({ path: out });
     fs.chmodSync(out, 0o600); // secret: never world-readable
-    log(`saved session "${opts.name}" → ${out} (mode 600)`);
-    return { name: opts.name, path: out, capturedAt: new Date().toISOString(), mode, ok: true };
+    const hosts = [...new Set(gained.map((c) => (c.domain ?? '').replace(/^\./, '')))].filter(Boolean);
+    log(`saved session "${opts.name}" → ${out} (mode 600; ${gained.length} new cookies on ${hosts.join(', ')})`);
+    return {
+      name: opts.name,
+      path: out,
+      capturedAt: new Date().toISOString(),
+      mode,
+      ok: true,
+      cookiesGained: gained.length,
+      authHosts: hosts,
+    };
   } catch (err) {
     return {
       name: opts.name,
@@ -435,6 +477,42 @@ export function clearanceSummary(state: StorageState): { expiresAt?: string; war
   return { expiresAt: new Date(Math.min(...expiries) * 1000).toISOString() };
 }
 
+/**
+ * Cookies gained between two captures — the only trustworthy "a login actually
+ * happened" signal.
+ *
+ * Every URL/DOM heuristic here fails on email-first IdP screens. DocuSign,
+ * Google and Microsoft all ask for the email address on a page that has NO
+ * password field, reached by redirecting to a different host AND path than the
+ * one the caller passed. So `samePath()` reports "moved off the login page" and
+ * `hasPasswordField()` reports "no login form present" — while the human is
+ * still looking at step one of the login. A real login always issues at least
+ * one new cookie.
+ *
+ * Compared by (domain, name) rather than by count, so analytics/consent cookies
+ * dropped on arrival — present in BOTH captures — never read as authentication.
+ */
+export function newCookies(before: StorageState, after: StorageState): NonNullable<StorageState['cookies']> {
+  const key = (c: { domain?: string; name?: string }) =>
+    `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
+  const seen = new Set((before.cookies ?? []).map(key));
+  return (after.cookies ?? []).filter((c) => !seen.has(key(c)));
+}
+
+/**
+ * Cookies belonging to `domain` (or a subdomain). Shares `scopeStorageState`'s
+ * host-matching rule deliberately: if the two disagreed, a capture could be scoped
+ * to nothing and still pass the "did we capture anything" check.
+ */
+export function siteCookies(state: StorageState, domain: string): NonNullable<StorageState['cookies']> {
+  const all = state.cookies ?? [];
+  if (!domain) return all;
+  return all.filter((c) => {
+    const host = (c.domain ?? '').replace(/^\./, '').toLowerCase();
+    return host === domain || host.endsWith('.' + domain);
+  });
+}
+
 /** Keep only cookies/origins belonging to `domain` (and its subdomains) — never persist the whole jar. */
 export function scopeStorageState(state: StorageState, domain: string): StorageState {
   if (!domain) return state;
@@ -560,6 +638,23 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     // A real/shared profile carries the user's whole cookie jar — persist ONLY the
     // login site's cookies. A throwaway temp profile only ever holds the target site.
     if (prof.scope) state = scopeStorageState(state, siteDomain(opts.loginUrl));
+
+    // Same invariant sessionLogin() enforces, adapted: attach connects AFTER the
+    // human is done, so there is no before/after delta to take. What holds for both
+    // profile modes is that the target site must have issued SOMETHING — a temp
+    // profile starts empty, and a scoped system profile keeps only this site — so
+    // zero cookies here means the capture is worthless whatever the mode. Writing it
+    // anyway is the harmful outcome: later web_fetch({session}) reads silently
+    // deauthenticated. (Whether a *clearance-named* cookie is present stays a
+    // warning below — walls mark trust in ways that allowlist cannot know.)
+    if (!siteCookies(state, siteDomain(opts.loginUrl)).length) {
+      throw new Error(
+        `${opts.challenge ? 'challenge' : 'attach'}: nothing was captured — no cookies for ` +
+          `${siteDomain(opts.loginUrl) || 'the target site'} are present, so the ` +
+          `${opts.challenge ? 'wall was not cleared' : 'login did not complete'}. Nothing was saved.`,
+      );
+    }
+
     fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
     fs.writeFileSync(out, JSON.stringify(state));
     fs.chmodSync(out, 0o600);
