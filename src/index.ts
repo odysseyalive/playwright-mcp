@@ -14,11 +14,9 @@
  * All logging goes to stderr.
  */
 
-import { createConnection } from '@playwright/mcp';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -27,11 +25,10 @@ import {
 import { pathToFileURL } from 'node:url';
 
 import { customTools, callCustomTool, isCustomTool } from './tools.js';
-import { loadSecrets } from './secrets.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
-import { egressRestricted, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
+import { initUpstream, getUpstream, closeUpstream } from './upstream.js';
 
 const VERSION = '0.2.0';
 
@@ -72,9 +69,10 @@ function buildInstructions(
         'for the human to log in (2FA/SSO fine; credentials never pass through the model). Point loginUrl at the app ' +
         'page you want; redirects to the identity provider are followed, and the capture FAILS LOUDLY rather than ' +
         'saving an unauthenticated session. Then read authenticated pages with web_fetch({url, session:"name"}); ' +
-        'session_status({name, probeUrl}) checks it first. The capture is a portable storageState artifact — the ' +
-        'browser_* tools have their OWN persistent profile and do NOT inherit it, so clicking through an authed UI ' +
-        'interactively still needs its own login.',
+        'session_status({name, probeUrl}) checks it first. The capture BINDS the browser automatically: browser_* ' +
+        'are then authenticated too, so you can click through the authed UI, not just read it. ' +
+        'session_attach({name}) re-binds a session captured in an earlier run; session_attach({name:null}) drops back ' +
+        'to anonymous.',
     );
   }
   if (names.has('session_solve_challenge')) {
@@ -119,6 +117,7 @@ const REMOTE_DENYLIST = new Set([
   'session_login',
   'session_status',
   'session_solve_challenge',
+  'session_attach',
   'session_scaffold_tests',
   'browser_file_upload',
   'suite_scaffold',
@@ -140,7 +139,12 @@ interface OutwardServerOptions {
  * actually exposes.
  */
 export function createOutwardServer(
-  upstream: Client,
+  /**
+   * Resolved PER CALL, not captured: binding a session rebuilds the upstream
+   * browser underneath us (see src/upstream.ts), and already-connected callers
+   * must follow the swap without reconnecting.
+   */
+  upstreamOf: () => Client,
   upstreamTools: { name: string }[],
   options: OutwardServerOptions = {},
 ): Server {
@@ -159,7 +163,7 @@ export function createOutwardServer(
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const { tools } = await upstream.listTools();
+    const { tools } = await upstreamOf().listTools();
     return { tools: [...tools.filter((t) => allow(t.name)), ...visibleCustom] };
   });
 
@@ -175,7 +179,7 @@ export function createOutwardServer(
     }
     try {
       if (isCustomTool(name)) return await callCustomTool(name, args ?? {});
-      return await upstream.callTool({ name, arguments: args ?? {} });
+      return await upstreamOf().callTool({ name, arguments: args ?? {} });
     } catch (err) {
       return {
         content: [
@@ -200,30 +204,18 @@ function remoteAuthEnv() {
 }
 
 async function main() {
-  // 1. Spin up the official @playwright/mcp server in-process, headless.
-  const playwrightServer = await createConnection({
-    browser: {
-      browserName: 'chromium',
-      launchOptions: { headless: true, channel: 'chrome' },
-    },
-    secrets: loadSecrets(),
-    // Remote instance: block the wrapped browser_* tools from the metadata
-    // endpoint, localhost, and private nets (SSRF backstop; OS-level is primary).
-    ...(egressRestricted() ? { network: { blockedOrigins: BLOCKED_ORIGIN_PATTERNS } } : {}),
-  });
-
-  // 2. Connect to it as a client over an in-memory transport.
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  await playwrightServer.connect(serverTransport);
-  const upstream = new Client({ name: 'playwright-mcp-proxy', version: VERSION });
-  await upstream.connect(clientTransport);
+  // 1-2. Spin up the official @playwright/mcp server in-process (headless) and
+  //      connect to it over an in-memory transport. It lives behind a mutable
+  //      holder so session_login/session_attach can rebind the browser to a
+  //      captured login without anything reconnecting — see src/upstream.ts.
+  const upstream = await initUpstream();
 
   // 3. Snapshot the live upstream toolset once for the instructions map; each
   //    outward Server (stdio + every HTTP session) is built from the factory.
   const { tools: upstreamTools } = await upstream.listTools();
 
   // 3a. Local stdio surface (Claude Code) — full toolset, byte-for-byte unchanged.
-  const stdioServer = createOutwardServer(upstream, upstreamTools);
+  const stdioServer = createOutwardServer(getUpstream, upstreamTools);
   await stdioServer.connect(new StdioServerTransport());
   log(`v${VERSION} ready (stdio, wrapping @playwright/mcp, headless chromium)`);
 
@@ -248,7 +240,7 @@ async function main() {
     if (start) {
       const port = Number(process.env.PLAYWRIGHT_MCP_PORT ?? 8765);
       remote = startRemoteServer({
-        makeServer: () => createOutwardServer(upstream, upstreamTools, { remote: true }),
+        makeServer: () => createOutwardServer(getUpstream, upstreamTools, { remote: true }),
         publicUrl,
         port,
         authRouter: auth?.router,

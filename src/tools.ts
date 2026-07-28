@@ -19,7 +19,12 @@ interface CustomTool {
 }
 
 import { webFetch } from './tools/web-fetch.js';
-import { sessionLoginTool, sessionStatusTool, sessionSolveChallengeTool } from './tools/session.js';
+import {
+  sessionLoginTool,
+  sessionStatusTool,
+  sessionSolveChallengeTool,
+  sessionAttachTool,
+} from './tools/session.js';
 import { sessionScaffoldTool } from './tools/scaffold.js';
 import { suiteScaffoldTool, suiteAuditTool, suiteMethodologyTool } from './tools/suite.js';
 
@@ -28,6 +33,7 @@ const registry: CustomTool[] = [
   sessionLoginTool,
   sessionStatusTool,
   sessionSolveChallengeTool,
+  sessionAttachTool,
   sessionScaffoldTool,
   suiteScaffoldTool,
   suiteAuditTool,

@@ -54,7 +54,10 @@ function stubUpstream() {
 async function connectOutward(remote) {
   const upstream = stubUpstream();
   const { tools: upstreamTools } = await upstream.listTools();
-  const server = createOutwardServer(upstream, upstreamTools, { remote });
+  // createOutwardServer resolves the upstream client PER CALL so a session bind
+  // can swap the browser underneath live callers (src/upstream.ts) — hand it a
+  // getter, not the client.
+  const server = createOutwardServer(() => upstream, upstreamTools, { remote });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
   const client = new Client({ name: 'test', version: '0' });

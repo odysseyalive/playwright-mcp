@@ -25,6 +25,7 @@ import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { sessionsDir, sessionFilePath, getSecret } from '../secrets.js';
+import { bindSession } from '../upstream.js';
 import {
   STEALTH_LAUNCH,
   STEALTH_INIT,
@@ -1065,7 +1066,80 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
   // attach mode harvests a human-solved real Chrome (Cloudflare/Turnstile sites);
   // otherwise the standard Playwright-driven capture runs.
   const result = opts.attach ? await sessionAttach(opts) : await sessionLogin(opts);
-  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: !result.ok };
+
+  // Bind the browser to what we just captured. "Log in once" has to mean the
+  // WHOLE toolset is logged in — otherwise browser_* stay anonymous and the
+  // caller has to log in a second time by hand to click anything, which is the
+  // gap this package existed to close. Read paths (web_fetch) and interactive
+  // paths (browser_*) now come from the same capture.
+  let bound: string | undefined;
+  let bindError: string | undefined;
+  if (result.ok) {
+    try {
+      await bindSession(opts.name);
+      bound = opts.name;
+    } catch (err) {
+      // The capture itself succeeded and is on disk — surface the bind failure
+      // without pretending the login failed.
+      bindError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  return {
+    content: [
+      { type: 'text', text: JSON.stringify({ ...result, boundTo: bound, bindError }, null, 2) },
+    ],
+    isError: !result.ok,
+  };
+}
+
+const attachDefinition: Tool = {
+  name: 'session_attach',
+  description:
+    'Point the browser_* tools at a login captured earlier (by name), so interactive browsing runs ' +
+    'authenticated — the way to reuse a session in a LATER run without logging in again. ' +
+    'session_login already does this for the session it captures; use this to switch between saved ' +
+    'sessions, or to re-bind after a server restart. Pass name:null to drop back to the anonymous profile. ' +
+    'Rebinding swaps the browser underneath any open page, so re-navigate afterwards.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: {
+        type: ['string', 'null'],
+        description: 'Saved session name to bind, or null to unbind and browse anonymously.',
+      },
+    },
+    required: ['name'],
+  },
+};
+
+async function attachHandler(args: Record<string, unknown>): Promise<CallToolResult> {
+  const name = args.name == null ? null : String(args.name);
+  try {
+    const { session } = await bindSession(name);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              boundTo: session,
+              note: session
+                ? 'browser_* are now authenticated as this session; re-navigate to pick it up'
+                : 'browser_* are now anonymous',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+      isError: true,
+    };
+  }
 }
 
 const statusDefinition: Tool = {
@@ -1153,3 +1227,4 @@ async function solveChallengeHandler(args: Record<string, unknown>): Promise<Cal
 export const sessionLoginTool = { definition: loginDefinition, handler: loginHandler };
 export const sessionStatusTool = { definition: statusDefinition, handler: statusHandler };
 export const sessionSolveChallengeTool = { definition: solveChallengeDefinition, handler: solveChallengeHandler };
+export const sessionAttachTool = { definition: attachDefinition, handler: attachHandler };
