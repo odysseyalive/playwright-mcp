@@ -262,7 +262,9 @@ while still allowing it to fetch public sites and reach GitHub over TLS.
 
 - `journalctl -u playwright-mcp-remote` shows `auth: on` and `ready`.
 - `curl https://mcp.example.com/.well-known/oauth-authorization-server` returns
-  JSON with `issuer` = your public URL (from an allowlisted IP).
+  JSON with `issuer` = your public URL (from an allowlisted IP), and
+  `authorization_response_iss_parameter_supported: true` — the RFC 9207 flag from
+  MCP spec 2026-07-28. If that field is missing, an old build is running.
 - `curl -X POST https://mcp.example.com/mcp` (no token) → `401` with a
   `WWW-Authenticate: Bearer …` header.
 - In claude.ai, the connector lists `web_fetch` + browser tools but **not**
@@ -271,9 +273,10 @@ while still allowing it to fetch public sites and reach GitHub over TLS.
   block) — confirm the firewall is doing its job.
 
 The deterministic half of all this is covered by `npm test`
-(`scripts/test-remote.mjs`): denylist, OAuth metadata/DCR/redirect/401, egress
-classifier. The **live** GitHub login + claude.ai handshake is what you verify
-here, on the server.
+(`scripts/test-remote.mjs`): denylist, OAuth metadata/DCR/redirect/401, the RFC
+9207 `iss` parameter on both the success and denial redirects, the session-binding
+banner, and the egress classifier. The **live** GitHub login + claude.ai handshake
+is what you verify here, on the server.
 
 ---
 

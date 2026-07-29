@@ -12,12 +12,25 @@
  * Stores are in-memory: a process restart forces a re-auth. That is acceptable
  * for a single-user connector and keeps secrets off disk. stdout is never written
  * here (it carries the stdio MCP stream); logging goes to stderr.
+ *
+ * RFC 9207 (MCP 2026-07-28, SEP-2468; ledger DEC-2026-07-28): because we ARE the
+ * authorization server, every authorization response we emit carries the `iss`
+ * identifier so a client can detect an AS mix-up before redeeming the code. The
+ * SDK's own authorize handler does not emit it, so we add it on our side.
+ * KNOWN GAP: the SDK's authorizationHandler redirects its own late validation
+ * failures straight to the client, and those responses still carry no `iss` —
+ * closing that would mean forking the SDK, so compliance here is ours-only.
  */
 
 import crypto from 'node:crypto';
 
 import express, { type Request, type Response, type RequestHandler, type Router } from 'express';
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import {
+  mcpAuthRouter,
+  mcpAuthMetadataRouter,
+  createOAuthMetadata,
+  getOAuthProtectedResourceMetadataUrl,
+} from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type {
@@ -94,7 +107,16 @@ class GitHubProxyOAuthProvider implements OAuthServerProvider {
   private readonly refreshTokens = new Map<string, TokenRecord>();
   private readonly callbackUrl: string;
 
-  constructor(private readonly config: GitHubAuthConfig) {
+  /**
+   * @param issuer RFC 9207 issuer identifier for the `iss` authorization-response
+   *   parameter. MUST be byte-identical to the `issuer` in our AS metadata —
+   *   buildGitHubAuth() derives both from the same `issuerUrl.href`, which is why
+   *   this is injected rather than recomputed here.
+   */
+  constructor(
+    private readonly config: GitHubAuthConfig,
+    private readonly issuer: string,
+  ) {
     this.callbackUrl = new URL('/oauth/github/callback', config.publicUrl).href;
   }
 
@@ -148,6 +170,9 @@ class GitHubProxyOAuthProvider implements OAuthServerProvider {
 
     const redirect = new URL(txn.redirectUri);
     if (txn.state) redirect.searchParams.set('state', txn.state);
+    // RFC 9207: EVERY authorization response carries `iss` — success and error
+    // alike — so set it here, on the one URL both branches below redirect to.
+    redirect.searchParams.set('iss', this.issuer);
 
     try {
       const ghToken = await this.exchangeGitHubCode(code);
@@ -299,19 +324,36 @@ class GitHubProxyOAuthProvider implements OAuthServerProvider {
  * the GitHub callback, mounted at root) and a bearer guard for /mcp.
  */
 export function buildGitHubAuth(config: GitHubAuthConfig): RemoteAuth {
-  const provider = new GitHubProxyOAuthProvider(config);
   const issuerUrl = new URL(config.publicUrl);
   const resourceServerUrl = new URL('/mcp', issuerUrl);
+  const scopesSupported = ['mcp'];
+  const resourceName = 'playwright-mcp';
 
-  const oauthRouter = mcpAuthRouter({
-    provider,
-    issuerUrl,
-    resourceServerUrl,
-    scopesSupported: ['mcp'],
-    resourceName: 'playwright-mcp',
-  });
+  // issuerUrl.href is the ONE source for the issuer identifier: createOAuthMetadata
+  // publishes it as `issuer`, and the provider echoes the same string back as the
+  // RFC 9207 `iss` parameter. A client comparing the two must see them match.
+  const provider = new GitHubProxyOAuthProvider(config, issuerUrl.href);
+
+  // ONE options object feeds both the SDK router and our metadata copy below.
+  // mcpAuthRouter derives its metadata from these internally; if the two were
+  // built from separate literals, adding an option here (baseUrl,
+  // serviceDocumentationUrl, …) would silently omit it from the document we
+  // actually serve, because ours shadows the SDK's.
+  const authOptions = { provider, issuerUrl, resourceServerUrl, scopesSupported, resourceName };
+  const oauthRouter = mcpAuthRouter(authOptions);
+
+  // Advertise RFC 9207 support. mcpAuthRouter builds its metadata internally with
+  // no hook for extra fields, so we serve the same document plus the flag from our
+  // OWN metadata router mounted FIRST — express matches mounts in order, so this
+  // shadows the identical routes inside oauthRouter. OAuthMetadataSchema is a
+  // z.looseObject, so the added field survives client-side validation.
+  const oauthMetadata = {
+    ...createOAuthMetadata(authOptions),
+    authorization_response_iss_parameter_supported: true,
+  };
 
   const router = express.Router();
+  router.use(mcpAuthMetadataRouter({ oauthMetadata, resourceServerUrl, scopesSupported, resourceName }));
   router.use(oauthRouter); // /.well-known/*, /authorize, /token, /register, /revoke
   router.get('/oauth/github/callback', provider.gitHubCallback);
 

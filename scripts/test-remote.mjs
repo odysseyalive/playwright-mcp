@@ -12,7 +12,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import express from 'express';
 
 import { isBlockedIp, isBlockedHostSync, assertEgressAllowed, EgressBlockedError } from '../dist/egress.js';
-import { createOutwardServer } from '../dist/index.js';
+import { createOutwardServer, withSessionBanner } from '../dist/index.js';
 import { buildGitHubAuth } from '../dist/auth.js';
 
 const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_solve_challenge', 'session_scaffold_tests', 'browser_file_upload', 'suite_scaffold', 'suite_audit'];
@@ -159,4 +159,101 @@ test('oauth: /mcp without a bearer token → 401 + WWW-Authenticate', async () =
   });
   assert.equal(res.status, 401);
   assert.match(res.headers.get('www-authenticate') ?? '', /Bearer/);
+});
+
+// ── RFC 9207 issuer identification (MCP 2026-07-28 / SEP-2468) ────────────────
+// We are our own authorization server, so clients validate `iss` against us. The
+// SDK emits none; ledger DEC-2026-07-28 adds it. GitHub is stubbed at the global
+// fetch so the callback's redirect contract is exercised with zero network.
+
+/** Register a client and start /authorize, returning the txn id GitHub would echo. */
+async function beginAuthorization() {
+  const reg = await fetch(`${authApp.base}/register`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: ['https://claude.ai/api/mcp/auth_callback'], token_endpoint_auth_method: 'none', grant_types: ['authorization_code'], response_types: ['code'] }),
+  }).then((r) => r.json());
+  const u = new URL(`${authApp.base}/authorize`);
+  u.search = new URLSearchParams({
+    response_type: 'code', client_id: reg.client_id, redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+    code_challenge: 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM', code_challenge_method: 'S256', state: 'xyz', scope: 'mcp',
+  }).toString();
+  const res = await fetch(u, { redirect: 'manual' });
+  return new URL(res.headers.get('location')).searchParams.get('state');
+}
+
+/** Drive the GitHub callback with `login` as the identity GitHub reports back. */
+async function callbackAs(login) {
+  const real = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.startsWith('https://github.com/login/oauth/access_token'))
+      return new Response(JSON.stringify({ access_token: 'gh-token' }), { headers: { 'Content-Type': 'application/json' } });
+    if (url.startsWith('https://api.github.com/user'))
+      return new Response(JSON.stringify({ login }), { headers: { 'Content-Type': 'application/json' } });
+    return real(input, init);
+  };
+  try {
+    const txn = await beginAuthorization();
+    const res = await real(`${authApp.base}/oauth/github/callback?code=gh-code&state=${txn}`, { redirect: 'manual' });
+    return new URL(res.headers.get('location'));
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+test('rfc9207: metadata advertises iss support and keeps the RFC 9728 route working', async () => {
+  const m = await fetch(`${authApp.base}/.well-known/oauth-authorization-server`).then((r) => r.json());
+  assert.equal(m.authorization_response_iss_parameter_supported, true);
+  // Our metadata router mounts AHEAD of mcpAuthRouter to inject that flag; prove
+  // the shadowed sibling route still resolves rather than being swallowed.
+  const prm = await fetch(`${authApp.base}/.well-known/oauth-protected-resource/mcp`).then((r) => r.json());
+  assert.match(prm.resource, /\/mcp$/);
+});
+
+test('rfc9207: successful authorization response carries iss matching the metadata issuer', async () => {
+  const { issuer } = await fetch(`${authApp.base}/.well-known/oauth-authorization-server`).then((r) => r.json());
+  const loc = await callbackAs('someone');
+  assert.ok(loc.searchParams.get('code'), 'issues an authorization code');
+  assert.equal(loc.searchParams.get('iss'), issuer, 'iss is byte-identical to the published issuer');
+  assert.equal(loc.searchParams.get('state'), 'xyz');
+});
+
+test('rfc9207: denied authorization response ALSO carries iss (error responses are not exempt)', async () => {
+  const { issuer } = await fetch(`${authApp.base}/.well-known/oauth-authorization-server`).then((r) => r.json());
+  const loc = await callbackAs('somebody-else');
+  assert.equal(loc.searchParams.get('error'), 'access_denied');
+  assert.equal(loc.searchParams.get('code'), null, 'no code is handed out on denial');
+  assert.equal(loc.searchParams.get('iss'), issuer);
+});
+
+// ── ambient session-binding disclosure (ledger DEC-2026-07-28) ────────────────
+
+// Deliberately unlike any English word: the remote test asserts this name is
+// ABSENT from the banner, and a short name like "ft" is a substring of ordinary
+// prose ("after"), which would make that assertion pass or fail by accident.
+const SESSION = 'acme-portal';
+
+test('binding banner: anonymous browser leaves the result untouched', () => {
+  const result = { content: [{ type: 'text', text: 'snapshot' }] };
+  assert.deepEqual(withSessionBanner(result, null, false), result);
+});
+
+test('binding banner: local surface names the session and says how to unbind', () => {
+  const out = withSessionBanner({ content: [{ type: 'text', text: 'snapshot' }] }, SESSION, false);
+  assert.equal(out.content.length, 2, 'appends rather than replaces');
+  assert.equal(out.content[0].text, 'snapshot', 'original content is first and unmodified');
+  assert.match(out.content[1].text, new RegExp(`session "${SESSION}"`));
+  assert.match(out.content[1].text, /session_attach\(\{name:null\}\)/);
+});
+
+test('binding banner: remote surface discloses the binding WITHOUT leaking the name', () => {
+  const out = withSessionBanner({ content: [{ type: 'text', text: 'snapshot' }] }, SESSION, true);
+  assert.match(out.content[1].text, /authenticated session/);
+  assert.equal(out.content[1].text.includes(SESSION), false, 'session name never reaches the remote client');
+});
+
+test('binding banner: a result with no content array still gets the notice', () => {
+  const out = withSessionBanner({ isError: true }, SESSION, false);
+  assert.equal(out.isError, true, 'other fields survive');
+  assert.equal(out.content.length, 1);
 });

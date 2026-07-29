@@ -28,7 +28,7 @@ import { customTools, callCustomTool, isCustomTool } from './tools.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
-import { initUpstream, getUpstream, closeUpstream } from './upstream.js';
+import { initUpstream, getUpstream, closeUpstream, boundSession } from './upstream.js';
 
 const VERSION = '0.2.0';
 
@@ -131,6 +131,45 @@ interface OutwardServerOptions {
 }
 
 /**
+ * Disclose the ambient browser binding on every result it affects.
+ *
+ * session_login / session_solve_challenge / session_attach rebind the shared
+ * upstream browser (src/upstream.ts), so every later browser_* call is
+ * authenticated without saying so. That is state carried across calls where the
+ * model cannot see it — exactly what MCP 2026-07-28 moves away from ("mint an
+ * explicit handle… the model can see the handle and thread it between tools";
+ * ledger DEC-2026-07-28). The binding stays, because it is what makes "log in
+ * once" cover interactive debugging; it just stops being invisible.
+ *
+ * The remote surface gets a name-free notice: it shares this browser but cannot
+ * rebind it (session_* is denylisted), so the name would be disclosure to a
+ * prompt-injectable client with nothing actionable attached.
+ *
+ * Takes the session as an argument rather than reading boundSession() itself, so
+ * it stays a pure function the T1 tier can exercise without a live browser.
+ */
+export function withSessionBanner<T extends object>(
+  result: T,
+  session: string | null,
+  remote: boolean,
+): T {
+  if (!session) return result;
+  const banner = {
+    type: 'text' as const,
+    text: remote
+      ? '[playwright-mcp] this browser is running an authenticated session.'
+      : `[playwright-mcp] browser is authenticated as session "${session}" — session_attach({name:null}) returns it to the anonymous profile.`,
+  };
+  // callTool's compatibility result is a union (modern `content` vs legacy
+  // `toolResult`), so read the field defensively and re-widen on the way out.
+  const existing = (result as { content?: unknown }).content;
+  return {
+    ...result,
+    content: Array.isArray(existing) ? [...existing, banner] : [banner],
+  } as T;
+}
+
+/**
  * Build one outward-facing MCP Server bound to the shared upstream proxy. A
  * Server owns exactly one transport (SDK contract: connect() assumes sole
  * ownership), so each binding — stdio and every HTTP session — gets its own
@@ -179,8 +218,11 @@ export function createOutwardServer(
       };
     }
     try {
+      // Custom tools are exempt: web_fetch already takes an explicit `session`
+      // argument, and the session_* tools report the binding themselves.
       if (isCustomTool(name)) return await callCustomTool(name, args ?? {});
-      return await upstreamOf().callTool({ name, arguments: args ?? {} });
+      const result = await upstreamOf().callTool({ name, arguments: args ?? {} });
+      return withSessionBanner(result, boundSession(), remote);
     } catch (err) {
       return {
         content: [
@@ -250,10 +292,20 @@ async function main() {
     }
   }
 
-  // Tidy the shared stealth context + remote host on shutdown (best-effort).
+  // Tidy both browsers + the remote host on shutdown (best-effort).
+  //
+  // ONE handler covers BOTH surfaces: this is a single process that always serves
+  // stdio and additionally serves the HTTP port when PLAYWRIGHT_MCP_PUBLIC_URL is
+  // set, and every binding — stdio and each HTTP session — resolves the SAME
+  // upstream chromium through getUpstream(). There is no port-only teardown to
+  // write; closing that one upstream covers the local and served cases alike.
   const shutdown = async () => {
-    remote?.close();
-    await closeBrowser().catch(() => {});
+    remote?.close(); // stop accepting before tearing anything down
+    // Two independent browsers: the wrapped @playwright/mcp chromium (upstream,
+    // rebound by session_login/session_attach) and the stealth context web_fetch
+    // uses. Concurrent so a slow close doesn't serialise behind the other;
+    // allSettled because shutdown must not be derailed by either one failing.
+    await Promise.allSettled([closeUpstream(), closeBrowser()]);
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
