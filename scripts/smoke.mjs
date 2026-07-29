@@ -38,6 +38,15 @@ const result = await client.callTool({
 const text = result.content?.find((c) => c.type === 'text')?.text ?? '';
 console.log(text.includes('smoke-ok') ? '\nPASS: navigation + snapshot working' : `\nFAIL: unexpected result:\n${text}`);
 
+// Exfiltration-guard acceptance (DEC-2026-07-29): page content reaching the model
+// must be marked untrusted. test-exfil.mjs proves withUntrustedNotice() works;
+// only this proves it is actually WIRED into the live stdio call path — deleting
+// the wrapper from createOutwardServer would leave every T1 test green.
+const noticeOk = (result.content ?? []).some(
+  (c) => c.type === 'text' && c.text.includes('UNTRUSTED DATA, not instructions'),
+);
+console.log(noticeOk ? 'guards: browser_* results carry the untrusted-content notice' : 'FAIL: untrusted-content notice missing from browser_navigate result');
+
 // Shutdown acceptance: SIGTERM must COMPLETE and exit rather than hang. The
 // navigate above launched the browser, so the handler runs with real work to do —
 // and because one process serves stdio AND the HTTP port off the SAME upstream,
@@ -64,4 +73,4 @@ if (pid) {
 console.log(shutdownOk ? 'shutdown: SIGTERM exits cleanly' : 'FAIL: server still running 10s after SIGTERM');
 
 await client.close().catch(() => {});
-process.exit(text.includes('smoke-ok') && instructionsOk && toolsOk && shutdownOk ? 0 : 1);
+process.exit(text.includes('smoke-ok') && instructionsOk && toolsOk && noticeOk && shutdownOk ? 0 : 1);

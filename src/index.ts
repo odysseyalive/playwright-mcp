@@ -25,6 +25,8 @@ import {
 import { pathToFileURL } from 'node:url';
 
 import { customTools, callCustomTool, isCustomTool } from './tools.js';
+import { guardOutbound, UNTRUSTED_NOTICE } from './exfil.js';
+import { secretInventory } from './secrets.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
@@ -170,6 +172,49 @@ export function withSessionBanner<T extends object>(
 }
 
 /**
+ * `browser_*` tools whose results do NOT carry page content, so the untrusted-
+ * content notice would be pure noise on them. An allowlist by exclusion rather
+ * than by enumeration: upstream adds tools, and a new page-reading tool must
+ * default to being marked, not to being trusted.
+ */
+const NO_PAGE_CONTENT = new Set(['browser_close', 'browser_resize', 'browser_take_screenshot']);
+
+/**
+ * Mark upstream page content as untrusted data (ledger DEC-2026-07-29).
+ *
+ * `browser_*` results are accessibility snapshots consumed structurally, so they
+ * get the one-line notice rather than web_fetch's full `<untrusted-content>`
+ * wrap — wrapping them would fight the ref-based interaction workflow. Same
+ * intercept point and same shape as withSessionBanner; both may append, which
+ * is the accepted cost of making invisible state visible.
+ *
+ * Pure, so the T1 tier exercises it without a live browser.
+ */
+export function withUntrustedNotice<T extends object>(result: T, toolName: string): T {
+  if (!toolName.startsWith('browser_') || NO_PAGE_CONTENT.has(toolName)) return result;
+  const notice = { type: 'text' as const, text: UNTRUSTED_NOTICE };
+  const existing = (result as { content?: unknown }).content;
+  return {
+    ...result,
+    content: Array.isArray(existing) ? [...existing, notice] : [notice],
+  } as T;
+}
+
+/**
+ * The http(s) URL an upstream tool call is about to navigate to, if any.
+ *
+ * Reads any string `url` argument rather than special-casing browser_navigate:
+ * the guard must cover every upstream tool that can be pointed at a host
+ * (browser_navigate, browser_tabs, browser_network_request), including ones
+ * upstream has not shipped yet.
+ */
+function outboundUrlArg(args: Record<string, unknown> | undefined): string | undefined {
+  const raw = args?.url;
+  if (typeof raw !== 'string') return undefined;
+  return /^https?:\/\//i.test(raw) ? raw : undefined;
+}
+
+/**
  * Build one outward-facing MCP Server bound to the shared upstream proxy. A
  * Server owns exactly one transport (SDK contract: connect() assumes sole
  * ownership), so each binding — stdio and every HTTP session — gets its own
@@ -218,11 +263,26 @@ export function createOutwardServer(
       };
     }
     try {
-      // Custom tools are exempt: web_fetch already takes an explicit `session`
-      // argument, and the session_* tools report the binding themselves.
+      // Custom tools are exempt from the wrappers below: web_fetch already takes
+      // an explicit `session` argument and runs the outbound guard + framing
+      // itself, and the session_* tools report the binding themselves.
       if (isCustomTool(name)) return await callCustomTool(name, args ?? {});
+
+      // Same outbound guard web_fetch runs, on the same shared ledger — so
+      // browser_navigate cannot be used to route around it (DEC-2026-07-29).
+      const target = outboundUrlArg(args);
+      if (target) {
+        const guard = guardOutbound(target, secretInventory());
+        if (!guard.ok) {
+          return {
+            content: [{ type: 'text', text: `Error in ${name}: ${guard.reason}` }],
+            isError: true,
+          };
+        }
+      }
+
       const result = await upstreamOf().callTool({ name, arguments: args ?? {} });
-      return withSessionBanner(result, boundSession(), remote);
+      return withUntrustedNotice(withSessionBanner(result, boundSession(), remote), name);
     } catch (err) {
       return {
         content: [

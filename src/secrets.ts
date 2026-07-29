@@ -12,6 +12,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { TtlCache } from './cache.js';
+
 /** The playwright-mcp config base dir (platform-correct). */
 export function configDir(): string {
   const base =
@@ -87,4 +89,52 @@ export function getSecret(key: string, opts: GetSecretOptions = {}): string | un
     if (projectEnv?.[key] !== undefined) return projectEnv[key];
   }
   return loadSecrets()?.[key] ?? process.env[key];
+}
+
+/**
+ * Everything this package can positively identify as a secret VALUE, labelled
+ * by where it came from — the inventory src/exfil.ts scans outbound URLs
+ * against (ledger DEC-2026-07-29).
+ *
+ * Deliberately scoped to what we own: dotenv values plus cookie values from
+ * captured storageState artifacts. It knows nothing of the user's memory
+ * directory or connector data, which is exactly why the DEC records
+ * single-URL exfiltration as an explicit non-fix.
+ *
+ * Labels are what surface in a refusal message; values never are. Cached
+ * briefly so a per-fetch check does not re-read every session file, but short
+ * enough that a freshly captured session is covered within a minute.
+ */
+const inventoryCache = new TtlCache<Record<string, string>>(60_000);
+
+export function secretInventory(): Record<string, string> {
+  const cached = inventoryCache.get('inventory');
+  if (cached) return cached;
+
+  const inventory: Record<string, string> = {};
+
+  const projectEnv = parseDotenv(path.join(process.cwd(), '.env'));
+  for (const [key, value] of Object.entries(projectEnv ?? {})) inventory[`.env:${key}`] = value;
+  for (const [key, value] of Object.entries(loadSecrets() ?? {})) inventory[`secrets.env:${key}`] = value;
+
+  const dir = sessionsDir();
+  if (fs.existsSync(dir)) {
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const state = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')) as {
+          cookies?: { name?: string; value?: string }[];
+        };
+        const session = file.replace(/\.json$/, '');
+        for (const cookie of state.cookies ?? []) {
+          if (cookie.name && cookie.value) inventory[`session:${session}/${cookie.name}`] = cookie.value;
+        }
+      } catch {
+        /* an unreadable or corrupt artifact contributes nothing; never fatal */
+      }
+    }
+  }
+
+  inventoryCache.set('inventory', inventory);
+  return inventory;
 }

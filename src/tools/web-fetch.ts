@@ -18,8 +18,9 @@ import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { getStealthContext, pace } from '../browser.js';
 import { dismissConsent } from '../consent.js';
 import { egressRestricted, assertEgressAllowed, installEgressGuard } from '../egress.js';
+import { guardOutbound, sessionAllowsUrl, wrapUntrusted } from '../exfil.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
-import { sessionFilePath } from '../secrets.js';
+import { sessionFilePath, secretInventory } from '../secrets.js';
 import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 import {
   classifyHealth,
@@ -85,6 +86,15 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
+  // Outbound exfiltration guards (ledger DEC-2026-07-29). Runs on EVERY instance,
+  // unlike the egress check below — this watches what leaves, not what we can be
+  // pointed at. A cache hit skips it: that URL already shipped, so there is
+  // nothing left to prevent.
+  const guard = guardOutbound(url, secretInventory());
+  if (!guard.ok) {
+    return errorResult(url, 'blocked', guard.reason ?? 'refused by the exfiltration guard', opts.links);
+  }
+
   // Remote (claude.ai) instance: refuse SSRF to metadata/localhost/private nets.
   if (egressRestricted()) {
     try {
@@ -108,6 +118,27 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     const file = sessionFilePath(opts.session);
     if (!fs.existsSync(file)) {
       return errorResult(url, 'blocked', `session "${opts.session}" not found — capture it with session_login first`, opts.links);
+    }
+    // Session domain scoping (DEC-2026-07-29): a captured identity may only be
+    // replayed against its own registrable domains, so an injected page cannot
+    // get an authenticated context pointed at an attacker host. Reading the
+    // artifact here also gives a corrupt one a clean refusal instead of letting
+    // newContext() throw past fetchUrl's never-throw contract.
+    let state: unknown;
+    try {
+      state = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return errorResult(url, 'blocked', `session "${opts.session}" is unreadable or corrupt — recapture it with session_login`, opts.links);
+    }
+    if (!sessionAllowsUrl(state, url)) {
+      return errorResult(
+        url,
+        'blocked',
+        `refused: session "${opts.session}" holds no identity for this URL's domain. ` +
+          'A captured session is only replayed against the site it was captured on — ' +
+          'fetch this URL without the session parameter.',
+        opts.links,
+      );
     }
     const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
     const context = await browser.newContext({ ...stealthContextOptions, storageState: file, ignoreHTTPSErrors: true });
@@ -297,7 +328,14 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     session: args.session ? String(args.session) : undefined,
     linkScope: scope === 'same-origin' || scope === 'all' ? scope : 'outbound',
   });
-  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  // Provenance framing (DEC-2026-07-29): the document body is quarantined with
+  // its warning in the opening delimiter, adjacent to the content it is warning
+  // about. Applied at the MCP boundary — fetchUrl's structured result is what
+  // in-process callers want, the framing is for what enters model context.
+  const framed = result.text
+    ? { ...result, text: wrapUntrusted(result.text, result.url) }
+    : result;
+  return { content: [{ type: 'text', text: JSON.stringify(framed, null, 2) }] };
 }
 
 export const webFetch = { definition, handler };
