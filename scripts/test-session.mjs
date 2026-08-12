@@ -19,7 +19,7 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie } =
   await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
 
@@ -298,6 +298,37 @@ test('makeAttachLoginCheck: an SSO redirect is the START of a login, not the end
   const done3 = makeAttachLoginCheck();
   done3({ url: 'https://signin.example.com/', title: 'Login' });
   assert.equal(done3({ url: 'https://app.example.com/home', title: 'Just a moment...' }), false);
+});
+
+// The cookie gate the makeAttachLoginCheck test above refers to as its backstop.
+// A same-origin SPA / multi-step / SSO login can finish without the URL ever
+// leaving the login page; a new AUTH cookie is what proves it happened.
+test('gainedAuthCookie: auth-named completes at once, plain new cookie only after settle, infra never', () => {
+  const set = (a) => new Set(a);
+  const base = set(['x.test|ASP.NET_SessionId', 'x.test|srv_id', 'x.test|_mkto_trk']);
+
+  // A strong auth-named cookie counts the instant it appears (settled irrelevant).
+  assert.equal(gainedAuthCookie(base, set([...base, 'x.test|AuthToken']), false), 'AuthToken');
+  assert.equal(gainedAuthCookie(base, set([...base, 'x.test|.AspNet.Cookies']), false), '.AspNet.Cookies');
+
+  // Pure infra/marketing new cookies never count, even settled.
+  assert.equal(gainedAuthCookie(base, set([...base, 'x.test|_mkto_trk2', 'x.test|__cfruid']), true), null);
+
+  // A non-infra, non-auth-named opaque cookie counts ONLY once past the settle window.
+  assert.equal(gainedAuthCookie(base, set([...base, 'x.test|opaque42']), false), null, 'pre-settle: wait');
+  assert.equal(gainedAuthCookie(base, set([...base, 'x.test|opaque42']), true), 'opaque42', 'post-settle: accept');
+
+  // Nothing gained → null.
+  assert.equal(gainedAuthCookie(base, base, true), null);
+
+  // Name classifiers: ASP.NET_SessionId is pre-login, never the auth ticket.
+  assert.equal(isAuthCookieName('ASP.NET_SessionId'), false);
+  assert.equal(isAuthCookieName('AuthToken'), true);
+  assert.equal(isAuthCookieName('.AspNet.Cookies'), true);
+  assert.equal(isAuthCookieName('.ASPXAUTH'), true);
+  assert.equal(isInfraCookieName('_mkto_trk'), true);
+  assert.equal(isInfraCookieName('__cfruid'), true);
+  assert.equal(isInfraCookieName('AuthToken'), false);
 });
 
 // Both capture modes write the same kind of artifact to the same store, so both

@@ -384,15 +384,101 @@ export function makeAttachLoginCheck(): (p: { url: string; title: string }) => b
   };
 }
 
-/** Wait for the human to clear the wall AND finish logging in (page leaves the login url). */
-const pollAttachedLogin = (port: number, _loginUrl: string, timeout: number): Promise<void> =>
-  pollAttached(
-    port,
-    makeAttachLoginCheck(),
-    timeout,
-    'attach: login was not completed before the timeout — solve the Cloudflare check and finish logging in ' +
-      'in the Chrome window that opened, then it captures automatically',
-  );
+const safeHostname = (u: string): string => {
+  try {
+    return new URL(u).hostname;
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Wait for the human to finish logging in, using the AUTH-COOKIE signal rather than
+ * a URL change. A same-origin SPA login — and any multi-step / SSO login — can finish
+ * without the pathname ever leaving the login page, so the URL heuristic
+ * (makeAttachLoginCheck / leftLoginPage) times out on it while the login has plainly
+ * succeeded. The cookie gate is the completion authority the driven path already
+ * trusts (newCookies: "a real login always issues at least one new cookie").
+ *
+ * CDP-safety: cookies are read only via a passive connectOverCDP, and only once a
+ * login-host page is showing a NON-wall document — never while a managed challenge is
+ * still up, because reading during the solve is what makes a Cloudflare wall loop.
+ * wallUp() is the same shared predicate both capture modes compose.
+ */
+async function pollAttachedLogin(port: number, loginUrl: string, timeout: number): Promise<void> {
+  const reg = siteDomain(loginUrl);
+  const onSite = (host: string) => {
+    const h = host.replace(/^\./, '').toLowerCase();
+    return h === reg || h.endsWith('.' + reg);
+  };
+  const nameKey = (c: { domain?: string; name?: string }) =>
+    `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
+  const valKey = (c: { domain?: string; name?: string; value?: string }) => `${nameKey(c)}|${c.value ?? ''}`;
+  const urlCheck = makeAttachLoginCheck(); // URL arm — latches the login page, fires once it is left
+  let cdp: Browser | undefined;
+  let baseNames: Set<string> | null = null;
+  let baseVals: Set<string> | null = null;
+  const start = Date.now();
+  const deadline = Date.now() + timeout;
+  let stableSince = 0;
+  try {
+    while (Date.now() < deadline) {
+      let pages: Array<{ type?: string; url?: string; title?: string }> = [];
+      try {
+        pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
+      } catch {
+        /* endpoint hiccup — keep waiting */
+      }
+      // The login-host page, if its document has rendered. The URL arm observes it
+      // every poll (latching the login page, firing when the human leaves it). The
+      // cookie arms read only once its wall — if any — is down, because a passive CDP
+      // read is safe only after a managed challenge is gone.
+      const sitePage = pages.find(
+        (p) => p.type === 'page' && typeof p.url === 'string' && onSite(safeHostname(p.url)) && (p.title ?? '').trim() !== '',
+      );
+      const urlLeft = sitePage ? urlCheck({ url: sitePage.url ?? '', title: sitePage.title ?? '' }) : false;
+      let done = false;
+      if (sitePage && !wallUp(sitePage.url ?? '', sitePage.title ?? '')) {
+        try {
+          if (!cdp) cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+          const ctx = cdp.contexts()[0];
+          const cookies = (ctx ? await ctx.cookies() : []).filter((c) => onSite(c.domain ?? ''));
+          const names = new Set(cookies.map(nameKey));
+          // value-keyed, infra excluded — catches a session cookie ROTATED in place
+          // (same name, new value on login) that a name-only delta would miss.
+          const vals = new Set(cookies.filter((c) => !isInfraCookieName(c.name ?? '')).map(valKey));
+          if (baseNames === null) {
+            baseNames = names;
+            baseVals = vals; // first clean read = the pre-login cookie floor
+          } else {
+            const authGained = gainedAuthCookie(baseNames, names, Date.now() - start > 15_000);
+            const jarChanged = [...vals].some((k) => !baseVals!.has(k)); // added or rotated
+            // A new auth cookie proves login on its own (the same-origin SPA case, where
+            // the URL never moves). Otherwise require BOTH the URL leaving the login page
+            // AND a real cookie change — which keeps a multi-step login's email screen
+            // (URL moved to /username, no cookie issued yet) from completing early.
+            done = authGained !== null || (urlLeft && jarChanged);
+          }
+        } catch {
+          /* CDP hiccup — keep waiting */
+        }
+      }
+      if (done) {
+        if (!stableSince) stableSince = Date.now();
+        else if (Date.now() - stableSince >= 2000) return; // held 2s → real
+      } else {
+        stableSince = 0;
+      }
+      await sleep(1000);
+    }
+    throw new Error(
+      'attach: login was not completed before the timeout — solve any challenge and finish logging in ' +
+        'in the Chrome window that opened, then it captures automatically',
+    );
+  } finally {
+    await cdp?.close().catch(() => {});
+  }
+}
 
 /** Wait for the human to clear the wall only — no login expected, same url throughout. */
 const pollAttachedChallenge = (port: number, url: string, timeout: number): Promise<void> =>
@@ -526,6 +612,49 @@ export function newCookies(before: StorageState, after: StorageState): NonNullab
     `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
   const seen = new Set((before.cookies ?? []).map(key));
   return (after.cookies ?? []).filter((c) => !seen.has(key(c)));
+}
+
+/**
+ * Cookies set BEFORE any login — dropped on first page load by the app, analytics
+ * or the CDN. A new one of these is not evidence of authentication (an ASP.NET app
+ * drops ASP.NET_SessionId and a Marketo _mkto_trk before the user has typed a
+ * thing), so the attach auth-completion gate must ignore them.
+ */
+export function isInfraCookieName(name: string): boolean {
+  return /^(?:_mkto_trk|marketo|__cf|cf_|_ga(?:$|_)|_gid|_gcl|_hj|optimizely|ai_session|ai_user|srv_id|cookiesession\d*|_fbp|_uetsid|_uetvid|visitor|_pk_|s_|utag_)/i.test(
+    name,
+  );
+}
+
+/**
+ * A cookie NAME that looks like a real authentication ticket/token (forms-auth,
+ * ASP.NET Core auth, an identity/JWT/bearer/login token). Excludes the pre-login
+ * ASP.NET_SessionId, which exists before the user authenticates.
+ */
+export function isAuthCookieName(name: string): boolean {
+  if (/^ASP\.NET_SessionId$/i.test(name)) return false;
+  return /aspxauth|\.aspnet\.|\.aspnetcore|fedauth|identity|\bauth\b|token|jwt|bearer|logintoken/i.test(name);
+}
+
+/**
+ * The signal attach-login completes on — the same "a real login issues a new
+ * cookie" authority the driven path uses (see newCookies), adapted for a passive
+ * poll. Returns the name of a gained cookie that proves login, else null:
+ *   • a STRONG auth-named cookie (isAuthCookieName) counts the instant it appears;
+ *   • any other NON-infra new cookie counts only once `settled` (past the pre-login
+ *     cookie-settle window), so a late CSRF/analytics drop cannot false-complete.
+ * `before`/`after` are (domain|name) key sets for the login site's own cookies.
+ */
+export function gainedAuthCookie(before: Set<string>, after: Set<string>, settled: boolean): string | null {
+  let fallback: string | null = null;
+  for (const k of after) {
+    if (before.has(k)) continue;
+    const name = k.slice(k.indexOf('|') + 1);
+    if (isInfraCookieName(name)) continue;
+    if (isAuthCookieName(name)) return name;
+    if (settled && fallback === null) fallback = name;
+  }
+  return fallback;
 }
 
 /**
