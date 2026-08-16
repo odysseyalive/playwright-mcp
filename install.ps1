@@ -1,8 +1,8 @@
 # install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
 # Builds the server, downloads Chromium, registers it at USER scope with Claude
-# Code, and applies the WebFetch/claude-in-chrome override automatically, printing
-# a diff of what it changes. Native WebSearch stays enabled. Idempotent +
+# Code and Codex, and applies the WebFetch/claude-in-chrome override automatically,
+# printing a diff of what it changes. Native WebSearch stays enabled. Idempotent +
 # non-interactive: safe to re-run, never prompts. Opt out of the global-config
 # edits with -NoDeny / -NoSteer.
 #
@@ -29,6 +29,8 @@ $nodeMajor = [int](node -p "process.versions.node.split('.')[0]")
 if ($nodeMajor -lt 18) { Die "Node >=18 required; found $(node -v)." }
 $hasClaude = [bool](Get-Command claude -ErrorAction SilentlyContinue)
 if (-not $hasClaude) { Warn "Claude Code CLI 'claude' not found — registration step will be skipped." }
+$hasCodex = [bool](Get-Command codex -ErrorAction SilentlyContinue)
+if (-not $hasCodex) { Warn "Codex CLI 'codex' not found — registration step will be skipped." }
 Say "Node $(node -v) OK"
 
 # ── 2. Install deps + build ───────────────────────────────────────────────────
@@ -54,13 +56,23 @@ try {
 # ── 4. Register at user scope (idempotent) ────────────────────────────────────
 $entry = Join-Path $Here "dist\index.js"
 if ($hasClaude) {
-  Say "Registering playwright-mcp at user scope…"
+  Say "Registering playwright-mcp at user scope with Claude Code…"
   claude mcp remove --scope user playwright-mcp 2>$null
   claude mcp add --scope user playwright-mcp -- node "$entry"
-  Say "Registered. Check with: claude mcp list"
+  Say "Registered with Claude Code. Check with: claude mcp list"
 } else {
-  Warn "Skipped registration. Run manually once 'claude' is installed:"
+  Warn "Skipped Claude Code registration. Run manually once 'claude' is installed:"
   Write-Host "    claude mcp add --scope user playwright-mcp -- node `"$entry`""
+}
+
+if ($hasCodex) {
+  Say "Registering playwright-mcp with Codex…"
+  codex mcp remove playwright-mcp 2>$null
+  codex mcp add playwright-mcp -- node "$entry"
+  Say "Registered with Codex. Check with: codex mcp list"
+} else {
+  Warn "Skipped Codex registration. Run manually once 'codex' is installed:"
+  Write-Host "    codex mcp add playwright-mcp -- node `"$entry`""
 }
 
 # ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────

@@ -5,7 +5,7 @@
 # Builds the server, downloads headless Chromium, registers the server at USER
 # scope with Claude Code (so every project gets it), and applies the
 # WebFetch/claude-in-chrome override automatically, printing a diff of what it
-# changes. Native WebSearch stays enabled. Idempotent + non-interactive: safe to
+# changes. Native WebFetch stays enabled. Idempotent + non-interactive: safe to
 # re-run, never prompts. Opt out of the global-config edits with --no-deny/--no-steer.
 #
 # Flags:
@@ -36,6 +36,7 @@ command -v node >/dev/null 2>&1 || die "Node.js is required (>=18). Install it a
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 18 ] || die "Node >=18 required; found $(node -v)."
 command -v claude >/dev/null 2>&1 || warn "Claude Code CLI 'claude' not found on PATH — the registration step will be skipped."
+command -v codex >/dev/null 2>&1 || warn "Codex CLI 'codex' not found on PATH — the registration step will be skipped."
 say "Node $(node -v) OK"
 
 # ── 2. Install deps + build ───────────────────────────────────────────────────
@@ -77,13 +78,23 @@ pw_install npx playwright install chromium
 
 # ── 4. Register at user scope (idempotent) ────────────────────────────────────
 if command -v claude >/dev/null 2>&1; then
-  say "Registering playwright-mcp at user scope…"
+  say "Registering playwright-mcp at user scope with Claude Code…"
   claude mcp remove --scope user playwright-mcp >/dev/null 2>&1 || true
   claude mcp add --scope user playwright-mcp -- node "$HERE/dist/index.js"
-  say "Registered. Check with: claude mcp list"
+  say "Registered with Claude Code. Check with: claude mcp list"
 else
-  warn "Skipped registration. Run manually once 'claude' is installed:"
+  warn "Skipped Claude Code registration. Run manually once 'claude' is installed:"
   echo "    claude mcp add --scope user playwright-mcp -- node \"$HERE/dist/index.js\""
+fi
+
+if command -v codex >/dev/null 2>&1; then
+  say "Registering playwright-mcp with Codex…"
+  codex mcp remove playwright-mcp >/dev/null 2>&1 || true
+  codex mcp add playwright-mcp -- node "$HERE/dist/index.js"
+  say "Registered with Codex. Check with: codex mcp list"
+else
+  warn "Skipped Codex registration. Run manually once 'codex' is installed:"
+  echo "    codex mcp add playwright-mcp -- node \"$HERE/dist/index.js\""
 fi
 
 # ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────
