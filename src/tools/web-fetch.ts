@@ -100,7 +100,7 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     try {
       await assertEgressAllowed(url);
     } catch (err) {
-      return errorResult(url, 'blocked', err instanceof Error ? err.message : String(err), opts.links);
+      return errorResult(url, 'blocked', briefly(err), opts.links);
     }
   }
 
@@ -109,66 +109,81 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   // storageState, so authed cookies live in their own jar and never bleed into
   // the shared scraping profile (the storageState-isolation rule). Local-only:
   // a captured session is never loaded on the prompt-injectable remote surface.
+  //
+  // Acquiring the page is inside the try: a browser that will not start is a
+  // fetch failure like any other, and must come back as a FetchResult. It used
+  // to throw past this function, breaking the never-throw contract and reaching
+  // the model as a bare `Error in web_fetch:` with no fetchStatus.
   let page: Page;
-  let cleanup: () => Promise<void>;
-  if (opts.session) {
-    if (egressRestricted()) {
-      return errorResult(url, 'blocked', 'authenticated web_fetch (session) is disabled on the remote instance', opts.links);
-    }
-    const file = sessionFilePath(opts.session);
-    if (!fs.existsSync(file)) {
-      return errorResult(url, 'blocked', `session "${opts.session}" not found — capture it with session_login first`, opts.links);
-    }
-    // Session domain scoping (DEC-2026-07-29): a captured identity may only be
-    // replayed against its own registrable domains, so an injected page cannot
-    // get an authenticated context pointed at an attacker host. Reading the
-    // artifact here also gives a corrupt one a clean refusal instead of letting
-    // newContext() throw past fetchUrl's never-throw contract.
-    let state: unknown;
-    try {
-      state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {
-      return errorResult(url, 'blocked', `session "${opts.session}" is unreadable or corrupt — recapture it with session_login`, opts.links);
-    }
-    if (!sessionAllowsUrl(state, url)) {
-      return errorResult(
-        url,
-        'blocked',
-        `refused: session "${opts.session}" holds no identity for this URL's domain. ` +
-          'A captured session is only replayed against the site it was captured on — ' +
-          'fetch this URL without the session parameter.',
-        opts.links,
-      );
-    }
-    const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
-    const context = await browser.newContext({ ...stealthContextOptions, storageState: file, ignoreHTTPSErrors: true });
-    await context.addInitScript(STEALTH_INIT);
-    page = await context.newPage();
-    cleanup = async () => {
-      // Rolling session write-back: sites extend cookie expiry on every authed
-      // request; persisting the refreshed jar means each read PROLONGS the
-      // session instead of letting the artifact age toward its original expiry.
-      // Skipped when the page landed on a login wall — a logged-out jar must
-      // never overwrite the (possibly recoverable) captured one.
-      try {
-        const landed = page.url();
-        if (!/\/(login|signin|sign-in|auth)(\b|\/|\?)/i.test(landed)) {
-          await context.storageState({ path: file });
-          fs.chmodSync(file, 0o600);
-        }
-      } catch {
-        /* write-back is best-effort; the read result is unaffected */
+  let cleanup: (() => Promise<void>) | undefined;
+  try {
+    if (opts.session) {
+      if (egressRestricted()) {
+        return errorResult(url, 'blocked', 'authenticated web_fetch (session) is disabled on the remote instance', opts.links);
       }
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
-    };
-  } else {
-    const context = await getStealthContext();
-    page = await context.newPage();
-    if (egressRestricted()) await installEgressGuard(page);
-    cleanup = async () => {
-      await page.close().catch(() => {});
-    };
+      const file = sessionFilePath(opts.session);
+      if (!fs.existsSync(file)) {
+        return errorResult(url, 'blocked', `session "${opts.session}" not found — capture it with session_login first`, opts.links);
+      }
+      // Session domain scoping (DEC-2026-07-29): a captured identity may only be
+      // replayed against its own registrable domains, so an injected page cannot
+      // get an authenticated context pointed at an attacker host. Reading the
+      // artifact here also gives a corrupt one a clean refusal instead of letting
+      // newContext() throw past fetchUrl's never-throw contract.
+      let state: unknown;
+      try {
+        state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch {
+        return errorResult(url, 'blocked', `session "${opts.session}" is unreadable or corrupt — recapture it with session_login`, opts.links);
+      }
+      if (!sessionAllowsUrl(state, url)) {
+        return errorResult(
+          url,
+          'blocked',
+          `refused: session "${opts.session}" holds no identity for this URL's domain. ` +
+            'A captured session is only replayed against the site it was captured on — ' +
+            'fetch this URL without the session parameter.',
+          opts.links,
+        );
+      }
+      const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
+      // Registered before the context exists: if newContext/newPage throws, the
+      // catch below still has something that closes this chromium.
+      cleanup = async () => {
+        await browser.close().catch(() => {});
+      };
+      const context = await browser.newContext({ ...stealthContextOptions, storageState: file, ignoreHTTPSErrors: true });
+      await context.addInitScript(STEALTH_INIT);
+      page = await context.newPage();
+      cleanup = async () => {
+        // Rolling session write-back: sites extend cookie expiry on every authed
+        // request; persisting the refreshed jar means each read PROLONGS the
+        // session instead of letting the artifact age toward its original expiry.
+        // Skipped when the page landed on a login wall — a logged-out jar must
+        // never overwrite the (possibly recoverable) captured one.
+        try {
+          const landed = page.url();
+          if (!/\/(login|signin|sign-in|auth)(\b|\/|\?)/i.test(landed)) {
+            await context.storageState({ path: file });
+            fs.chmodSync(file, 0o600);
+          }
+        } catch {
+          /* write-back is best-effort; the read result is unaffected */
+        }
+        await context.close().catch(() => {});
+        await browser.close().catch(() => {});
+      };
+    } else {
+      const context = await getStealthContext();
+      page = await context.newPage();
+      cleanup = async () => {
+        await page.close().catch(() => {});
+      };
+      if (egressRestricted()) await installEgressGuard(page);
+    }
+  } catch (err) {
+    await cleanup?.();
+    return errorResult(url, 'blocked', `browser unavailable: ${briefly(err)}`, opts.links);
   }
   try {
     await pace();
@@ -248,10 +263,16 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     cache.set(cacheKey, result);
     return result;
   } catch (err) {
-    return errorResult(url, 'blocked', err instanceof Error ? err.message : String(err), opts.links);
+    return errorResult(url, 'blocked', briefly(err), opts.links);
   } finally {
-    await cleanup();
+    await cleanup?.();
   }
+}
+
+/** Playwright errors carry a whole browser log; keep the head of it, not all of it. */
+function briefly(err: unknown, max = 400): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.length > max ? `${msg.slice(0, max)}…` : msg;
 }
 
 function errorResult(url: string, status: FetchStatus, error: string, links?: boolean): FetchResult {
