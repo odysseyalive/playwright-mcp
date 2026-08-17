@@ -47,6 +47,20 @@ test('fetchStatus: blocked from 429', () => {
   assert.equal(classifyHealth('<html>ok</html>', 429), 'blocked');
 });
 
+test('fetchStatus: a substantial article that merely references "captcha" stays ok', () => {
+  // Every Wikipedia page references a captcha in its edit UI markup, tripping
+  // BLOCK_TELL. A full article body means the fetch succeeded — not a bot wall.
+  const head = '<html><head><title>Hawaii</title><script>mw.loader.load("ext.confirmEdit.CaptchaWidget")</script></head><body>';
+  const article = 'Hawaii is a U.S. state in the Pacific. '.repeat(60); // > 1500 chars
+  assert.equal(classifyHealth(head + article + '</body></html>', 200, article), 'ok');
+});
+
+test('fetchStatus: a captcha interstitial with a tiny body is still blocked', () => {
+  // The guard is body-size, not keyword removal: a real challenge page has ~no prose.
+  const wall = '<html><body>Please verify you are human by solving the captcha.</body></html>';
+  assert.equal(classifyHealth(wall, 200, 'verify you are human'), 'blocked');
+});
+
 test('citation: JSON-LD yields author + dateConfidence high', () => {
   const c = extractCitation(html('article-jsonld.html'), 'https://coastalreview.test/tides');
   assert.ok(c.author.length >= 1, 'has an author');

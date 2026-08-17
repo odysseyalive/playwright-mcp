@@ -21,12 +21,15 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-# 2) Chromium + its system libraries (apt via --with-deps needs root; we are root
-#    at build time). Make the browser dir readable by the unprivileged runtime user.
-# Chromium + its system libraries. Make the browser dir writable by the non-root
-# runtime user — Playwright creates lock/registry dirs under it at launch (mkdir
-# there fails with EACCES otherwise). Same RUN layer, so no image-size duplication.
-RUN npx playwright install --with-deps chromium \
+# 2) Google Chrome + its system libraries (apt via --with-deps needs root; we are
+#    root at build time). The runtime launches with channel:'chrome' (real Chrome,
+#    not bundled Chromium — src/stealth.ts, src/upstream.ts: bundled Chromium is an
+#    anti-bot tell), so the `chrome` channel MUST be installed, not `chromium`.
+#    Chrome lands in /opt/google/chrome (world-readable from the .deb, so the
+#    unprivileged runtime user can exec it). Make /ms-playwright writable too —
+#    Playwright still creates lock/registry dirs there at launch. Same RUN layer.
+RUN npx playwright install --with-deps chrome \
+ && mkdir -p /ms-playwright \
  && chmod -R a+rwX /ms-playwright
 
 # 3) Build the TypeScript (.dockerignore keeps host node_modules/dist out, so this

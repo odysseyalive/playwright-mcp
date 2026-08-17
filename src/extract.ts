@@ -56,14 +56,6 @@ const CONSENT_TELL =
 export function classifyHealth(html: string, httpStatus = 200, bodyText?: string): FetchStatus {
   if (httpStatus === 404) return '404';
   if (httpStatus === 403 || httpStatus === 429) return 'blocked';
-  const head = html.slice(0, 60_000);
-  if (BLOCK_TELL.test(head)) return 'blocked';
-  if (PARKED_TELL.test(head)) return 'parked';
-
-  const title = /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1] ?? '';
-  const h1 = /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]?.replace(/<[^>]+>/g, '') ?? '';
-  // Soft-404: 200 OK but the title/H1 announces not-found.
-  if (NOTFOUND_TELL.test(title) || NOTFOUND_TELL.test(h1)) return '404';
 
   const body = bodyText ?? '';
   const short = body.length > 0 && body.length < 600;
@@ -71,7 +63,21 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
   // the DOM regardless of entitlement, so PAYWALL_TELL fires even on a full,
   // authenticated read. Only call it a wall when the content is actually gated —
   // missing or truncated body — not when a substantial article body came through.
+  // The same reasoning covers the bot-wall tell below: a real CAPTCHA / "unusual
+  // traffic" interstitial serves a tiny challenge page, whereas a full article
+  // that merely REFERENCES a captcha in its edit UI (every Wikipedia page does)
+  // is not blocked. A 403/429 status is still a hard block regardless of body.
   const substantial = body.length >= 1500;
+
+  const head = html.slice(0, 60_000);
+  if (BLOCK_TELL.test(head) && !substantial) return 'blocked';
+  if (PARKED_TELL.test(head)) return 'parked';
+
+  const title = /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1] ?? '';
+  const h1 = /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]?.replace(/<[^>]+>/g, '') ?? '';
+  // Soft-404: 200 OK but the title/H1 announces not-found.
+  if (NOTFOUND_TELL.test(title) || NOTFOUND_TELL.test(h1)) return '404';
+
   if (LOGIN_TELL.test(head) && short) return 'login-wall';
   if (PAYWALL_TELL.test(head) && !substantial) return 'paywall';
   // Consent notice returned AS the content. Only a real failure when the notice

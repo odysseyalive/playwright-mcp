@@ -24,6 +24,13 @@ import { CHROME_MAJOR, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:browser]', ...args);
 
 function profileDir(): string {
+  // An explicit override wins so a SECOND instance (e.g. the krull-web-broker's
+  // dedicated HTTP host instance running alongside a Claude Code stdio instance)
+  // can use its own persistent profile. Two instances sharing one profile dir
+  // collide on Chromium's SingletonLock — the second's stealth context then
+  // fails to open pages and every web_fetch reads back `blocked`.
+  const override = process.env.PLAYWRIGHT_MCP_PROFILE_DIR;
+  if (override) return override;
   const base = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache');
   return path.join(base, 'playwright-mcp', 'profile');
 }

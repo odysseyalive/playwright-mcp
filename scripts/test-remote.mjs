@@ -17,6 +17,11 @@ import { buildGitHubAuth } from '../dist/auth.js';
 
 const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_solve_challenge', 'session_scaffold_tests', 'browser_file_upload', 'suite_scaffold', 'suite_audit'];
 const KEEPERS = ['web_fetch', 'browser_evaluate', 'browser_navigate', 'browser_snapshot', 'browser_click'];
+// The cloud denylist splits into two tiers on the local (no-auth loopback) surface:
+// silent-power tools stay denied everywhere non-stdio; the human-gated session_*
+// handoff family is allowed on the local trusted surface (broker CAPTCHA solving).
+const ALWAYS_DENIED = ['browser_run_code_unsafe', 'browser_file_upload', 'session_scaffold_tests', 'suite_scaffold', 'suite_audit'];
+const SESSION_HANDOFF = ['session_login', 'session_status', 'session_solve_challenge', 'session_attach'];
 
 // ── egress backstop ───────────────────────────────────────────────────────────
 
@@ -51,13 +56,16 @@ function stubUpstream() {
   };
 }
 
-async function connectOutward(remote) {
+async function connectOutward(options) {
+  // Back-compat: a bare boolean maps to the legacy { remote } switch; an object
+  // is passed through so tests can select a trust tier directly.
+  const opts = typeof options === 'object' && options !== null ? options : { remote: options };
   const upstream = stubUpstream();
   const { tools: upstreamTools } = await upstream.listTools();
   // createOutwardServer resolves the upstream client PER CALL so a session bind
   // can swap the browser underneath live callers (src/upstream.ts) — hand it a
   // getter, not the client.
-  const server = createOutwardServer(() => upstream, upstreamTools, { remote });
+  const server = createOutwardServer(() => upstream, upstreamTools, opts);
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
   const client = new Client({ name: 'test', version: '0' });
@@ -77,14 +85,31 @@ test('denylist: remote tools/call rejects a denylisted tool by name (not just hi
   const client = await connectOutward(true);
   const res = await client.callTool({ name: 'session_login', arguments: {} });
   assert.equal(res.isError, true);
-  assert.match(res.content.find((c) => c.type === 'text').text, /not available on the remote surface/);
+  assert.match(res.content.find((c) => c.type === 'text').text, /not available on the cloud surface/);
   await client.close();
 });
 
-test('denylist: local (remote:false) surface keeps the full toolset', async () => {
+test('denylist: stdio (remote:false) surface keeps the full toolset', async () => {
   const client = await connectOutward(false);
   const names = new Set((await client.listTools()).tools.map((t) => t.name));
-  for (const d of DENYLISTED) assert.equal(names.has(d), true, `${d} present locally`);
+  for (const d of DENYLISTED) assert.equal(names.has(d), true, `${d} present on stdio`);
+  await client.close();
+});
+
+test('local tier: hides ALWAYS_DENIED but keeps the human-gated session_* handoff', async () => {
+  const client = await connectOutward({ trust: 'local' });
+  const names = new Set((await client.listTools()).tools.map((t) => t.name));
+  for (const d of ALWAYS_DENIED) assert.equal(names.has(d), false, `${d} hidden on local`);
+  for (const s of SESSION_HANDOFF) assert.equal(names.has(s), true, `${s} present on local (broker CAPTCHA handoff)`);
+  for (const k of KEEPERS) assert.equal(names.has(k), true, `${k} present on local`);
+  await client.close();
+});
+
+test('local tier: tools/call still rejects an ALWAYS_DENIED tool by name', async () => {
+  const client = await connectOutward({ trust: 'local' });
+  const res = await client.callTool({ name: 'browser_run_code_unsafe', arguments: {} });
+  assert.equal(res.isError, true);
+  assert.match(res.content.find((c) => c.type === 'text').text, /not available on the local surface/);
   await client.close();
 });
 

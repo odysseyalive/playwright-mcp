@@ -108,27 +108,62 @@ function buildInstructions(
 }
 
 /**
- * Tools that must NOT be reachable over the remote (claude.ai) transport: they
- * run arbitrary code or touch credentials, and the remote surface is driven by a
- * prompt-injectable cloud LLM (ledger DEC-2026-06-26). Filtered from BOTH
- * tools/list and tools/call when remote=true; the local stdio surface is
- * unaffected. Hiding alone is insufficient — a client can still name a hidden
- * tool — so the call handler rejects them too.
+ * The HTTP surface has two trust tiers, and the denylist is split to match.
+ *
+ * `ALWAYS_DENIED` — silent, ungated power: arbitrary code execution, host-fs
+ * writes, and test/suite scaffolding. These have no human in the loop, so a
+ * prompt-injectable driver (a cloud LLM, OR a local model steered by untrusted
+ * page content) could wield them invisibly. Denied on EVERY non-stdio surface,
+ * local-trusted included.
+ *
+ * `CLOUD_DENIED` — the `session_*` login/challenge/attach handoff family. Each
+ * one opens a HEADED window the human must act in (log in, solve a CAPTCHA), so
+ * injection can at most pop a visible window, never silently exfiltrate. That
+ * human gate is exactly what makes them safe on a LOCAL trusted surface (the
+ * no-auth loopback the operator explicitly opted into via
+ * PLAYWRIGHT_MCP_ALLOW_NOAUTH=1) yet unsafe on the public claude.ai surface,
+ * where the client is a prompt-injectable cloud LLM behind OAuth. Denied on the
+ * cloud surface only.
+ *
+ * `REMOTE_DENYLIST` (the union) is the CLOUD denylist and is unchanged from when
+ * it was the only one — the claude.ai surface still drops all nine. Filtering is
+ * applied to BOTH tools/list and tools/call: hiding alone is insufficient since a
+ * client can still name a hidden tool, so the call handler rejects them too.
+ * (ledger DEC-2026-06-26.)
  */
-const REMOTE_DENYLIST = new Set([
+const ALWAYS_DENIED = new Set([
   'browser_run_code_unsafe',
+  'browser_file_upload',
+  'session_scaffold_tests',
+  'suite_scaffold',
+  'suite_audit',
+]);
+const CLOUD_DENIED = new Set([
   'session_login',
   'session_status',
   'session_solve_challenge',
   'session_attach',
-  'session_scaffold_tests',
-  'browser_file_upload',
-  'suite_scaffold',
-  'suite_audit',
 ]);
+const REMOTE_DENYLIST = new Set([...ALWAYS_DENIED, ...CLOUD_DENIED]);
+
+/**
+ * Trust tier of an outward surface:
+ * - `stdio`  — the local Claude Code process; full toolset.
+ * - `local`  — a no-auth loopback HTTP surface an operator opted into; full
+ *              toolset minus `ALWAYS_DENIED` (keeps the human-gated `session_*`).
+ * - `cloud`  — the public OAuth claude.ai surface; full toolset minus
+ *              `REMOTE_DENYLIST`.
+ */
+type SurfaceTrust = 'stdio' | 'local' | 'cloud';
 
 interface OutwardServerOptions {
-  /** Apply the REMOTE_DENYLIST to tools/list + tools/call (claude.ai surface). */
+  /** Trust tier governing the denylist. Defaults from `remote` for back-compat. */
+  trust?: SurfaceTrust;
+  /**
+   * Legacy switch: `true` == `trust: 'cloud'`, `false`/absent == `trust: 'stdio'`.
+   * Retained so existing call sites and tests keep working; `trust` wins if both
+   * are given.
+   */
   remote?: boolean;
 }
 
@@ -233,8 +268,14 @@ export function createOutwardServer(
   upstreamTools: { name: string }[],
   options: OutwardServerOptions = {},
 ): Server {
-  const remote = options.remote ?? false;
-  const allow = (name: string) => !remote || !REMOTE_DENYLIST.has(name);
+  const trust: SurfaceTrust = options.trust ?? (options.remote ? 'cloud' : 'stdio');
+  // The local tier still owes the session banner a truthful "can this surface
+  // rebind?" answer; only the cloud tier gets the name-free variant, because only
+  // it hides the session_* family.
+  const remote = trust === 'cloud';
+  const denied =
+    trust === 'stdio' ? null : trust === 'local' ? ALWAYS_DENIED : REMOTE_DENYLIST;
+  const allow = (name: string) => denied === null || !denied.has(name);
 
   const visibleUpstream = upstreamTools.filter((t) => allow(t.name));
   const visibleCustom = customTools.filter((t) => allow(t.name));
@@ -257,7 +298,7 @@ export function createOutwardServer(
     if (!allow(name)) {
       return {
         content: [
-          { type: 'text', text: `Error: tool "${name}" is not available on the remote surface.` },
+          { type: 'text', text: `Error: tool "${name}" is not available on the ${trust} surface.` },
         ],
         isError: true,
       };
@@ -335,15 +376,19 @@ async function main() {
       auth = buildGitHubAuth({ publicUrl, clientId, clientSecret, allowedLogin });
       log(`remote auth: GitHub proxy-OAuth (allowed login: ${allowedLogin})`);
     } else if (allowNoAuth) {
-      log('WARNING: remote transport starting WITHOUT auth (PLAYWRIGHT_MCP_ALLOW_NOAUTH=1) — localhost/dev only, never expose publicly.');
+      log('WARNING: remote transport starting WITHOUT auth (PLAYWRIGHT_MCP_ALLOW_NOAUTH=1) — localhost/dev only, never expose publicly. Serving the LOCAL trust tier (session_* handoff tools available; arbitrary-code tools still denied).');
     } else {
       start = false;
       log('remote requested (PLAYWRIGHT_MCP_PUBLIC_URL set) but GitHub OAuth is not configured — refusing to start the remote transport. Set GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET/GITHUB_ALLOWED_LOGIN, or PLAYWRIGHT_MCP_ALLOW_NOAUTH=1 for localhost dev.');
     }
     if (start) {
       const port = Number(process.env.PLAYWRIGHT_MCP_PORT ?? 8765);
+      // OAuth present → public cloud surface (cloud denylist). No-auth loopback
+      // opt-in → local trusted surface (keeps the human-gated session_* handoff
+      // the krull-web-broker needs for inline CAPTCHA solving).
+      const trust: SurfaceTrust = auth ? 'cloud' : 'local';
       remote = startRemoteServer({
-        makeServer: () => createOutwardServer(getUpstream, upstreamTools, { remote: true }),
+        makeServer: () => createOutwardServer(getUpstream, upstreamTools, { trust }),
         publicUrl,
         port,
         authRouter: auth?.router,
