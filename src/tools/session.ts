@@ -42,8 +42,9 @@ export interface LoginOptions {
   name: string;
   loginUrl: string;
   // Optional confirmation marker: a CSS/XPath selector, visible text, or a
-  // substring of the *post-login* URL. Omit in headed mode to auto-detect
-  // login by "moved past the login page" (see waitForLogin).
+  // substring of the *post-login* URL. Omit in headed mode to auto-detect login —
+  // "moved past the login page", OR (for a same-origin SPA whose URL never changes,
+  // e.g. iCloud) a newly issued auth cookie. See waitForLogin / makeAuthCookieProbe.
   successSignal?: string;
   headed?: boolean; // required for 2FA / SSO / hardware keys
   // Capture via a plain, human-solved Chrome (connectOverCDP) instead of a
@@ -135,6 +136,14 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     // page so cookies the site drops on arrival are already accounted for.
     const before = (await context.storageState()) as StorageState;
 
+    // Completion signal for a SAME-ORIGIN SPA login whose URL never changes
+    // (iCloud, and any app that keeps its pathname constant through sign-in): a
+    // newly issued auth-named cookie, the same authority the attach path already
+    // trusts (pollAttachedLogin / gainedAuthCookie). Consulted ONLY by the no-signal
+    // auto-detect fallback in waitForLogin — never when the caller gave an explicit
+    // successSignal, which stays authoritative.
+    const authGained = makeAuthCookieProbe(() => context.cookies(), before, loginUrl);
+
     if (opts.headed) {
       // Human completes the challenge in the SEPARATE automation window this
       // launched (not their everyday browser). We auto-detect completion when
@@ -143,7 +152,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       log(
         `headed login for "${opts.name}" — a SEPARATE automation window opened; complete the login in THAT window`,
       );
-      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 300_000);
+      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 300_000, authGained);
     } else {
       const sel = { ...DEFAULT_SELECTORS, ...opts.selectors };
       const lookup = { envFile: opts.envFile };
@@ -159,7 +168,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
         page.click(sel.submit).catch(() => page.keyboard.press('Enter')),
         page.waitForLoadState('domcontentloaded').catch(() => {}),
       ]);
-      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 30_000);
+      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 30_000, authGained);
     }
 
     // The wait heuristics can resolve while the human is still mid-login (see
@@ -658,6 +667,42 @@ export function gainedAuthCookie(before: Set<string>, after: Set<string>, settle
 }
 
 /**
+ * The completion probe the DRIVEN capture path (sessionLogin) uses to recognise a
+ * SAME-ORIGIN SPA login — iCloud, and any app that keeps its URL constant through
+ * sign-in — where waitPastLogin's pathname-change test can never fire. It reuses the
+ * exact authority the attach path trusts (gainedAuthCookie over the login site's own
+ * cookies), in STRONG-ONLY form (`settled` = false): an auth-NAMED ticket completes
+ * on its own, while an opaque analytics/CSRF cookie never does. On the driven path
+ * waitPastLogin still governs the URL-change case, so the loose opaque-cookie
+ * fallback is deliberately withheld here. STRONG-only is also the real safety
+ * boundary for cross-origin-iframe auth (iCloud): waitPastLogin's "password field is
+ * gone" gate cannot see an iframe form, so completion there rests entirely on an
+ * auth-NAMED ticket, which the IdP issues only AFTER authentication — never during it.
+ *
+ * `before` is the pre-login cookie floor (context.storageState() taken after landing
+ * on the login page); `cookiesNow` reads the live jar each poll. Both are filtered to
+ * the login site's own domain, matching pollAttachedLogin's scoping.
+ */
+function makeAuthCookieProbe(
+  cookiesNow: () => Promise<Array<{ domain?: string; name?: string }>>,
+  before: StorageState,
+  loginUrl: string,
+): () => Promise<boolean> {
+  const reg = siteDomain(loginUrl);
+  const onSite = (host: string) => {
+    const h = (host ?? '').replace(/^\./, '').toLowerCase();
+    return !!reg && (h === reg || h.endsWith('.' + reg));
+  };
+  const key = (c: { domain?: string; name?: string }) =>
+    `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
+  const base = new Set((before.cookies ?? []).filter((c) => onSite(c.domain ?? '')).map(key));
+  return async () => {
+    const now = (await cookiesNow()).filter((c) => onSite(c.domain ?? ''));
+    return gainedAuthCookie(base, new Set(now.map(key)), false) !== null;
+  };
+}
+
+/**
  * Cookies belonging to `domain` (or a subdomain). Shares `scopeStorageState`'s
  * host-matching rule deliberately: if the two disagreed, a capture could be scoped
  * to nothing and still pass the "did we capture anything" check.
@@ -912,14 +957,28 @@ async function hasPasswordField(page: PwPage): Promise<boolean> {
  * held stable briefly so a mid-redirect flicker doesn't false-trigger. Rejects
  * on timeout so it never counts as success in the race.
  */
-async function waitPastLogin(page: PwPage, loginUrl: string, timeout: number): Promise<void> {
+async function waitPastLogin(
+  page: PwPage,
+  loginUrl: string,
+  timeout: number,
+  authGained?: () => Promise<boolean>,
+): Promise<void> {
   const deadline = Date.now() + timeout;
   let stableSince = 0;
   while (Date.now() < deadline) {
     const url = page.url();
     const movedOff = !samePath(url, loginUrl);
     const noPassword = !(await hasPasswordField(page).catch(() => false));
-    if (movedOff && noPassword) {
+    // A same-origin SPA login (iCloud, and any app that keeps its URL constant
+    // through sign-in) never changes pathname, so movedOff alone can never fire.
+    // A freshly issued auth cookie is the equivalent "past the login" proof — the
+    // same authority the attach path trusts. Requiring the password field to be gone
+    // guards the pre-submit window for a MAIN-FRAME credential form; when that form
+    // lives in a cross-origin iframe (iCloud's does), this locator cannot see it, so
+    // the guard is absent there and safety rests on makeAuthCookieProbe's STRONG-name-
+    // only detection — an auth-named ticket the IdP issues only AFTER authentication.
+    const pastLogin = movedOff || (authGained ? await authGained().catch(() => false) : false);
+    if (noPassword && pastLogin) {
       if (!stableSince) stableSince = Date.now();
       else if (Date.now() - stableSince >= 1500) return;
     } else {
@@ -942,6 +1001,7 @@ async function waitForLogin(
   loginUrl: string,
   signal: string | undefined,
   timeout: number,
+  authGained?: () => Promise<boolean>,
 ): Promise<void> {
   const sig = signal?.trim();
   // The generic heuristic is a FALLBACK, not a co-equal racer. Multi-step logins
@@ -952,7 +1012,11 @@ async function waitForLogin(
   // marker the caller supplied to prevent that. When the caller has said what
   // success looks like, only that counts; a marker that never matches must
   // surface as a diagnostic timeout, not as a wrong success.
-  const arms: Promise<unknown>[] = sig ? [] : [waitPastLogin(page, loginUrl, timeout)];
+  //
+  // authGained is the SPA-login completion signal (a new auth cookie) and it rides
+  // with the fallback for the same reason: it is consulted only when the caller gave
+  // no marker, so an explicit successSignal stays the sole authority.
+  const arms: Promise<unknown>[] = sig ? [] : [waitPastLogin(page, loginUrl, timeout, authGained)];
   if (sig) {
     // (a) CSS/XPath/Playwright-engine selector, (b) visible text, (c) URL
     // substring — but guarded so the login URL itself never counts (D).
@@ -1006,10 +1070,16 @@ async function loginDiagnostic(
     `login capture timed out after ${Math.round(timeoutMs / 1000)}s`,
     `final URL: ${url || 'unknown'}${title ? ` (“${title}”)` : ''}`,
   ];
-  if (pw || samePath(url, loginUrl)) {
+  if (pw) {
     parts.push(
       'the page still shows a login form — a SEPARATE automation window was opened for this capture; ' +
         'complete the login in THAT window (not your everyday browser), then it saves automatically',
+    );
+  } else if (samePath(url, loginUrl)) {
+    parts.push(
+      'the URL never left the login page and no new auth cookie was detected — for a single-page app whose ' +
+        'URL does not change on sign-in, pass a successSignal naming an element or text visible only after ' +
+        'login, or use attach:true',
     );
   }
   if (signal) {
@@ -1103,7 +1173,8 @@ const loginDefinition: Tool = {
     'for reuse in debugging and generated Playwright tests. Use headed:true for 2FA/SSO — this opens ' +
     'a SEPARATE automation window; the human must complete the login in THAT window (not their ' +
     'everyday browser), and it saves automatically once past the login page. successSignal is ' +
-    'OPTIONAL (headed logins auto-detect completion). ' +
+    'OPTIONAL (headed logins auto-detect completion — including a same-origin single-page app whose ' +
+    'URL never changes, e.g. iCloud, via the auth cookie it issues). ' +
     "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
     'user-scoped secrets.env, then process.env — never embedded; tokens are never echoed back. ' +
     'For a site behind a Cloudflare/Turnstile "Just a moment…" challenge that loops forever under ' +

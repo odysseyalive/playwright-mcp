@@ -63,6 +63,43 @@ function startApp() {
       res.end('<!DOCTYPE html><html><body><h1>Welcome demo</h1></body></html>');
       return;
     }
+    // Same-origin SPA login (the iCloud class): submitting does NOT navigate — the
+    // pathname stays /spa throughout — so the URL-change heuristic can never fire.
+    // On success the password form is removed and an auth-NAMED cookie is set.
+    if (req.url?.startsWith('/spa')) {
+      if (req.method === 'POST' && req.url === '/spa-login') {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          const p = new URLSearchParams(body);
+          if (p.get('username') === 'demo' && p.get('password') === 'secret') {
+            // Mimic iCloud's first-party auth cookie name (contains "token").
+            res.writeHead(200, {
+              'Set-Cookie': 'X-APPLE-WEBAUTH-TOKEN=ok; Path=/',
+              'Content-Type': 'text/plain',
+            });
+            res.end('ok');
+          } else {
+            res.writeHead(401);
+            res.end('no');
+          }
+        });
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(
+        '<!DOCTYPE html><html><body>' +
+          '<form id="f"><input name="username" type="text"><input name="password" type="password">' +
+          '<button type="submit">Login</button></form><div id="app"></div>' +
+          '<script>document.getElementById("f").addEventListener("submit",async function(e){' +
+          'e.preventDefault();var f=e.target;' +
+          'var b=new URLSearchParams(new FormData(f)).toString();' +
+          'var r=await fetch("/spa-login",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:b});' +
+          'if(r.ok){f.remove();document.getElementById("app").textContent="Signed in";}' +
+          '});</script></body></html>',
+      );
+      return;
+    }
     // /login (and default)
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(
@@ -113,6 +150,22 @@ test('session_login: auto-detects login with NO successSignal (moved past login 
   });
   assert.equal(r.ok, true, r.error ?? 'login ok without a marker');
   assert.ok(fs.existsSync(r.path), 'storageState written');
+});
+
+test('session_login: auto-detects a SAME-ORIGIN SPA login whose URL never changes', async () => {
+  // Regression for the iCloud class of app: the pathname stays /spa through sign-in,
+  // so the URL-change heuristic (waitPastLogin's movedOff) can NEVER fire. Before the
+  // fix this timed out even though login plainly succeeded. Completion must instead
+  // come from the newly issued auth-named cookie, with NO successSignal supplied.
+  const r = await sessionLogin({
+    name: 'spa',
+    loginUrl: `${base}/spa`,
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+    timeoutMs: 15_000,
+  });
+  assert.equal(r.ok, true, r.error ?? 'SPA login auto-detected via the auth-cookie signal');
+  assert.ok(fs.existsSync(r.path), 'storageState written');
+  assert.match(fs.readFileSync(r.path, 'utf8'), /X-APPLE-WEBAUTH-TOKEN/, 'the auth cookie was captured');
 });
 
 test('session_login: a VISIBLE-TEXT successSignal matches (not just a CSS selector)', async () => {
