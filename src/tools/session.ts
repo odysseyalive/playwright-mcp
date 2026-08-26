@@ -189,6 +189,28 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
     await context.storageState({ path: out });
     fs.chmodSync(out, 0o600); // secret: never world-readable
+
+    // SPA truth gate. When the login completed with NO caller marker and the URL never
+    // left the login page (the same-origin SPA path), a live-probe hit on a strong auth
+    // cookie is the ONLY completion evidence — and a transient handshake cookie can trip
+    // it and then be cleared before this write, persisting a logged-out session while the
+    // delta check above still counted "cookies gained". The durable proof is the artifact
+    // itself: it must carry a strong auth cookie for the login site, or the login had not
+    // finalized. (URL-change and marker completions never reach this branch, so no
+    // ordinary login is affected.)
+    if (!opts.successSignal?.trim() && samePath(page.url(), loginUrl)) {
+      const saved = JSON.parse(fs.readFileSync(out, 'utf8')) as StorageState;
+      if (!artifactHasSiteAuthCookie(saved, loginUrl)) {
+        fs.rmSync(out, { force: true }); // never leave a logged-out artifact behind
+        throw new Error(
+          `login did not finalize — a same-origin SPA login (URL unchanged at ${page.url()}) completed but ` +
+            `the saved session carries no durable auth cookie for ${siteDomain(loginUrl) || 'the site'}, so it ` +
+            `would read as logged out. This usually means the window closed before sign-in fully finished; ` +
+            `retry and complete every step (2FA + "trust this browser") until the app's own content is on screen.`,
+        );
+      }
+    }
+
     const hosts = [...new Set(gained.map((c) => (c.domain ?? '').replace(/^\./, '')))].filter(Boolean);
     log(`saved session "${opts.name}" → ${out} (mode 600; ${gained.length} new cookies on ${hosts.join(', ')})`);
     return {
@@ -666,27 +688,44 @@ export function gainedAuthCookie(before: Set<string>, after: Set<string>, settle
   return fallback;
 }
 
+// How long a strong auth cookie must persist CONTINUOUSLY before the driven SPA path
+// treats it as a finalized login. A multi-redirect sign-in (iCloud's) sets transient
+// auth-named cookies mid-handshake and then clears them; the durable session ticket is
+// issued only once the login truly finalizes and then stays. Requiring continuous
+// presence across this window is what tells the two apart — a flapping handshake cookie
+// resets the timer, a settled ticket clears it. Generous because the cost is a one-time
+// few-second wait on a capture a human is already sitting through.
+const AUTH_COOKIE_SETTLE_MS = 4000;
+
 /**
  * The completion probe the DRIVEN capture path (sessionLogin) uses to recognise a
  * SAME-ORIGIN SPA login — iCloud, and any app that keeps its URL constant through
  * sign-in — where waitPastLogin's pathname-change test can never fire. It reuses the
  * exact authority the attach path trusts (gainedAuthCookie over the login site's own
- * cookies), in STRONG-ONLY form (`settled` = false): an auth-NAMED ticket completes
- * on its own, while an opaque analytics/CSRF cookie never does. On the driven path
- * waitPastLogin still governs the URL-change case, so the loose opaque-cookie
- * fallback is deliberately withheld here. STRONG-only is also the real safety
- * boundary for cross-origin-iframe auth (iCloud): waitPastLogin's "password field is
- * gone" gate cannot see an iframe form, so completion there rests entirely on an
- * auth-NAMED ticket, which the IdP issues only AFTER authentication — never during it.
+ * cookies), in STRONG-ONLY form (`settled` = false): an auth-NAMED ticket completes it,
+ * while an opaque analytics/CSRF cookie never does. On the driven path waitPastLogin
+ * still governs the URL-change case, so the loose opaque-cookie fallback is deliberately
+ * withheld here. STRONG-only is also the real safety boundary for cross-origin-iframe
+ * auth (iCloud): waitPastLogin's "password field is gone" gate cannot see an iframe
+ * form, so completion there rests entirely on an auth-NAMED ticket.
  *
- * `before` is the pre-login cookie floor (context.storageState() taken after landing
- * on the login page); `cookiesNow` reads the live jar each poll. Both are filtered to
- * the login site's own domain, matching pollAttachedLogin's scoping.
+ * DURABILITY, not mere presence. A multi-redirect sign-in issues transient auth-named
+ * cookies during the handshake and clears them before the login finalizes — completing
+ * on one of those saves an unauthenticated session (measured on iCloud: the cookie that
+ * tripped the probe was gone by save time). So the probe fires only after a strong auth
+ * cookie has been present CONTINUOUSLY for AUTH_COOKIE_SETTLE_MS: a cookie that flaps or
+ * is replaced resets the clock, and only a settled ticket clears it. sessionLogin adds a
+ * second, decisive gate — the PERSISTED artifact must still carry that cookie.
+ *
+ * `before` is the pre-login cookie floor (context.storageState() taken after landing on
+ * the login page); `cookiesNow` reads the live jar each poll. Both are filtered to the
+ * login site's own domain, matching pollAttachedLogin's scoping.
  */
-function makeAuthCookieProbe(
+export function makeAuthCookieProbe(
   cookiesNow: () => Promise<Array<{ domain?: string; name?: string }>>,
   before: StorageState,
   loginUrl: string,
+  now: () => number = () => Date.now(), // injectable clock so the durability logic is unit-testable
 ): () => Promise<boolean> {
   const reg = siteDomain(loginUrl);
   const onSite = (host: string) => {
@@ -696,10 +735,35 @@ function makeAuthCookieProbe(
   const key = (c: { domain?: string; name?: string }) =>
     `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
   const base = new Set((before.cookies ?? []).filter((c) => onSite(c.domain ?? '')).map(key));
+  let trackedKey: string | null = null; // the auth cookie whose continuous presence we are timing
+  let firstSeen = 0;
   return async () => {
-    const now = (await cookiesNow()).filter((c) => onSite(c.domain ?? ''));
-    return gainedAuthCookie(base, new Set(now.map(key)), false) !== null;
+    const jar = (await cookiesNow()).filter((c) => onSite(c.domain ?? ''));
+    const names = new Set(jar.map(key));
+    const gained = gainedAuthCookie(base, names, false); // strong-named only; returns the cookie NAME
+    if (!gained) {
+      trackedKey = null; // no auth cookie present → nothing to time
+      return false;
+    }
+    const gainedKey = [...names].find((k) => k.slice(k.indexOf('|') + 1) === gained) ?? null;
+    if (gainedKey !== trackedKey) {
+      trackedKey = gainedKey; // a new/replaced auth cookie → restart the durability clock
+      firstSeen = now();
+      return false;
+    }
+    return now() - firstSeen >= AUTH_COOKIE_SETTLE_MS;
   };
+}
+
+/** Does the persisted storageState carry a strong auth cookie for `loginUrl`'s own domain? */
+function artifactHasSiteAuthCookie(state: StorageState, loginUrl: string): boolean {
+  const reg = siteDomain(loginUrl);
+  if (!reg) return false;
+  return (state.cookies ?? []).some((c) => {
+    const h = (c.domain ?? '').replace(/^\./, '').toLowerCase();
+    const onSite = h === reg || h.endsWith('.' + reg);
+    return onSite && isAuthCookieName(c.name ?? '');
+  });
 }
 
 /**

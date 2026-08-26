@@ -19,7 +19,7 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie, makeAuthCookieProbe } =
   await import('../dist/tools/session.js');
 const { getSecret } = await import('../dist/secrets.js');
 
@@ -166,6 +166,46 @@ test('session_login: auto-detects a SAME-ORIGIN SPA login whose URL never change
   assert.equal(r.ok, true, r.error ?? 'SPA login auto-detected via the auth-cookie signal');
   assert.ok(fs.existsSync(r.path), 'storageState written');
   assert.match(fs.readFileSync(r.path, 'utf8'), /X-APPLE-WEBAUTH-TOKEN/, 'the auth cookie was captured');
+});
+
+// Regression for the iCloud premature-capture failure: the sign-in handshake set an
+// auth-named cookie that tripped completion and was then cleared before the save, so an
+// unauthenticated session was written and reported ok:true. The durability probe must
+// require the auth cookie to persist CONTINUOUSLY past the settle window, and a cookie
+// that flaps (disappears and returns, as a cleared handshake cookie does) restarts the
+// clock. Driven with an injected time source so it is fully deterministic (no browser).
+test('makeAuthCookieProbe: an auth cookie completes only after CONTINUOUS presence past the settle window', async () => {
+  const SETTLE = 4000; // AUTH_COOKIE_SETTLE_MS
+  let t = 0;
+  let jar = [];
+  const probe = makeAuthCookieProbe(
+    async () => jar,
+    { cookies: [] },
+    'https://app.example.com/login',
+    () => t,
+  );
+  const auth = [{ domain: 'app.example.com', name: 'X-APPLE-WEBAUTH-TOKEN' }];
+
+  assert.equal(await probe(), false, 'no cookie yet');
+
+  jar = auth; // appears at t=0
+  assert.equal(await probe(), false, 'just appeared — not yet durable');
+  t = SETTLE - 1;
+  assert.equal(await probe(), false, 'still inside the settle window');
+  t = SETTLE;
+  assert.equal(await probe(), true, 'continuous presence past the window completes');
+
+  jar = []; // the handshake clears it
+  assert.equal(await probe(), false, 'gone → not complete, clock reset');
+  jar = auth;
+  t = SETTLE + 1; // reappears — the clock must restart, not resume
+  assert.equal(await probe(), false, 'reappeared — a fresh window has not yet elapsed');
+  t = 2 * SETTLE + 1;
+  assert.equal(await probe(), true, 'durable again after a full fresh window');
+
+  jar = [{ domain: 'app.example.com', name: '_ga' }]; // an infra cookie never qualifies
+  t = 10 * SETTLE;
+  assert.equal(await probe(), false, 'a non-auth cookie never completes');
 });
 
 test('session_login: a VISIBLE-TEXT successSignal matches (not just a CSS selector)', async () => {
