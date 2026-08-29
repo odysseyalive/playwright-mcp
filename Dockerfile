@@ -8,7 +8,7 @@
 #
 # Playwright is pinned to an alpha (see package.json), so there is no matching
 # mcr.microsoft.com/playwright tag — install Chromium + OS deps onto a Node base.
-FROM node:22-bookworm
+FROM node:26-bookworm
 
 # Shared, world-readable browser path so the non-root runtime user can read the
 # Chromium that we install here as root.
