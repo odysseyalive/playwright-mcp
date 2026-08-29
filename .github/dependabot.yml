@@ -1,0 +1,12 @@
+# Written by wf-pin-check (claude-workforce). Entries are APPEND-ONLY:
+# nothing here is ever edited or reordered by the guard.
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
