@@ -25,6 +25,7 @@ import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { sessionsDir, sessionFilePath, getSecret } from '../secrets.js';
+import { storageStateDomains } from '../exfil.js';
 import { bindSession } from '../upstream.js';
 import {
   STEALTH_LAUNCH,
@@ -1159,19 +1160,101 @@ async function loginDiagnostic(
 
 export interface StatusOptions {
   name: string;
-  probeUrl: string;
+  /** Omit for the OFFLINE artifact verdict — see `artifactStatus`. */
+  probeUrl?: string;
   loginIndicator?: string; // selector/URL substring meaning "logged out"
+}
+
+/** What the stored artifact says about itself — domains, origins, expiry. Never cookie values. */
+export interface ArtifactSummary {
+  /** Registrable domains the capture actually carries identity for. */
+  domains: string[];
+  /** Origins the capture holds localStorage for (origin only, never its entries). */
+  origins: string[];
+  cookieCount: number;
+  /** Earliest FIXED cookie expiry, ISO. `null` when no cookie has one. */
+  expiresAt: string | null;
+  /** Cookies with no fixed expiry — storageState records those as `expires: -1`. */
+  sessionCookies: number;
+  /** The earliest fixed expiry is already past. Advisory: the server may have rolled it forward. */
+  expired: boolean;
+  /** Plain-language reading of `expiresAt: null`, for a model that would otherwise guess. */
+  expiryNote?: string;
 }
 
 export interface StatusResult {
   name: string;
-  state: 'fresh' | 'stale' | 'missing' | 'unreachable';
+  state: 'fresh' | 'stale' | 'missing' | 'unreachable' | 'present';
   checkedAt: string;
+  /** Set only on the offline branch — its absence means a live probe ran. */
+  check?: 'artifact';
+  artifact?: ArtifactSummary;
+}
+
+/**
+ * Summarise a parsed storageState by ALLOWLIST — every field below is
+ * constructed explicitly, so a cookie value can never ride along in the output.
+ * Playwright records `expires` in Unix SECONDS, with -1 for a session cookie;
+ * a naive min over that returns -1 and would report a nonsense 1969 date.
+ */
+function summariseArtifact(state: unknown, now: number): ArtifactSummary {
+  const s = (state ?? {}) as StorageState;
+  const cookies = Array.isArray(s.cookies) ? s.cookies : [];
+  const fixed = cookies
+    .map((c) => (typeof c.expires === 'number' ? c.expires : -1))
+    .filter((e) => e > 0);
+  const earliest = fixed.length ? Math.min(...fixed) : null;
+  const origins = (Array.isArray(s.origins) ? s.origins : [])
+    .map((o) => o?.origin)
+    .filter((o): o is string => typeof o === 'string');
+  const summary: ArtifactSummary = {
+    domains: [...storageStateDomains(state)].sort(),
+    origins,
+    cookieCount: cookies.length,
+    expiresAt: earliest === null ? null : new Date(earliest * 1000).toISOString(),
+    sessionCookies: cookies.length - fixed.length,
+    expired: earliest !== null && earliest * 1000 <= now,
+  };
+  if (earliest === null && summary.sessionCookies > 0)
+    summary.expiryNote = 'session cookies only — no fixed expiry; they die with the capturing browser';
+  return summary;
+}
+
+/**
+ * OFFLINE artifact verdict — what the saved file itself says, with NO browser
+ * and NO network. It answers "do I already have access to this site?" so a
+ * headless agent stops proposing a headed re-login for access it already has.
+ *
+ * It reports `present`, never `fresh`: only the live probe can know the server
+ * still accepts the session. `expired` is advisory for the same reason — the
+ * keepalive write-back below means the server routinely rolls expiry forward.
+ */
+function artifactStatus(name: string, file: string, checkedAt: string): StatusResult {
+  if (!fs.existsSync(file)) return { name, state: 'missing', checkedAt, check: 'artifact' };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    // A corrupt artifact needs a recapture, exactly as the live probe reports it.
+    // Nothing from the file is echoed here — the read never produced a value.
+    return { name, state: 'stale', checkedAt, check: 'artifact' };
+  }
+  return {
+    name,
+    state: 'present',
+    checkedAt,
+    check: 'artifact',
+    artifact: summariseArtifact(parsed, Date.now()),
+  };
 }
 
 export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> {
   const file = sessionFilePath(opts.name);
   const checkedAt = new Date().toISOString();
+  // No probe URL to hit ⇒ answer from the artifact alone. Blank and whitespace
+  // count as absent: a live probe of '' can only ever report 'unreachable'.
+  const probeUrl = (opts.probeUrl ?? '').trim();
+  if (!probeUrl) return artifactStatus(opts.name, file, checkedAt);
   if (!fs.existsSync(file)) return { name: opts.name, state: 'missing', checkedAt };
 
   // A corrupt artifact needs a recapture, exactly like an expired one → stale.
@@ -1194,7 +1277,7 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
     await context.addInitScript(STEALTH_INIT);
     const page = await context.newPage();
     try {
-      await page.goto(opts.probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.goto(probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } catch {
       // The probe never completed (app down, DNS/network failure) — that says
       // nothing about the session itself. Never report it as expired.
@@ -1416,24 +1499,39 @@ async function attachHandler(args: Record<string, unknown>): Promise<CallToolRes
 const statusDefinition: Tool = {
   name: 'session_status',
   description:
-    'Check whether a saved session is still valid before reusing it; reports fresh / stale / ' +
+    'Ask what a saved session covers, before spending a login on access you may already have. ' +
+    'OMIT probeUrl for an instant OFFLINE check of the stored artifact — no browser, no network: ' +
+    'reports whether the named session exists ("present" / "missing"), which registrable domains and ' +
+    'origins it carries identity for, and the earliest cookie expiry. Use it first when you are about ' +
+    'to propose a headed session_login: if the domains already cover your target, just call ' +
+    'web_fetch({url, session}) or session_attach({name}) instead. ' +
+    'PASS probeUrl to additionally live-probe an authenticated route; that reports fresh / stale / ' +
     'missing / unreachable. "unreachable" means the probe itself failed (app down, network error) — ' +
-    'the session may still be fine, so fix reachability instead of re-logging-in.',
+    'the session may still be fine, so fix reachability instead of re-logging-in. ' +
+    'Cookie values are never returned by either mode.',
   inputSchema: {
     type: 'object',
     properties: {
       name: { type: 'string', description: 'The saved session name.' },
-      probeUrl: { type: 'string', description: 'An authenticated route to probe.' },
+      probeUrl: {
+        type: 'string',
+        description:
+          'OPTIONAL. An authenticated route to live-probe. Omit it for the offline artifact check ' +
+          '(exists / covered domains / earliest expiry) with no browser launch.',
+      },
       loginIndicator: { type: 'string', description: 'A selector/URL substring that means "logged out".' },
     },
-    required: ['name', 'probeUrl'],
+    required: ['name'],
   },
 };
 
 async function statusHandler(args: Record<string, unknown>): Promise<CallToolResult> {
+  // A blank or whitespace probeUrl is NOT a probe target — coerce it to absent
+  // here so the offline branch is chosen, not a live probe that must fail.
+  const probeUrl = typeof args.probeUrl === 'string' ? args.probeUrl.trim() : '';
   const result = await sessionStatus({
     name: String(args.name ?? ''),
-    probeUrl: String(args.probeUrl ?? ''),
+    probeUrl: probeUrl || undefined,
     loginIndicator: args.loginIndicator ? String(args.loginIndicator) : undefined,
   });
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };

@@ -561,11 +561,15 @@ test('attach (profile:system): scopeStorageState keeps ONLY the login domain —
 test('session_status: fresh for a valid saved session', async () => {
   const s = await sessionStatus({ name: 'demo', probeUrl: `${base}/app`, loginIndicator: '/login' });
   assert.equal(s.state, 'fresh');
+  // Live-path guard: a real probeUrl must NOT take the offline branch.
+  assert.equal(s.check, undefined);
+  assert.equal(s.artifact, undefined);
 });
 
 test('session_status: missing when no file exists', async () => {
   const s = await sessionStatus({ name: 'nope', probeUrl: `${base}/app` });
   assert.equal(s.state, 'missing');
+  assert.equal(s.check, undefined);
 });
 
 test('session_status: stale when the saved session has no valid cookie', async () => {
@@ -586,6 +590,133 @@ test('session_status: stale (recapture) for a corrupt storageState file', async 
   fs.writeFileSync(corruptPath, 'not json');
   const s = await sessionStatus({ name: 'corrupt', probeUrl: `${base}/app` });
   assert.equal(s.state, 'stale');
+});
+
+// ── session_status OFFLINE artifact verdict (no browser, no network) ──────────
+// The name-only call answers "do I already have access?" from the stored file
+// alone, so a headless agent stops proposing a headed login for access it has.
+
+const HOUR = 3600;
+const SOON = Math.floor(Date.now() / 1000) + HOUR; // Unix SECONDS, as storageState records it
+
+function writeArtifact(name, state) {
+  const file = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, `${name}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(state));
+  return file;
+}
+
+writeArtifact('offline-ok', {
+  cookies: [
+    { name: 'sid', value: 'TOP-SECRET-COOKIE-VALUE', domain: '.app.example.com', path: '/', expires: SOON + HOUR },
+    { name: 'csrf', value: 'ANOTHER-SECRET', domain: 'example.com', path: '/', expires: SOON },
+  ],
+  origins: [{ origin: 'https://app.example.com', localStorage: [{ name: 'tok', value: 'SECRET-LOCALSTORAGE' }] }],
+});
+
+test('session_status offline: reports present, covered domains, earliest expiry', async () => {
+  const s = await sessionStatus({ name: 'offline-ok' });
+  assert.equal(s.state, 'present'); // never 'fresh' — only a live probe can know that
+  assert.equal(s.check, 'artifact');
+  assert.deepEqual(s.artifact.domains, ['example.com']);
+  assert.deepEqual(s.artifact.origins, ['https://app.example.com']);
+  assert.equal(s.artifact.cookieCount, 2);
+  assert.equal(s.artifact.sessionCookies, 0);
+  assert.equal(s.artifact.expiresAt, new Date(SOON * 1000).toISOString()); // earliest, not latest
+  assert.equal(s.artifact.expired, false);
+});
+
+test('session_status offline: missing artifact is a clean verdict, not a throw', async () => {
+  const s = await sessionStatus({ name: 'no-such-session-anywhere' });
+  assert.equal(s.state, 'missing');
+  assert.equal(s.check, 'artifact');
+  assert.equal(s.artifact, undefined);
+});
+
+test('session_status offline: corrupt artifact reads stale (recapture), echoes nothing', async () => {
+  fs.writeFileSync(path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'offline-corrupt.json'), '{ not json');
+  const s = await sessionStatus({ name: 'offline-corrupt' });
+  assert.equal(s.state, 'stale');
+  assert.equal(s.check, 'artifact');
+  assert.ok(!JSON.stringify(s).includes('not json'));
+});
+
+test('session_status offline: coverage matches the artifact domains (sessionAllowsUrl semantics)', async () => {
+  const { sessionAllowsUrl } = await import('../dist/exfil.js');
+  const state = JSON.parse(
+    fs.readFileSync(path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'offline-ok.json'), 'utf8'),
+  );
+  const s = await sessionStatus({ name: 'offline-ok' });
+  // Covered: the artifact's own registrable domain, including a subdomain of it.
+  assert.ok(s.artifact.domains.includes('example.com'));
+  assert.equal(sessionAllowsUrl(state, 'https://app.example.com/x'), true);
+  // NOT covered: an unrelated host must be absent from the listing and refused.
+  assert.ok(!s.artifact.domains.includes('evil.test'));
+  assert.equal(sessionAllowsUrl(state, 'https://evil.test/x'), false);
+});
+
+test('session_status offline: a session cookie reports "no fixed expiry", never -1', async () => {
+  writeArtifact('offline-sessioncookie', {
+    cookies: [{ name: 'sid', value: 'V', domain: 'sessiononly.test', path: '/', expires: -1 }],
+    origins: [],
+  });
+  const s = await sessionStatus({ name: 'offline-sessioncookie' });
+  assert.equal(s.state, 'present');
+  assert.equal(s.artifact.expiresAt, null); // NOT 1969 — -1 is "dies with the browser"
+  assert.equal(s.artifact.sessionCookies, 1);
+  assert.equal(s.artifact.expired, false);
+  assert.match(s.artifact.expiryNote, /no fixed expiry/);
+  assert.ok(!JSON.stringify(s.artifact).includes('-1')); // the raw sentinel never surfaces
+});
+
+test('session_status offline: an already-past expiry is flagged advisory, not "stale"', async () => {
+  writeArtifact('offline-expired', {
+    cookies: [{ name: 'sid', value: 'V', domain: 'old.test', path: '/', expires: 1_000_000 }],
+    origins: [],
+  });
+  const s = await sessionStatus({ name: 'offline-expired' });
+  // 'stale' is the live vocabulary for "the server rejected it"; offline we only
+  // have capture-time metadata, and the keepalive rolls expiry forward server-side.
+  assert.equal(s.state, 'present');
+  assert.equal(s.artifact.expired, true);
+});
+
+test('session_status offline: no cookie or localStorage VALUE appears in the verdict', async () => {
+  const s = await sessionStatus({ name: 'offline-ok' });
+  const dumped = JSON.stringify(s);
+  assert.ok(!dumped.includes('TOP-SECRET-COOKIE-VALUE'));
+  assert.ok(!dumped.includes('ANOTHER-SECRET'));
+  assert.ok(!dumped.includes('SECRET-LOCALSTORAGE'));
+  assert.ok(!dumped.includes('"value"'));
+});
+
+test('session_status offline: does NOT write the artifact back (no keepalive path)', async () => {
+  const file = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'offline-ok.json');
+  const before = fs.readFileSync(file);
+  await sessionStatus({ name: 'offline-ok' });
+  assert.deepEqual(fs.readFileSync(file), before); // byte-identical: the live keepalive never ran
+});
+
+test('session_status handler: name-only, blank and whitespace probeUrl all go offline', async () => {
+  const { callCustomTool } = await import('../dist/tools.js');
+  for (const args of [
+    { name: 'offline-ok' },
+    { name: 'offline-ok', probeUrl: '' },
+    { name: 'offline-ok', probeUrl: '   ' },
+  ]) {
+    const res = await callCustomTool('session_status', args);
+    const verdict = JSON.parse(res.content[0].text);
+    assert.equal(verdict.check, 'artifact', `expected offline branch for ${JSON.stringify(args)}`);
+    assert.equal(verdict.state, 'present');
+  }
+});
+
+test('session_status handler: a real probeUrl still takes the live branch', async () => {
+  const { callCustomTool } = await import('../dist/tools.js');
+  const res = await callCustomTool('session_status', { name: 'demo', probeUrl: `${base}/app`, loginIndicator: '/login' });
+  const verdict = JSON.parse(res.content[0].text);
+  assert.equal(verdict.check, undefined); // no offline marker ⇒ the probe ran
+  assert.equal(verdict.state, 'fresh');
 });
 
 // ── credential precedence (project .env → secrets.env → process.env) ──────────
