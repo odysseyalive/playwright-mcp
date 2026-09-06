@@ -25,14 +25,14 @@ import {
 import { pathToFileURL } from 'node:url';
 
 import { customTools, callCustomTool, isCustomTool } from './tools.js';
-import { guardOutbound, UNTRUSTED_NOTICE } from './exfil.js';
+import { guardOutbound, UNTRUSTED_NOTICE, UNTRUSTED_IMAGE_NOTICE } from './exfil.js';
 import { secretInventory } from './secrets.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
 import { initUpstream, getUpstream, closeUpstream, boundSession } from './upstream.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -213,7 +213,7 @@ export function withSessionBanner<T extends object>(
  * than by enumeration: upstream adds tools, and a new page-reading tool must
  * default to being marked, not to being trusted.
  */
-const NO_PAGE_CONTENT = new Set(['browser_close', 'browser_resize', 'browser_take_screenshot']);
+const NO_PAGE_CONTENT = new Set(['browser_close', 'browser_resize']);
 
 /**
  * Mark upstream page content as untrusted data (ledger DEC-2026-07-29).
@@ -224,16 +224,35 @@ const NO_PAGE_CONTENT = new Set(['browser_close', 'browser_resize', 'browser_tak
  * intercept point and same shape as withSessionBanner; both may append, which
  * is the accepted cost of making invisible state visible.
  *
+ * A result carrying an IMAGE (browser_take_screenshot) is marked differently:
+ * the short UNTRUSTED_IMAGE_NOTICE, inserted BEFORE the first image block rather
+ * than appended after it. An image cannot be fenced the way text can, so the
+ * closest true analogue of wrapUntrusted's delimiting is a text block that
+ * arrives first — wrapUntrusted puts its warning in the OPENING tag for the same
+ * reason (a notice placed after the content sits away from the material it warns
+ * about). Before-only, not bracketing: an image is one atomic block, so a
+ * trailing block would add no containment, and no measurement of how a given
+ * client renders a bracketed image was available to justify the extra noise.
+ *
+ * The image branch keys on the PAYLOAD, not the tool name, so a future upstream
+ * tool that returns a rendering is covered without being enumerated here.
+ *
  * Pure, so the T1 tier exercises it without a live browser.
  */
 export function withUntrustedNotice<T extends object>(result: T, toolName: string): T {
   if (!toolName.startsWith('browser_') || NO_PAGE_CONTENT.has(toolName)) return result;
-  const notice = { type: 'text' as const, text: UNTRUSTED_NOTICE };
   const existing = (result as { content?: unknown }).content;
-  return {
-    ...result,
-    content: Array.isArray(existing) ? [...existing, notice] : [notice],
-  } as T;
+  const blocks = Array.isArray(existing) ? existing : [];
+  const imageAt = blocks.findIndex((b) => (b as { type?: unknown } | null)?.type === 'image');
+  if (imageAt >= 0) {
+    const label = { type: 'text' as const, text: UNTRUSTED_IMAGE_NOTICE };
+    return {
+      ...result,
+      content: [...blocks.slice(0, imageAt), label, ...blocks.slice(imageAt)],
+    } as T;
+  }
+  const notice = { type: 'text' as const, text: UNTRUSTED_NOTICE };
+  return { ...result, content: [...blocks, notice] } as T;
 }
 
 /**

@@ -67,7 +67,7 @@ async function connect(session: string | null, storageState?: string): Promise<B
   const server = await createConnection(upstreamConfig(storageState));
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
-  const client = new Client({ name: 'playwright-mcp-proxy', version: '0.2.0' });
+  const client = new Client({ name: 'playwright-mcp-proxy', version: '0.3.0' });
   await client.connect(clientTransport);
   return { server, client, session };
 }

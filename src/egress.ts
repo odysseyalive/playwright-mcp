@@ -127,8 +127,61 @@ export async function assertEgressAllowed(urlString: string): Promise<void> {
   }
 }
 
-/** Abort sub-resource requests to blocked hosts on a web_fetch page. */
-export async function installEgressGuard(page: Page): Promise<void> {
+export interface EgressGuardOptions {
+  /**
+   * Per-hop validator for document navigations. Defaults to the DNS-aware
+   * assertEgressAllowed. Injectable so the test tier can assert per-hop
+   * behaviour against an ordinary loopback chain, with no real private address
+   * hidden behind a redirect.
+   */
+  validate?: (url: string) => Promise<void>;
+}
+
+export interface EgressGuardHandle {
+  /**
+   * The reason a navigation hop was refused, if one was. A failed CDP request
+   * surfaces to the caller as `net::ERR_ACCESS_DENIED`, which says neither
+   * which hop nor why — fetchUrl reads this instead so the model gets the real
+   * reason rather than a chromium error code.
+   */
+  blocked(): string | null;
+}
+
+/**
+ * Guard a web_fetch page's outbound requests. Two layers, because one mechanism
+ * cannot see both kinds of traffic:
+ *
+ * 1. `page.route` aborts SUB-RESOURCE requests to blocked hosts (sync host check,
+ *    no DNS — it runs on every image and script on the page).
+ * 2. A CDP `Fetch` interception re-validates EVERY DOCUMENT request, which is
+ *    what closes the redirect gap (catalog SEC-8). Playwright's own route layer
+ *    follows 30x responses internally and never re-enters the handler — measured:
+ *    a 302 chain A/a → B/b → B/c fires `page.route` once, for A/a — so a redirect
+ *    into a private address was previously followed without re-entering any
+ *    check. CDP pauses each hop as a fresh request at the REQUEST stage, so a
+ *    refused hop is failed before its packet is sent, not reported after.
+ *
+ * The document check is DNS-aware on purpose. `isBlockedHostSync` resolves
+ * nothing, so a hop to a *hostname* pointing at a private or metadata address
+ * would pass a sync check that the same hostname fails as an initial URL — the
+ * DNS-TOCTOU asymmetry the catalog names.
+ *
+ * SCOPE, stated so it is not overread: this covers web_fetch's OWN page only.
+ * The upstream `browser_*` tools drive a page this server holds no handle to;
+ * their coverage is `network.blockedOrigins` plus, primarily, the OS-level
+ * nftables egress block (docs/REMOTE-CONNECTOR.md §6). This is defence in depth
+ * on the in-process backstop.
+ *
+ * Called only under `egressRestricted()` (see fetchUrl), so a local stdio
+ * instance never installs it and localhost dev-server debugging is untouched.
+ */
+export async function installEgressGuard(
+  page: Page,
+  opts: EgressGuardOptions = {},
+): Promise<EgressGuardHandle> {
+  const validate = opts.validate ?? assertEgressAllowed;
+  let blocked: string | null = null;
+
   await page.route('**/*', (route) => {
     let host = '';
     try {
@@ -142,4 +195,70 @@ export async function installEgressGuard(page: Page): Promise<void> {
     }
     void route.continue();
   });
+
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    cdp.on('Fetch.requestPaused', (event: unknown) => {
+      const e = event as FetchRequestPaused;
+      void handlePausedRequest(cdp, e, validate, (reason) => {
+        blocked ??= reason;
+      });
+    });
+    // Documents only: sub-resources are already covered by the route above, and
+    // pausing every image through CDP would tax each fetch for nothing.
+    await cdp.send('Fetch.enable', {
+      patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }],
+    });
+  } catch (err) {
+    // A browser that will not give up a CDP session still gets the sub-resource
+    // route above; degrade to the previous coverage rather than failing the
+    // fetch. FAIL-OPEN is deliberate — the OS-level nftables block is the
+    // primary control — but a security layer that degrades SILENTLY is
+    // indistinguishable from one that was never wired, so say so on stderr
+    // (never stdout: it carries the MCP stdio stream).
+    console.error(
+      '[playwright-mcp] egress: per-hop redirect guard unavailable, sub-resource route guard only —',
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  return { blocked: () => blocked };
+}
+
+/** The slice of CDP's Fetch.requestPaused payload this guard reads. */
+interface FetchRequestPaused {
+  requestId: string;
+  request?: { url?: string };
+  resourceType?: string;
+}
+
+/** Minimal CDP surface used above — Playwright types `send`/`on` loosely. */
+interface CdpLike {
+  send(method: string, params?: object): Promise<unknown>;
+}
+
+/**
+ * Validate one paused request and let it through, or fail it before it leaves.
+ * Only documents are validated; a paused non-document (there should be none,
+ * given the pattern) is continued rather than silently dropped.
+ */
+async function handlePausedRequest(
+  cdp: CdpLike,
+  e: FetchRequestPaused,
+  validate: (url: string) => Promise<void>,
+  onBlocked: (reason: string) => void,
+): Promise<void> {
+  const url = e.request?.url ?? '';
+  if (e.resourceType === 'Document' && url) {
+    try {
+      await validate(url);
+    } catch (err) {
+      onBlocked(err instanceof Error ? err.message : String(err));
+      await cdp
+        .send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'AccessDenied' })
+        .catch(() => {});
+      return;
+    }
+  }
+  await cdp.send('Fetch.continueRequest', { requestId: e.requestId }).catch(() => {});
 }

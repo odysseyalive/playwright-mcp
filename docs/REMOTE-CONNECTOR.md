@@ -21,15 +21,24 @@ The remote surface deliberately differs from the local one:
   `browser_evaluate` (run JS in the page). This is the "render JS + interact with
   the page" capability that motivated the connector.
 - **Denylisted remotely** (filtered from `tools/list` **and** rejected by
-  `tools/call`): `browser_run_code_unsafe`, `session_login`, `session_status`,
-  `session_scaffold_tests`, `browser_file_upload`.
+  `tools/call`), in two tiers. Five are denied on every non-stdio surface,
+  including the local no-auth option: `browser_run_code_unsafe`,
+  `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`,
+  `suite_audit`. Four more are denied on the cloud (OAuth) surface only:
+  `session_login`, `session_status`, `session_solve_challenge`,
+  `session_attach`. The cloud surface drops all nine. The no-auth surface keeps
+  the second group because none of them act autonomously. Three open a headed
+  window for the human; `session_status` only reports whether a saved session
+  exists.
 - **Authenticated** with GitHub-backed OAuth, locked to **one** GitHub login.
 - **Hardened** three ways, because the driving LLM is prompt-injectable by any
   page it visits: (1) GitHub OAuth, (2) an OS-level **egress block** to cloud
   metadata / localhost / private networks (primary SSRF control), (3) a
   **secrets-free** deployment (no `secrets.env`, no sessions dir on this host).
 
-None of these replaces the others — ship all three.
+None of these replaces the others, and none of them solves prompt injection.
+The full posture, including the non-fixes, is in the main
+[README](../README.md#untrusted-content-and-prompt-injection). Ship all three.
 
 ---
 
