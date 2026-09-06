@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 // T1 acceptance — remote (claude.ai) transport. Deterministic: no live browser,
-// no live GitHub, no network. Covers the egress SSRF backstop, the REMOTE_MODE
-// tool denylist (via createOutwardServer over an in-memory transport), and the
-// GitHub proxy-OAuth layer (metadata discovery, DCR, /authorize redirect, bearer
-// guard) by mounting the auth router on a throwaway express app. Run: node --test
+// no live GitHub, no network. Covers the egress SSRF backstop, the trust-tier
+// tool denylist (via createOutwardServer over an in-memory transport, with each
+// tier's denied set DERIVED from the running server rather than re-listed here),
+// and the GitHub proxy-OAuth layer (metadata discovery, DCR, /authorize redirect,
+// bearer guard) by mounting the auth router on a throwaway express app.
+//
+// Scope note: src/remote.ts is never constructed here. The transport wiring, the
+// stateful session map and the express mount order are NOT covered by this file;
+// what is covered is the filter (dist/index.js) and the auth router (dist/auth.js).
+// Run: node --test
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -14,14 +20,6 @@ import express from 'express';
 import { isBlockedIp, isBlockedHostSync, assertEgressAllowed, EgressBlockedError } from '../dist/egress.js';
 import { createOutwardServer, withSessionBanner } from '../dist/index.js';
 import { buildGitHubAuth } from '../dist/auth.js';
-
-const DENYLISTED = ['browser_run_code_unsafe', 'session_login', 'session_status', 'session_solve_challenge', 'session_scaffold_tests', 'browser_file_upload', 'suite_scaffold', 'suite_audit'];
-const KEEPERS = ['web_fetch', 'browser_evaluate', 'browser_navigate', 'browser_snapshot', 'browser_click'];
-// The cloud denylist splits into two tiers on the local (no-auth loopback) surface:
-// silent-power tools stay denied everywhere non-stdio; the human-gated session_*
-// handoff family is allowed on the local trusted surface (broker CAPTCHA solving).
-const ALWAYS_DENIED = ['browser_run_code_unsafe', 'browser_file_upload', 'session_scaffold_tests', 'suite_scaffold', 'suite_audit'];
-const SESSION_HANDOFF = ['session_login', 'session_status', 'session_solve_challenge', 'session_attach'];
 
 // ── egress backstop ───────────────────────────────────────────────────────────
 
@@ -45,11 +43,43 @@ test('egress: assertEgressAllowed throws for blocked, resolves for public', asyn
 });
 
 // ── REMOTE_MODE tool denylist ─────────────────────────────────────────────────
+//
+// The denied sets (ALWAYS_DENIED / CLOUD_DENIED / REMOTE_DENYLIST) live in
+// src/index.ts and are NOT exported, so this file used to keep a hand-copy of
+// them. A hand-copy is a claim about src/index.ts maintained where src/index.ts
+// cannot see it — the drift class this suite exists to catch. The tests below
+// DERIVE each tier's denied set from the running server instead:
+//
+//     denied(tier) === names(stdio) \ names(tier)
+//
+// so membership is read out of the live filter, never re-listed. The only names
+// spelled out below are (a) the universe of upstream tools handed to the filter,
+// which is not a claim about what is denied, and (b) three class representatives
+// anchoring the decisions, each carrying its reason.
+//
+// Residual, stated rather than hidden: a name silently REMOVED from the source
+// sets is caught only for the anchored representatives. Asserting full set
+// equality would need ALWAYS_DENIED / CLOUD_DENIED (or a `deniedFor(trust)`
+// helper) exported from src/index.ts, which this file does not own.
+
+/**
+ * The tool universe offered to the filter: real @playwright/mcp names only.
+ * NOT a claim about which are denied — every denial below is derived. The custom
+ * tools (web_fetch, session_*, suite_*) are injected by createOutwardServer
+ * itself, so the universe stays complete without naming them here.
+ */
+const UPSTREAM_TOOLS = [
+  'browser_run_code_unsafe',
+  'browser_evaluate',
+  'browser_file_upload',
+  'browser_navigate',
+  'browser_snapshot',
+  'browser_click',
+  'browser_close',
+];
 
 function stubUpstream() {
-  const tools = [...DENYLISTED, ...KEEPERS, 'browser_close']
-    .filter((n) => !['web_fetch', 'session_login', 'session_status', 'session_solve_challenge', 'session_scaffold_tests'].includes(n)) // these are custom, not upstream
-    .map((name) => ({ name, inputSchema: { type: 'object' } }));
+  const tools = UPSTREAM_TOOLS.map((name) => ({ name, inputSchema: { type: 'object' } }));
   return {
     listTools: async () => ({ tools }),
     callTool: async ({ name }) => ({ content: [{ type: 'text', text: `upstream:${name}` }] }),
@@ -73,44 +103,131 @@ async function connectOutward(options) {
   return client;
 }
 
-test('denylist: remote tools/list omits the dangerous tools, keeps the rest', async () => {
-  const client = await connectOutward(true);
-  const names = new Set((await client.listTools()).tools.map((t) => t.name));
-  for (const d of DENYLISTED) assert.equal(names.has(d), false, `${d} hidden on remote`);
-  for (const k of KEEPERS) assert.equal(names.has(k), true, `${k} present on remote`);
-  await client.close();
+/** Tool names a surface exposes on tools/list. */
+async function namesOn(options) {
+  const client = await connectOutward(options);
+  try {
+    return new Set((await client.listTools()).tools.map((t) => t.name));
+  } finally {
+    await client.close();
+  }
+}
+
+/**
+ * A tier's denied set, as the SERVER computes it: everything the stdio surface
+ * exposes that this tier does not. Derived on every call, so it cannot drift
+ * from src/index.ts the way a copied list can.
+ */
+async function deniedOn(options) {
+  const stdio = await namesOn(false);
+  // Guard the diff: an empty or broken stdio listing would make every "denied"
+  // assertion below pass by producing an empty universe.
+  assert.ok(stdio.size > UPSTREAM_TOOLS.length, 'stdio baseline lists the full toolset');
+  const tier = await namesOn(options);
+  return new Set([...stdio].filter((n) => !tier.has(n)));
+}
+
+/** Call one tool on a surface. */
+async function callOn(options, name) {
+  const client = await connectOutward(options);
+  try {
+    return await client.callTool({ name, arguments: {} });
+  } finally {
+    await client.close();
+  }
+}
+
+const textOf = (res) => res.content.find((c) => c.type === 'text')?.text ?? '';
+
+test('tiers: stdio is the full toolset — the baseline every denial is derived against', async () => {
+  const stdio = await namesOn(false);
+  for (const n of UPSTREAM_TOOLS) assert.equal(stdio.has(n), true, `${n} present on stdio`);
+  assert.ok(stdio.size > UPSTREAM_TOOLS.length, 'the custom tools reach the surface too');
 });
 
-test('denylist: remote tools/call rejects a denylisted tool by name (not just hidden)', async () => {
-  const client = await connectOutward(true);
-  const res = await client.callTool({ name: 'session_login', arguments: {} });
+for (const [tier, options, surface] of [
+  ['local', { trust: 'local' }, /not available on the local surface/],
+  ['cloud', { trust: 'cloud' }, /not available on the cloud surface/],
+]) {
+  test(`tiers: every tool the ${tier} surface hides is ALSO rejected by tools/call`, async () => {
+    // Hiding alone is insufficient — a client can name a hidden tool
+    // (DEC-2026-06-26). Derived, so this covers whatever the source denies today,
+    // not whatever a copied list last remembered.
+    const denied = await deniedOn(options);
+    assert.ok(denied.size > 0, `the ${tier} tier denies something at all (guards a vacuous loop)`);
+    let checked = 0;
+    for (const name of denied) {
+      const res = await callOn(options, name);
+      assert.equal(res.isError, true, `${name} rejected on ${tier} tools/call`);
+      assert.match(textOf(res), surface, `${name} rejected naming the ${tier} surface`);
+      checked += 1;
+    }
+    assert.equal(checked, denied.size, 'every derived denial was actually exercised');
+  });
+}
+
+test('tiers: the local denied set is a strict subset of the cloud one, differing only by session_*', async () => {
+  const local = await deniedOn({ trust: 'local' });
+  const cloud = await deniedOn({ trust: 'cloud' });
+  for (const n of local) assert.equal(cloud.has(n), true, `${n} denied on local is denied on cloud too`);
+  const cloudOnly = [...cloud].filter((n) => !local.has(n));
+  assert.ok(cloudOnly.length > 0, 'the two tiers actually differ (guards both sets collapsing into one)');
+  for (const n of cloudOnly) assert.match(n, /^session_/, `${n} is cloud-only because it is a human-gated handoff`);
+});
+
+test('tiers: the legacy remote:true alias resolves to exactly the cloud tier', async () => {
+  // OutwardServerOptions still accepts the boolean and existing call sites use it.
+  const legacy = await deniedOn(true);
+  const cloud = await deniedOn({ trust: 'cloud' });
+  assert.ok(cloud.size > 0, 'the cloud tier denies something at all');
+  assert.deepEqual([...legacy].sort(), [...cloud].sort());
+});
+
+// ── anchors: the decisions, one class representative each ─────────────────────
+
+test('anchor: browser_evaluate is denied on local AND cloud, on tools/list and tools/call', async () => {
+  // It injects arbitrary JS into page context with no human gate, so it sits in
+  // ALWAYS_DENIED, not CLOUD_DENIED (src/index.ts:120-127). This REVERSES
+  // DEC-2026-06-26 §4, whose "expose" clause named it; the tier split is the
+  // decision, so asserting cloud alone would also pass under CLOUD_DENIED —
+  // the option that was rejected.
+  for (const [tier, options, surface] of [
+    ['local', { trust: 'local' }, /not available on the local surface/],
+    ['cloud', { trust: 'cloud' }, /not available on the cloud surface/],
+  ]) {
+    assert.equal((await deniedOn(options)).has('browser_evaluate'), true, `browser_evaluate denied on ${tier}`);
+    const res = await callOn(options, 'browser_evaluate');
+    assert.equal(res.isError, true, `browser_evaluate rejected on ${tier} tools/call`);
+    assert.match(textOf(res), surface);
+  }
+});
+
+test('anchor: browser_evaluate is UNTOUCHED on stdio — visible and reaching upstream', async () => {
+  // The false-positive assertion: the operator's own Claude Code surface must
+  // keep the tool. Proven by a call that reaches the upstream stub, not by
+  // presence in a listing.
+  assert.equal((await namesOn(false)).has('browser_evaluate'), true, 'visible on stdio');
+  const res = await callOn(false, 'browser_evaluate');
+  assert.notEqual(res.isError, true, 'not rejected on stdio');
+  assert.equal(res.content[0].text, 'upstream:browser_evaluate', 'the call reached upstream');
+});
+
+test('anchor: browser_run_code_unsafe stays denied on local and cloud', async () => {
+  // browser_evaluate's pair: DEC-2026-07-29 treats the two as one class of
+  // arbitrary-code bypass, so a change that split them would show up here.
+  assert.equal((await deniedOn({ trust: 'local' })).has('browser_run_code_unsafe'), true, 'denied on local');
+  assert.equal((await deniedOn({ trust: 'cloud' })).has('browser_run_code_unsafe'), true, 'denied on cloud');
+});
+
+test('anchor: session_login is the tier split — exposed on local, denied on cloud', async () => {
+  // Human-gated (it opens a headed window), which is what makes it safe on the
+  // opted-in loopback surface and unsafe behind a prompt-injectable cloud client.
+  // Listing only: calling it for real would open a browser and break hermeticity.
+  assert.equal((await namesOn({ trust: 'local' })).has('session_login'), true, 'exposed on local');
+  assert.equal((await deniedOn({ trust: 'cloud' })).has('session_login'), true, 'denied on cloud');
+  const res = await callOn({ trust: 'cloud' }, 'session_login');
   assert.equal(res.isError, true);
-  assert.match(res.content.find((c) => c.type === 'text').text, /not available on the cloud surface/);
-  await client.close();
-});
-
-test('denylist: stdio (remote:false) surface keeps the full toolset', async () => {
-  const client = await connectOutward(false);
-  const names = new Set((await client.listTools()).tools.map((t) => t.name));
-  for (const d of DENYLISTED) assert.equal(names.has(d), true, `${d} present on stdio`);
-  await client.close();
-});
-
-test('local tier: hides ALWAYS_DENIED but keeps the human-gated session_* handoff', async () => {
-  const client = await connectOutward({ trust: 'local' });
-  const names = new Set((await client.listTools()).tools.map((t) => t.name));
-  for (const d of ALWAYS_DENIED) assert.equal(names.has(d), false, `${d} hidden on local`);
-  for (const s of SESSION_HANDOFF) assert.equal(names.has(s), true, `${s} present on local (broker CAPTCHA handoff)`);
-  for (const k of KEEPERS) assert.equal(names.has(k), true, `${k} present on local`);
-  await client.close();
-});
-
-test('local tier: tools/call still rejects an ALWAYS_DENIED tool by name', async () => {
-  const client = await connectOutward({ trust: 'local' });
-  const res = await client.callTool({ name: 'browser_run_code_unsafe', arguments: {} });
-  assert.equal(res.isError, true);
-  assert.match(res.content.find((c) => c.type === 'text').text, /not available on the local surface/);
-  await client.close();
+  assert.match(textOf(res), /not available on the cloud surface/);
 });
 
 // ── GitHub proxy-OAuth layer ──────────────────────────────────────────────────

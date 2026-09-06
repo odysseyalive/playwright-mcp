@@ -1,0 +1,37 @@
+{
+  "config": { "rootDir": "/tmp/fake-project" },
+  "suites": [
+    {
+      "title": "smoke.spec.ts",
+      "file": "smoke.spec.ts",
+      "specs": [
+        {
+          "title": "home renders",
+          "file": "smoke.spec.ts",
+          "line": 5,
+          "column": 3,
+          "tests": [
+            {
+              "projectName": "chromium",
+              "status": "expected",
+              "results": [{ "status": "passed", "duration": 120, "attachments": [] }]
+            }
+          ]
+        },
+        {
+          "title": "login gate passes",
+          "file": "smoke.spec.ts",
+          "line": 19,
+          "column": 3,
+          "tests": [
+            {
+              "projectName": "chromium",
+              "status": "expected",
+              "results": [{ "status": "passed", "duration": 340, "attachments": [] }]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

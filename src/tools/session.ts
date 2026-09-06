@@ -25,7 +25,7 @@ import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { sessionsDir, sessionFilePath, getSecret } from '../secrets.js';
-import { storageStateDomains } from '../exfil.js';
+import { storageStateDomains, wrapUntrusted } from '../exfil.js';
 import { bindSession } from '../upstream.js';
 import {
   STEALTH_LAUNCH,
@@ -82,7 +82,23 @@ export interface LoginResult {
   capturedAt: string;
   mode: 'headless' | 'headed' | 'attach' | 'challenge';
   ok: boolean;
+  /**
+   * Server-authored, and only that. A capture failure is diagnosed in this
+   * server's own words — including advice the model is meant to ACT on ("pass a
+   * successSignal", "complete the login in THAT window"), which is why it must
+   * not be marked as untrusted data. Anything the page had a hand in goes in
+   * `capturedDetail` instead.
+   */
   error?: string;
+  /**
+   * The CAPTURED half of a failure diagnosis: the final URL after redirects and
+   * the page's own `<title>`. Both are attacker-choosable on a hostile or
+   * hijacked login page, so `bindAndReport` fences this with `wrapUntrusted`
+   * rather than letting it ride inside `error`'s sentence.
+   */
+  capturedDetail?: string;
+  /** Where `capturedDetail` was read from — the fence's `source=` attribute. */
+  capturedSource?: string;
   // Challenge captures are SHORT-LIVED in a way logins are not — a cf_clearance
   // measures in minutes, and it expires without ever redirecting to a login page,
   // so session_status's login-shaped staleness check cannot see it die. Report the
@@ -96,6 +112,32 @@ export interface LoginResult {
   // check that the auth domain is present instead of trusting `ok` alone.
   cookiesGained?: number;
   authHosts?: string[];
+}
+
+/**
+ * A failure whose message is server prose and whose `captured` half is text a
+ * PAGE controlled — a final URL after redirects, a `<title>`.
+ *
+ * The two provenances travel as two values all the way to the MCP boundary
+ * instead of being interpolated into one sentence at the throw site. A throw is
+ * the reason this exists: `error: err.message` flattens everything a capture
+ * knew into a single string, and once flattened the boundary cannot tell which
+ * half a page wrote.
+ *
+ * Interpolating instead is not merely untidy, it is FORGEABLE: the previous
+ * form wrapped the title in curly quotes (`(“${title}”)`) and a page can put
+ * curly quotes in its own title. `wrapUntrusted` defangs its own delimiter;
+ * a punctuation convention defangs nothing.
+ */
+class CapturedTextError extends Error {
+  constructor(
+    message: string,
+    readonly captured: string,
+    readonly source: string,
+  ) {
+    super(message);
+    this.name = 'CapturedTextError';
+  }
 }
 
 /**
@@ -179,11 +221,15 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     const after = (await context.storageState()) as StorageState;
     const gained = newCookies(before, after);
     if (!gained.length) {
-      throw new Error(
-        `no session was captured — the browser gained no new cookies, so the login did not complete ` +
-          `(final URL: ${page.url()}). Nothing was saved. ` +
+      // The final URL is reported, not interpolated: after redirects it is the
+      // page's choice, so it travels as the captured half (see CapturedTextError).
+      throw new CapturedTextError(
+        `no session was captured — the browser gained no new cookies, so the login did not complete. ` +
+          `Nothing was saved. The final URL is quarantined below. ` +
           `If the site uses a multi-step login (email first, password/2FA after), pass a successSignal ` +
           `naming something only visible AFTER login — e.g. a post-login URL fragment or on-page text.`,
+        `final URL: ${page.url()}`,
+        page.url(),
       );
     }
 
@@ -203,11 +249,17 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       const saved = JSON.parse(fs.readFileSync(out, 'utf8')) as StorageState;
       if (!artifactHasSiteAuthCookie(saved, loginUrl)) {
         fs.rmSync(out, { force: true }); // never leave a logged-out artifact behind
-        throw new Error(
-          `login did not finalize — a same-origin SPA login (URL unchanged at ${page.url()}) completed but ` +
-            `the saved session carries no durable auth cookie for ${siteDomain(loginUrl) || 'the site'}, so it ` +
-            `would read as logged out. This usually means the window closed before sign-in fully finished; ` +
-            `retry and complete every step (2FA + "trust this browser") until the app's own content is on screen.`,
+        // `loginUrl` here is the LANDED url (page.url() after the goto), so both
+        // it and the domain derived from it are page-influenced — they are
+        // reported below the sentence rather than inside it.
+        throw new CapturedTextError(
+          `login did not finalize — a same-origin SPA login (the URL never changed) completed but ` +
+            `the saved session carries no durable auth cookie for the login site, so it would read as ` +
+            `logged out. The URL and the site it was checked against are quarantined below. This usually ` +
+            `means the window closed before sign-in fully finished; retry and complete every step ` +
+            `(2FA + "trust this browser") until the app's own content is on screen.`,
+          `final URL: ${page.url()}\nauth cookie looked for on: ${siteDomain(loginUrl) || 'the site'}`,
+          page.url(),
         );
       }
     }
@@ -224,6 +276,13 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       authHosts: hosts,
     };
   } catch (err) {
+    // A CapturedTextError kept its two halves apart on the way here; every other
+    // failure on this path is server-authored (missing credentials, a bad
+    // selector, a filesystem error) and carries no captured half at all.
+    // sessionAttach has no equivalent branch on purpose: none of its throws read
+    // anything from a page — they name a local profile dir or the caller's own
+    // loginUrl.
+    const captured = err instanceof CapturedTextError ? err : undefined;
     return {
       name: opts.name,
       path: out,
@@ -231,6 +290,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       mode,
       ok: false,
       error: err instanceof Error ? err.message : String(err),
+      ...(captured ? { capturedDetail: captured.captured, capturedSource: captured.source } : {}),
     };
   } finally {
     await browser?.close().catch(() => {});
@@ -1102,17 +1162,27 @@ async function waitForLogin(
   try {
     await Promise.any(arms);
   } catch {
-    throw new Error(await loginDiagnostic(page, loginUrl, sig, timeout));
+    throw await loginDiagnostic(page, loginUrl, sig, timeout);
   }
 }
 
-/** Build an actionable timeout message instead of "All promises were rejected". */
+/**
+ * Build an actionable timeout message instead of "All promises were rejected".
+ *
+ * Returns the error rather than a string, because the diagnosis has two
+ * provenances and a string can only carry one. The advice — "complete the login
+ * in THAT window", "pass a successSignal" — is this server's, and is meant to be
+ * ACTED on; the final URL and the page's `<title>` are the page's, and the title
+ * in particular is free-form attacker text on a hostile login page. The second
+ * kind is carried in `captured` and fenced at the MCP boundary; it is never
+ * spliced into the first.
+ */
 async function loginDiagnostic(
   page: PwPage,
   loginUrl: string,
   signal: string | undefined,
   timeoutMs: number,
-): Promise<string> {
+): Promise<CapturedTextError> {
   let url = '';
   let title = '';
   let pw = false;
@@ -1131,10 +1201,16 @@ async function loginDiagnostic(
   } catch {
     /* ignore */
   }
+  // The old form was `final URL: ${url} (“${title}”)` inside this list — one
+  // string, two authors, with the title's boundary marked by curly quotes a page
+  // can simply type into its own <title>. What is observed goes below; what is
+  // advised stays here.
   const parts = [
     `login capture timed out after ${Math.round(timeoutMs / 1000)}s`,
-    `final URL: ${url || 'unknown'}${title ? ` (“${title}”)` : ''}`,
+    'the final URL and page title observed at that moment are quarantined below',
   ];
+  const observed = [`final URL: ${url || 'unknown'}`];
+  if (title) observed.push(`page title: ${title}`);
   if (pw) {
     parts.push(
       'the page still shows a login form — a SEPARATE automation window was opened for this capture; ' +
@@ -1153,7 +1229,7 @@ async function loginDiagnostic(
         'changed-URL substring — verify it against the post-login page, or omit it in headed mode to auto-detect',
     );
   }
-  return parts.join('; ') + '.';
+  return new CapturedTextError(parts.join('; ') + '.', observed.join('\n'), url);
 }
 
 // ── session_status ────────────────────────────────────────────────────────────
@@ -1429,6 +1505,13 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
  * A bind failure never masquerades as a capture failure: the artifact is on disk
  * either way, so `ok` still reflects the capture and the bind problem is
  * reported alongside it.
+ *
+ * It is also the provenance boundary, the same way frameFetchResult is for
+ * web_fetch: the JSON envelope is what this server wrote, and a `capturedDetail`
+ * is pulled OUT of it and emitted as a fenced block after it. Pulled out, not
+ * copied — leaving it in the envelope would ship the page's text unmarked and
+ * fenced, which is worse than either alone. On the success path there is no
+ * detail and the result is a single JSON document exactly as before.
  */
 async function bindAndReport(result: LoginResult): Promise<CallToolResult> {
   let boundTo: string | undefined;
@@ -1441,8 +1524,17 @@ async function bindAndReport(result: LoginResult): Promise<CallToolResult> {
       bindError = err instanceof Error ? err.message : String(err);
     }
   }
+  const { capturedDetail, capturedSource, ...envelope } = result;
+  const text = JSON.stringify({ ...envelope, boundTo, bindError }, null, 2);
   return {
-    content: [{ type: 'text', text: JSON.stringify({ ...result, boundTo, bindError }, null, 2) }],
+    content: [
+      {
+        type: 'text',
+        text: capturedDetail
+          ? `${text}\n${wrapUntrusted(capturedDetail, capturedSource ?? '')}`
+          : text,
+      },
+    ],
     isError: !result.ok,
   };
 }

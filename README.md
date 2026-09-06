@@ -4,7 +4,7 @@ One install, every Claude Code project gets a real browser. Page fetching with c
 
 ## What it is
 
-An MCP server that wraps `@playwright/mcp` and adds four tools of its own. The installer denies Claude's built-in WebFetch and the claude-in-chrome extension, so `web_fetch` becomes the only page-fetching path Claude has. The extra features just come along for free.
+An MCP server that wraps `@playwright/mcp` and adds nine tools of its own for page fetching, authenticated sessions, and test suites. The installer denies Claude's built-in WebFetch and the claude-in-chrome extension, so `web_fetch` becomes the only page-fetching path Claude has. The extra features just come along for free.
 
 ### How it layers in
 
@@ -18,11 +18,12 @@ This server has nothing to do with web search. Claude runs its own native WebSea
 
 ### The tools
 
-Twenty-seven total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The four custom ones:
+Thirty-two total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The nine custom ones:
 
 - **`web_fetch`** stealth-renders a URL (HTML or PDF), returns readable text plus the citation and health data described above.
-- **`session_login`** and **`session_status`** handle authenticated debugging across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. Headed mode handles 2FA and SSO when you need it.
+- **`session_login`**, **`session_status`**, **`session_solve_challenge`**, and **`session_attach`** handle authenticated sessions across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. `session_solve_challenge` clears CAPTCHAs and bot walls the same way. `session_attach` binds a captured session to the `browser_*` tools so interactive browsing is authenticated too. Headed mode handles 2FA and SSO when you need it.
 - **`session_scaffold_tests`** generates a deterministic Playwright E2E test suite into any project, wired to reuse a session captured by `session_login`. No model in the loop. Just `npx playwright test`.
+- **`suite_scaffold`**, **`suite_audit`**, and **`suite_methodology`** carry a full e2e test-suite methodology. Scaffold the complete pack into any project, audit results with per-failure dossiers, or pull the playbook on demand. More in the Test-suite builder section below.
 
 ## Requirements
 
@@ -148,7 +149,7 @@ Escape hatches are environment variables (`PLAYWRIGHT_MCP_FETCH_LIMIT`, `PLAYWRI
 
 On the remote surface (`PLAYWRIGHT_MCP_PUBLIC_URL` set), `assertEgressAllowed` blocks targets that resolve to private or metadata addresses. Per-hop redirect re-validation catches redirect chains that land on a private address after the initial URL passed. That re-validation covers `web_fetch`'s own page only. Upstream `browser_*` redirect hops are not reachable from the proxy, because upstream owns that page and this server holds no Playwright Page handle for it. The OS-level nftables egress block ([docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md) section 6) is the primary SSRF control. The in-process checks are the backstop.
 
-Tools are stripped by tier. `browser_run_code_unsafe`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, and `suite_audit` are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`.
+Tools are stripped by tier. `browser_run_code_unsafe`, `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, and `suite_audit` are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`. The operator's own stdio surface (Claude Code) keeps every tool. These denylists only apply to the HTTP transport.
 
 ### What this does not fix
 

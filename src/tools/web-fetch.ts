@@ -58,7 +58,20 @@ export interface FetchResult {
   appraisalRequested?: boolean;
   /** Set when the body is not article prose (e.g. a rescued link index). */
   note?: string;
+  /**
+   * Server-authored, and only that. `error` is emitted OUTSIDE the quarantine
+   * because the envelope is this server talking to the model, so nothing a page
+   * influenced may be interpolated into it — put that in `errorDetail`.
+   */
   error?: string;
+  /**
+   * The CAPTURED half of a failure: a raw caught-exception message, which for a
+   * Playwright error carries the URL the page chose via redirect and whatever
+   * text the browser echoed back. Page-influenced, so it rides INSIDE the
+   * quarantine (see frameFetchResult) while `error` stays a server sentence.
+   * Truncated by `briefly` before it ever gets here.
+   */
+  errorDetail?: string;
 }
 
 export interface FetchOptions {
@@ -105,7 +118,14 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     try {
       await assertEgressAllowed(url);
     } catch (err) {
-      return errorResult(url, 'blocked', briefly(err), opts.links);
+      return errorResult(
+        url,
+        'blocked',
+        'refused by the egress guard: the reason is quarantined below as `errorDetail` — ' +
+          'it is a caught error message, not this server speaking',
+        opts.links,
+        briefly(err),
+      );
     }
   }
 
@@ -191,7 +211,16 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     }
   } catch (err) {
     await cleanup?.();
-    return errorResult(url, 'blocked', `browser unavailable: ${briefly(err)}`, opts.links);
+    // Two values, not one sentence. The launch failure's own text is a caught
+    // exception — see errorResult, and `errorDetail` in FetchResult.
+    return errorResult(
+      url,
+      'blocked',
+      'browser unavailable: the render browser would not start; the failure text is quarantined ' +
+        'below as `errorDetail`',
+      opts.links,
+      briefly(err),
+    );
   }
   try {
     await pace();
@@ -272,9 +301,20 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     return result;
   } catch (err) {
     // A refused redirect hop reaches here as a bare chromium error code, so the
-    // guard's own reason wins when it has one.
+    // guard's own reason wins when it has one. Two branches, and they differ in
+    // PROVENANCE, not only in wording: the guard's reason is server-authored and
+    // belongs in the envelope; anything else is a caught error from a navigation
+    // the page steered, so it is quarantined instead.
     const refusedHop = egressGuard?.blocked();
-    return errorResult(url, 'blocked', refusedHop ?? briefly(err), opts.links);
+    return refusedHop
+      ? errorResult(url, 'blocked', refusedHop, opts.links)
+      : errorResult(
+          url,
+          'blocked',
+          'the page could not be fetched: the browser error is quarantined below as `errorDetail`',
+          opts.links,
+          briefly(err),
+        );
   } finally {
     await cleanup?.();
   }
@@ -286,7 +326,20 @@ function briefly(err: unknown, max = 400): string {
   return msg.length > max ? `${msg.slice(0, max)}…` : msg;
 }
 
-function errorResult(url: string, status: FetchStatus, error: string, links?: boolean): FetchResult {
+/**
+ * Two provenances, two arguments — never one interpolated sentence.
+ *
+ * `error` is the server's own words and lands in the envelope; `detail` is text
+ * a page influenced (a caught browser error) and lands inside the quarantine.
+ * `briefly()` it first: the field is bounded, not the fence.
+ */
+function errorResult(
+  url: string,
+  status: FetchStatus,
+  error: string,
+  links?: boolean,
+  detail?: string,
+): FetchResult {
   const r: FetchResult = {
     url,
     fetchStatus: status,
@@ -296,6 +349,7 @@ function errorResult(url: string, status: FetchStatus, error: string, links?: bo
     citation: { type: 'webpage', title: url, author: [], URL: url, dateConfidence: 'low' },
     error,
   };
+  if (detail) r.errorDetail = detail;
   if (links) {
     r.links = [];
     r.references = [];
@@ -366,6 +420,17 @@ const definition: Tool = {
  * instructions" would tell the model to ignore its own tool's guidance — a
  * false positive that costs real functionality.
  *
+ * `errorDetail` is the correction that made that claim TRUE. `error` used to be
+ * built as `browser unavailable: ${briefly(err)}` — one string with two
+ * provenances, the second of which is a raw caught exception whose Playwright
+ * text embeds the URL a page chose by redirecting. The envelope was exempted on
+ * the reasoning that it is "the server talking to the model", which was a claim
+ * about what the field is FOR rather than about what went INTO it. Splitting the
+ * two halves does not merely avoid mixing them: it makes the partition's premise
+ * true. The captured half moves INSIDE, as a field of the quarantined body —
+ * not as a second fenced block — so the "fenced exactly once" invariant holds
+ * for every result rather than only for results without a detail.
+ *
  * Framed unconditionally, including on the error path. The alternative — skip
  * the wrap when the body is empty — leaks `citation.title` (read from a hostile
  * `<title>`) whenever a page returns markup but no prose, and teaches the model
@@ -380,12 +445,15 @@ const definition: Tool = {
  * Pure — no browser, no network — so the T1 tier exercises it directly.
  */
 export function frameFetchResult(result: FetchResult): string {
-  const { text, citation, cms, links, references, ...envelope } = result;
+  const { text, citation, cms, links, references, errorDetail, ...envelope } = result;
   const pageDerived: Record<string, unknown> = { cms, text, citation };
   // links/references are absent unless links:true was asked for; keep them that
   // way rather than inventing empty arrays the caller did not request.
   if (links) pageDerived.links = links;
   if (references) pageDerived.references = references;
+  // Same rule, same reason: absent on the success path, so a result that has no
+  // captured failure text does not grow an empty field announcing one.
+  if (errorDetail !== undefined) pageDerived.errorDetail = errorDetail;
   return (
     `${JSON.stringify(envelope, null, 2)}\n` +
     wrapUntrusted(JSON.stringify(pageDerived, null, 2), result.url)

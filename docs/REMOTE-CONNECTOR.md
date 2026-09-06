@@ -17,19 +17,29 @@ host you intend to serve from (jstack/Debian assumed).
 
 The remote surface deliberately differs from the local one:
 
-- **Exposed remotely:** `web_fetch` + the full interactive browser tools +
-  `browser_evaluate` (run JS in the page). This is the "render JS + interact with
-  the page" capability that motivated the connector.
+- **Exposed remotely:** `web_fetch` + the browser tools not denylisted below
+  (`browser_navigate`, `browser_click`, `browser_type`, `browser_snapshot`,
+  `browser_take_screenshot`, and the rest). An earlier version of this runbook
+  included `browser_evaluate` here and described it as "the 'render JS +
+  interact with the page' capability that motivated the connector." That
+  conflated three things. Rendering JS-heavy pages is what headless Chromium
+  does unaided. It is why the connector runs Playwright at all, and `web_fetch`
+  stealth-renders without `browser_evaluate`. Interaction is `browser_click`,
+  `browser_type`, `browser_fill_form`, `browser_select_option`,
+  `browser_press_key`, `browser_snapshot`, all still exposed.
+  `browser_evaluate` injects script into page context. It does neither, and the
+  connector keeps its stated purpose without it.
 - **Denylisted remotely** (filtered from `tools/list` **and** rejected by
-  `tools/call`), in two tiers. Five are denied on every non-stdio surface,
+  `tools/call`), in two tiers. Six are denied on every non-stdio surface,
   including the local no-auth option: `browser_run_code_unsafe`,
-  `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`,
-  `suite_audit`. Four more are denied on the cloud (OAuth) surface only:
-  `session_login`, `session_status`, `session_solve_challenge`,
-  `session_attach`. The cloud surface drops all nine. The no-auth surface keeps
+  `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`,
+  `suite_scaffold`, `suite_audit`. Four more are denied on the cloud (OAuth)
+  surface only: `session_login`, `session_status`, `session_solve_challenge`,
+  `session_attach`. The cloud surface drops all ten. The no-auth surface keeps
   the second group because none of them act autonomously. Three open a headed
   window for the human; `session_status` only reports whether a saved session
-  exists.
+  exists. None of this touches the local stdio surface. Claude Code on your own
+  machine still has every tool, `browser_evaluate` included.
 - **Authenticated** with GitHub-backed OAuth, locked to **one** GitHub login.
 - **Hardened** three ways, because the driving LLM is prompt-injectable by any
   page it visits: (1) GitHub OAuth, (2) an OS-level **egress block** to cloud

@@ -24,6 +24,7 @@ import path from 'node:path';
 
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
+import { wrapUntrusted } from '../exfil.js';
 import { scaffold, SUITE_TEMPLATE_DIR } from '../scaffold.js';
 
 const SKILL_REFS = path.join(SUITE_TEMPLATE_DIR, '.claude', 'skills', 'test-suite');
@@ -276,7 +277,15 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
       );
       const { stderrTail } = await runPlaywright(cwd, specs, reportFile, timeoutMs);
       if (!fs.existsSync(reportFile)) {
-        throw new Error(`playwright produced no JSON report. stderr tail:\n${stderrTail}`);
+        // Two provenances, two parts. The sentence is this server's; the tail is
+        // a subprocess's stderr, which carries whatever a spec printed — page
+        // text included — so it rides in a fence. Already truncated at the
+        // resolve above: truncate first, wrap second, so no slice can cut a
+        // delimiter in half.
+        throw new Error(
+          'playwright produced no JSON report. The stderr tail is quarantined below.\n' +
+            wrapUntrusted(stderrTail, `playwright stderr (cwd ${cwd})`),
+        );
       }
       reportRaw = fs.readFileSync(reportFile, 'utf8');
       ranNote = `Ran: npx playwright test ${specs.join(' ')} (cwd ${cwd})`;
@@ -305,7 +314,19 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
           `location:    ${f.location}\n` +
           `status:      ${f.status} (retries: ${f.retries}, ${Math.round(f.durationMs)}ms)\n` +
           `attachments: ${f.attachments.map((a) => `${a.name} → ${a.path}`).join('; ') || '(none)'}\n` +
-          `error:\n${f.error}`,
+          // The dossier headers above are this server's own words. `f.error` is
+          // a Playwright failure message: page content, DOM fragments and
+          // selectors that the site under test chose. It is quarantined because
+          // ADJUDICATION_RUBRIC follows immediately below — server-authored
+          // instructions telling the model to take action on what it just read.
+          // Unfenced page text directly in front of those is the shape a
+          // crafted failure message would exploit.
+          //
+          // Wrapped HERE and not at the `error:` assignment in parseReport: the
+          // stripAnsi().slice() there must stay the outermost operation, so a
+          // truncation can never cut a delimiter in half.
+          `error:\n` +
+          wrapUntrusted(f.error, `playwright failure: ${f.location}`),
       )
       .join('\n\n');
 

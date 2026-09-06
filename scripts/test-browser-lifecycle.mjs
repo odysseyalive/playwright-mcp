@@ -20,9 +20,19 @@ import { fetchUrl } from '../dist/tools/web-fetch.js';
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `pwmcp-${name}-`));
 
-/** Point profileDir() at a path that cannot be created, so launch fails fast. */
-function breakProfile() {
-  const file = path.join(tmp('broken'), 'not-a-dir');
+/**
+ * Point profileDir() at a path that cannot be created, so launch fails fast.
+ *
+ * `depth` pads the path with long directory segments so the launch failure is
+ * longer than briefly()'s 400-char cap. Without that padding the raw message is
+ * ~130 chars and the truncation assertion below passes whether or not anything
+ * truncates — green while observing nothing.
+ */
+function breakProfile(depth = 0) {
+  let dir = tmp('broken');
+  for (let i = 0; i < depth; i++) dir = path.join(dir, `${'p'.repeat(200)}${i}`);
+  if (depth) fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'not-a-dir');
   fs.writeFileSync(file, '');
   process.env.XDG_CACHE_HOME = file;
   return file;
@@ -67,12 +77,19 @@ test('a failed launch is not memoized — the next call tries again', async () =
 });
 
 test('fetchUrl never throws when the browser cannot start', async () => {
-  breakProfile();
+  breakProfile(3); // a launch failure long enough for the truncation to matter
   const result = await fetchUrl({ url: 'https://never-reached.test/article' });
   assert.equal(result.fetchStatus, 'blocked');
+  // The server's own sentence — this half does not move, so the pin stays.
   assert.match(result.error ?? '', /^browser unavailable: /);
   assert.equal(result.text, '');
-  assert.ok((result.error ?? '').length < 500, 'the browser log tail is truncated');
+
+  // The caught launch failure is the CAPTURED half: it echoes back whatever the
+  // browser said, so it rides in `errorDetail` (quarantined by frameFetchResult)
+  // and not in the server-authored `error`. Assert against the field that
+  // actually carries it — against `error` this checks nothing at all.
+  assert.ok(result.errorDetail, 'the launch failure is carried as errorDetail');
+  assert.ok(result.errorDetail.length < 500, 'the browser log tail is truncated');
 });
 
 // ── real-chrome recovery (opt-in) ────────────────────────────────────────────

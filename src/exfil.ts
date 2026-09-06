@@ -158,6 +158,23 @@ export const UNTRUSTED_IMAGE_NOTICE =
  * about, which is where injection actually starts. Any closing delimiter in the
  * body is defanged so a page cannot break out of its own quarantine by
  * embedding one.
+ *
+ * Also the one place captured text should be marked, and the reason a message
+ * ever comes back in two parts (a server sentence, then a fence) instead of one
+ * fluent sentence: a page's text must never be interpolated into prose the model
+ * is meant to act on. See frameFetchResult (web-fetch.ts) and bindAndReport
+ * (tools/session.ts) for the two boundaries that do it.
+ *
+ * KNOWN LIMIT, and it is structural rather than an oversight. Nothing makes a
+ * capture site come through here. A developer who writes
+ * `throw new Error(\`at ${await page.title()}\`)` gets a mixed string and no
+ * warning from the compiler, the tests, or this comment. A test can enumerate
+ * the known capture verbs (page.title, page.url, page.content, a caught
+ * Playwright error) and catch the ones it lists; it cannot prove the list is
+ * complete, because the list is of things someone thought to look for. Treat a
+ * green suite as evidence about the enumerated sites and nothing wider — and
+ * when you add a site that reads from a page, add it here rather than trusting
+ * the enumeration to grow by itself.
  */
 export function wrapUntrusted(text: string, url: string): string {
   const safeUrl = url.replace(/["<>]/g, '');
