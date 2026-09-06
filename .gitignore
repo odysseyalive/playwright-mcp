@@ -5,6 +5,7 @@
 
 # Build scaffolding — meta-tooling used to BUILD the package, not the shipped package
 /.claude/
+/.claude-backups/
 CLAUDE.md
 
 # Dependencies & build output
