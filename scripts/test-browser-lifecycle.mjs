@@ -16,9 +16,36 @@ import path from 'node:path';
 
 import { getStealthContext, closeBrowser, isStaleLock } from '../dist/browser.js';
 import { fetchUrl } from '../dist/tools/web-fetch.js';
+import { upstreamConfig } from '../dist/upstream.js';
+import { STEALTH_ARGS, STEALTH_INIT, STEALTH_UA } from '../dist/stealth.js';
 
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `pwmcp-${name}-`));
+
+// The browser_* browser must wear the same disguise as web_fetch. Without it a
+// session captured by attach mode replayed as `HeadlessChrome` with
+// navigator.webdriver=true, and dash.cloudflare.com re-challenged it at once
+// (2026-09-14). Checked both bound and unbound, since both launch the same browser.
+test('upstreamConfig: browser_* launches with the shared stealth disguise, bound or not', () => {
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = tmp('cache');
+  try {
+    for (const storageState of [undefined, '/nonexistent/session.json']) {
+      const b = upstreamConfig(storageState).browser;
+      for (const arg of STEALTH_ARGS) assert.ok(b.launchOptions.args?.includes(arg), `launch arg ${arg}`);
+      assert.equal(b.contextOptions?.userAgent, STEALTH_UA, 'real-Chrome UA, not HeadlessChrome');
+      assert.equal(b.initScript?.length, 1, 'one init script');
+      assert.equal(fs.readFileSync(b.initScript[0], 'utf8'), STEALTH_INIT, 'init script file holds STEALTH_INIT');
+      if (storageState) {
+        assert.equal(b.contextOptions.storageState, storageState, 'bound session still seeds the context');
+        assert.equal(b.isolated, true);
+      }
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+  }
+});
 
 /**
  * Point profileDir() at a path that cannot be created, so launch fails fast.

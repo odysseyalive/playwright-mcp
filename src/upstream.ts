@@ -29,8 +29,11 @@ import { createConnection } from '@playwright/mcp';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { loadSecrets, sessionFilePath } from './secrets.js';
+import { STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
 import { egressRestricted, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
@@ -46,15 +49,41 @@ interface Bound {
 
 let current: Bound | undefined;
 
-/** Build the @playwright/mcp config, optionally seeded with a captured session. */
-function upstreamConfig(storageState?: string) {
+/**
+ * @playwright/mcp takes init scripts as FILE PATHS, not source, so the shared
+ * STEALTH_INIT is written once to the cache root beside web_fetch's profiles.
+ * Rewritten on every launch so it can never lag the source string.
+ */
+function stealthInitFile(): string {
+  const base = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache');
+  const file = path.join(base, 'playwright-mcp', 'stealth-init.js');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, STEALTH_INIT);
+  return file;
+}
+
+/**
+ * Build the @playwright/mcp config, optionally seeded with a captured session.
+ *
+ * The browser_* browser wears the same disguise as web_fetch and the capture
+ * contexts (stealth.ts). Without it, a session captured by attach mode was replayed
+ * by a headless browser announcing `HeadlessChrome` with navigator.webdriver=true, so
+ * a Cloudflare-fronted site (dash.cloudflare.com, 2026-09-14) re-challenged it
+ * immediately: the clearance was earned by a different-looking client. Headless +
+ * CDP remains detectable by a determined wall; this removes the obvious mismatch.
+ */
+export function upstreamConfig(storageState?: string) {
   return {
     browser: {
       browserName: 'chromium' as const,
-      launchOptions: { headless: true, channel: 'chrome' },
-      // Only when a session is bound: the artifact is the source of truth, so
-      // run without a persistent profile that could disagree with it.
-      ...(storageState ? { isolated: true, contextOptions: { storageState } } : {}),
+      launchOptions: { headless: true, channel: 'chrome', args: STEALTH_ARGS },
+      initScript: [stealthInitFile()],
+      // Isolated only when a session is bound: the artifact is the source of truth,
+      // so run without a persistent profile that could disagree with it. The
+      // disguise applies either way.
+      ...(storageState
+        ? { isolated: true, contextOptions: { ...stealthContextOptions, storageState } }
+        : { contextOptions: { ...stealthContextOptions } }),
     },
     secrets: loadSecrets(),
     // Remote instance: block the wrapped browser_* tools from the metadata

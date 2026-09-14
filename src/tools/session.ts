@@ -18,6 +18,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -328,16 +329,54 @@ function devtoolsJson(port: number, route: string): Promise<unknown> {
   });
 }
 
-/** Chrome writes its chosen port to <profile>/DevToolsActivePort once it is up. */
-async function readDevtoolsPort(profile: string, timeout: number): Promise<number> {
-  const f = path.join(profile, 'DevToolsActivePort');
+/**
+ * A free local TCP port for Chrome's DevTools endpoint.
+ *
+ * NEVER `--remote-debugging-port=0`. Chrome sets navigator.webdriver=true in every
+ * page when the debugging port is 0 (MDN, Navigator.webdriver). MEASURED 2026-09-14
+ * on Chrome 153: port 0 → `webdriver=true`, a fixed port → `webdriver=false`. With
+ * port 0 the "plain" attach window told chatgpt.com and auth.openai.com it was
+ * automated, and sign-in failed with "Route Error (400 Invalid content type:
+ * text/html)" — HTML (a challenge) where the login step expected JSON. A fixed port
+ * also means Chrome writes no DevToolsActivePort file, so readiness is polled on the
+ * endpoint itself (waitForDevtools).
+ */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      srv.close(() => (port > 0 ? resolve(port) : reject(new Error('attach: could not reserve a local port'))));
+    });
+  });
+}
+
+/** Chrome launch arguments for an attach capture. Exported so the port rule is testable. */
+export function attachChromeArgs(profileDir: string, port: number, url: string): string[] {
+  if (!(Number.isInteger(port) && port > 0))
+    throw new Error(`attach: refusing debugging port ${port} — port 0 marks every page navigator.webdriver=true`);
+  return [
+    `--user-data-dir=${profileDir}`,
+    `--remote-debugging-port=${port}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--new-window',
+    url,
+  ];
+}
+
+/** Wait until Chrome's DevTools HTTP endpoint answers on `port`. */
+async function waitForDevtools(port: number, timeout: number): Promise<void> {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     try {
-      const port = parseInt(fs.readFileSync(f, 'utf8').split('\n')[0], 10);
-      if (port > 0) return port;
+      await devtoolsJson(port, '/json/version');
+      return;
     } catch {
-      /* not written yet */
+      /* not up yet */
     }
     await sleep(300);
   }
@@ -496,6 +535,13 @@ const safeHostname = (u: string): string => {
  * login-host page is showing a NON-wall document — never while a managed challenge is
  * still up, because reading during the solve is what makes a Cloudflare wall loop.
  * wallUp() is the same shared predicate both capture modes compose.
+ *
+ * The CDP connection is NEVER held. MEASURED 2026-09-14 on chatgpt.com: with a
+ * connection held open (the previous shape — connect once, keep it for the whole
+ * wait), the human's sign-in on auth.openai.com turned into "Oops, an error occurred!"
+ * and Cloudflare looped; the same sign-in with nothing connected reached the password
+ * page normally. So each read is connect → cookies → close, gated by
+ * attachCookieReadDecision.
  */
 async function pollAttachedLogin(port: number, loginUrl: string, timeout: number): Promise<void> {
   const reg = siteDomain(loginUrl);
@@ -507,69 +553,125 @@ async function pollAttachedLogin(port: number, loginUrl: string, timeout: number
     `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
   const valKey = (c: { domain?: string; name?: string; value?: string }) => `${nameKey(c)}|${c.value ?? ''}`;
   const urlCheck = makeAttachLoginCheck(); // URL arm — latches the login page, fires once it is left
-  let cdp: Browser | undefined;
   let baseNames: Set<string> | null = null;
   let baseVals: Set<string> | null = null;
+  let lastReadKey = '';
+  let lastReadAt = 0;
+  let lastDone = false; // the verdict of the most recent read, carried across skipped polls
   const start = Date.now();
   const deadline = Date.now() + timeout;
   let stableSince = 0;
-  try {
-    while (Date.now() < deadline) {
-      let pages: Array<{ type?: string; url?: string; title?: string }> = [];
-      try {
-        pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
-      } catch {
-        /* endpoint hiccup — keep waiting */
-      }
-      // The login-host page, if its document has rendered. The URL arm observes it
-      // every poll (latching the login page, firing when the human leaves it). The
-      // cookie arms read only once its wall — if any — is down, because a passive CDP
-      // read is safe only after a managed challenge is gone.
-      const sitePage = pages.find(
-        (p) => p.type === 'page' && typeof p.url === 'string' && onSite(safeHostname(p.url)) && (p.title ?? '').trim() !== '',
-      );
-      const urlLeft = sitePage ? urlCheck({ url: sitePage.url ?? '', title: sitePage.title ?? '' }) : false;
-      let done = false;
-      if (sitePage && !wallUp(sitePage.url ?? '', sitePage.title ?? '')) {
-        try {
-          if (!cdp) cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-          const ctx = cdp.contexts()[0];
-          const cookies = (ctx ? await ctx.cookies() : []).filter((c) => onSite(c.domain ?? ''));
-          const names = new Set(cookies.map(nameKey));
-          // value-keyed, infra excluded — catches a session cookie ROTATED in place
-          // (same name, new value on login) that a name-only delta would miss.
-          const vals = new Set(cookies.filter((c) => !isInfraCookieName(c.name ?? '')).map(valKey));
-          if (baseNames === null) {
-            baseNames = names;
-            baseVals = vals; // first clean read = the pre-login cookie floor
-          } else {
-            const authGained = gainedAuthCookie(baseNames, names, Date.now() - start > 15_000);
-            const jarChanged = [...vals].some((k) => !baseVals!.has(k)); // added or rotated
-            // A new auth cookie proves login on its own (the same-origin SPA case, where
-            // the URL never moves). Otherwise require BOTH the URL leaving the login page
-            // AND a real cookie change — which keeps a multi-step login's email screen
-            // (URL moved to /username, no cookie issued yet) from completing early.
-            done = authGained !== null || (urlLeft && jarChanged);
-          }
-        } catch {
-          /* CDP hiccup — keep waiting */
-        }
-      }
-      if (done) {
-        if (!stableSince) stableSince = Date.now();
-        else if (Date.now() - stableSince >= 2000) return; // held 2s → real
-      } else {
-        stableSince = 0;
-      }
-      await sleep(1000);
+  while (Date.now() < deadline) {
+    let pages: Array<{ type?: string; url?: string; title?: string }> = [];
+    try {
+      pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
+    } catch {
+      /* endpoint hiccup — keep waiting */
     }
-    throw new Error(
-      'attach: login was not completed before the timeout — solve any challenge and finish logging in ' +
-        'in the Chrome window that opened, then it captures automatically',
+    // The login-host page, if its document has rendered. The URL arm observes it
+    // every poll (latching the login page, firing when the human leaves it) — that is
+    // HTTP only and touches no page. The cookie arms need CDP, so they run only when
+    // attachCookieReadDecision says a brief connection is safe.
+    const sitePage = pages.find(
+      (p) => p.type === 'page' && typeof p.url === 'string' && onSite(safeHostname(p.url)) && (p.title ?? '').trim() !== '',
     );
-  } finally {
-    await cdp?.close().catch(() => {});
+    const urlLeft = sitePage ? urlCheck({ url: sitePage.url ?? '', title: sitePage.title ?? '' }) : false;
+    const readKey = sitePage ? `${sitePage.url}|${sitePage.title}` : '';
+    const decision = attachCookieReadDecision(pages, onSite, readKey, lastReadKey, Date.now() - lastReadAt);
+    if (decision === 'read') {
+      lastReadKey = readKey;
+      lastReadAt = Date.now();
+      lastDone = false;
+      let cdp: Browser | undefined;
+      try {
+        cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+        const ctx = cdp.contexts()[0];
+        const cookies = (ctx ? await ctx.cookies() : []).filter((c) => onSite(c.domain ?? ''));
+        const names = new Set(cookies.map(nameKey));
+        // value-keyed, infra excluded — catches a session cookie ROTATED in place
+        // (same name, new value on login) that a name-only delta would miss.
+        const vals = new Set(cookies.filter((c) => !isInfraCookieName(c.name ?? '')).map(valKey));
+        if (baseNames === null) {
+          baseNames = names;
+          baseVals = vals; // first clean read = the pre-login cookie floor
+        } else {
+          lastDone = attachLoginDone(baseNames, names, baseVals!, vals, urlLeft, Date.now() - start > 15_000);
+        }
+      } catch {
+        /* CDP hiccup — keep waiting */
+      } finally {
+        await cdp?.close().catch(() => {}); // never held past the read
+      }
+    } else if (decision === 'blocked') {
+      lastDone = false;
+    }
+    const done = decision !== 'blocked' && lastDone;
+    if (done) {
+      if (!stableSince) stableSince = Date.now();
+      else if (Date.now() - stableSince >= 2000) return; // held 2s → real
+    } else {
+      stableSince = 0;
+    }
+    await sleep(1000);
   }
+  throw new Error(
+    'attach: login was not completed before the timeout — solve any challenge and finish logging in ' +
+      'in the Chrome window that opened, then it captures automatically',
+  );
+}
+
+/**
+ * attach-mode completion verdict for one cookie read.
+ *
+ *  • A STRONG auth-named cookie (isAuthCookieName) proves login on its own — the
+ *    same-origin SPA case, where the URL never moves.
+ *  • Anything weaker — the post-settle opaque-cookie fallback, or a jar change —
+ *    counts ONLY once the URL has left the login page. MEASURED 2026-09-14 on
+ *    chatgpt.com: with the fallback un-gated, `oai-asli` / `precise_location_permission`
+ *    appeared on the still-logged-out login page past the 15s settle window and the
+ *    capture saved a logged-out session reported ok:true, while the human was still
+ *    on auth.openai.com. Requiring the URL arm keeps a multi-step login's email screen
+ *    and a pre-login analytics drop from completing early.
+ */
+export function attachLoginDone(
+  baseNames: Set<string>,
+  names: Set<string>,
+  baseVals: Set<string>,
+  vals: Set<string>,
+  urlLeft: boolean,
+  settled: boolean,
+): boolean {
+  if (gainedAuthCookie(baseNames, names, false) !== null) return true; // strong names only
+  if (!urlLeft) return false;
+  const jarChanged = [...vals].some((k) => !baseVals.has(k)); // added or rotated
+  return jarChanged || gainedAuthCookie(baseNames, names, settled) !== null;
+}
+
+/** How often attach re-reads cookies while the login-site page is unchanged. */
+const ATTACH_READ_EVERY_MS = 5000;
+
+/**
+ * May attach mode briefly connect over CDP to read cookies on this poll?
+ *
+ *   'blocked' — no rendered login-site page, OR any http(s) tab is on a bot wall, OR
+ *               any tab is off the login site (an identity provider mid-sign-in, e.g.
+ *               auth.openai.com). A connection then is what breaks the sign-in.
+ *   'read'    — safe, and the login-site page changed or the last read is stale.
+ *   'reuse'   — safe, but nothing changed since the last read: keep its verdict.
+ *
+ * Pure, so the gate is testable without a browser.
+ */
+export function attachCookieReadDecision(
+  pages: Array<{ type?: string; url?: string; title?: string }>,
+  onSite: (host: string) => boolean,
+  key: string,
+  lastKey: string,
+  sinceLastReadMs: number,
+): 'read' | 'reuse' | 'blocked' {
+  if (!key) return 'blocked';
+  const tabs = pages.filter((p) => p.type === 'page' && typeof p.url === 'string' && /^https?:/i.test(p.url));
+  if (tabs.some((p) => wallUp(p.url ?? '', p.title ?? '') || !onSite(safeHostname(p.url ?? '')))) return 'blocked';
+  return key !== lastKey || sinceLastReadMs >= ATTACH_READ_EVERY_MS ? 'read' : 'reuse';
 }
 
 /** Wait for the human to clear the wall only — no login expected, same url throughout. */
@@ -707,12 +809,23 @@ export function newCookies(before: StorageState, after: StorageState): NonNullab
 }
 
 /**
+ * Sign-in FLOW cookies: set by the login page itself before the human types anything
+ * (CSRF, OAuth callback/state/nonce, PKCE verifier). By name they look like auth —
+ * next-auth's `__Host-next-auth.csrf-token` matches both the `auth` and `token` arms of
+ * isAuthCookieName — so an attach capture of chatgpt.com completed on page load and
+ * saved a logged-out session reported ok:true. They are pre-login infrastructure:
+ * never proof of login, and never a "real cookie change" for the settle fallback.
+ */
+const PRE_LOGIN_FLOW_COOKIE = /csrf|xsrf|callback|nonce|pkce|code[-_.]?verifier|[-_.]state$/i;
+
+/**
  * Cookies set BEFORE any login — dropped on first page load by the app, analytics
  * or the CDN. A new one of these is not evidence of authentication (an ASP.NET app
  * drops ASP.NET_SessionId and a Marketo _mkto_trk before the user has typed a
  * thing), so the attach auth-completion gate must ignore them.
  */
 export function isInfraCookieName(name: string): boolean {
+  if (PRE_LOGIN_FLOW_COOKIE.test(name)) return true;
   return /^(?:_mkto_trk|marketo|__cf|cf_|_ga(?:$|_)|_gid|_gcl|_hj|optimizely|ai_session|ai_user|srv_id|cookiesession\d*|_fbp|_uetsid|_uetvid|visitor|_pk_|s_|utag_)/i.test(
     name,
   );
@@ -725,6 +838,7 @@ export function isInfraCookieName(name: string): boolean {
  */
 export function isAuthCookieName(name: string): boolean {
   if (/^ASP\.NET_SessionId$/i.test(name)) return false;
+  if (PRE_LOGIN_FLOW_COOKIE.test(name)) return false;
   return /aspxauth|\.aspnet\.|\.aspnetcore|fedauth|identity|\bauth\b|token|jwt|bearer|logintoken/i.test(name);
 }
 
@@ -936,14 +1050,8 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     // (non-default) dir we drive, so Chrome 136+ still allows the debug port.
     if (prof.copyFrom) copyProfileEssentials(prof.copyFrom, prof.dir);
 
-    const args = [
-      `--user-data-dir=${prof.dir}`,
-      '--remote-debugging-port=0', // 0 = free port, reported via DevToolsActivePort
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--new-window',
-      opts.loginUrl,
-    ];
+    const port = await freePort(); // never 0 — see freePort()
+    const args = attachChromeArgs(prof.dir, port, opts.loginUrl);
     child = spawn(chromePath, args, { stdio: 'ignore', detached: true }); // own process group → clean tree-kill
     child.on('error', (e) => log(`attach: chrome spawn error: ${e.message}`));
     if (child.pid && prof.cleanup) registerAttachRecord(child.pid, prof.dir); // temp/copy dirs are reap-eligible
@@ -953,7 +1061,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
         : `attach login for "${opts.name}" — a real Chrome window opened; solve the challenge and log in there`,
     );
 
-    const port = await readDevtoolsPort(prof.dir, 20_000);
+    await waitForDevtools(port, 20_000);
     const waitMs = opts.timeoutMs ?? 300_000;
     if (opts.challenge) await pollAttachedChallenge(port, opts.loginUrl, waitMs);
     else await pollAttachedLogin(port, opts.loginUrl, waitMs);
@@ -995,12 +1103,18 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     // lifetime is the auth cookie's, which session_status already probes for.
     const clearance = opts.challenge ? clearanceSummary(state) : {};
     if (clearance.warning) log(`warning: ${clearance.warning}`);
+    // The same proof-of-capture sessionLogin reports: which hosts the saved cookies
+    // belong to. Attach has no before/after delta, so this is the site's whole jar.
+    const saved = siteCookies(state, siteDomain(opts.loginUrl));
+    const hosts = [...new Set(saved.map((c) => (c.domain ?? '').replace(/^\./, '')))].filter(Boolean);
     return {
       name: opts.name,
       path: out,
       capturedAt: new Date().toISOString(),
       mode: opts.challenge ? 'challenge' : 'attach',
       ok: true,
+      cookiesGained: saved.length,
+      authHosts: hosts,
       ...clearance,
     };
   } catch (err) {
@@ -1400,9 +1514,11 @@ const loginDefinition: Tool = {
     'URL never changes, e.g. iCloud, via the auth cookie it issues). ' +
     "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
     'user-scoped secrets.env, then process.env — never embedded; tokens are never echoed back. ' +
-    'For a site behind a Cloudflare/Turnstile "Just a moment…" challenge that loops forever under ' +
-    'automation, set attach:true — a real Chrome window opens, the human clears the challenge and ' +
-    'logs in, and the session is harvested passively (no CDP driving during the solve). ' +
+    'For a site fronted by Cloudflare/Turnstile or a similar human check — including one embedded in ' +
+    'the login form, e.g. dash.cloudflare.com or chatgpt.com — use attach:true FROM THE START: the ' +
+    'headed automation window is rejected by these checks and loops until the timeout. attach:true ' +
+    'opens a real Chrome window, the human clears the check and logs in, and the session is harvested ' +
+    'passively (no CDP driving during the solve). ' +
     'To capture a CLEARED BOT WALL with NO login at all (the human just solves the CAPTCHA), use the ' +
     'session_solve_challenge tool instead. ' +
     'To freeze a flow as a deterministic test suite that reuses this session, call the ' +

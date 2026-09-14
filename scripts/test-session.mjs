@@ -422,6 +422,81 @@ test('gainedAuthCookie: auth-named completes at once, plain new cookie only afte
   assert.equal(isInfraCookieName('_mkto_trk'), true);
   assert.equal(isInfraCookieName('__cfruid'), true);
   assert.equal(isInfraCookieName('AuthToken'), false);
+
+  // Sign-in FLOW cookies the login page sets before anyone types (measured on
+  // chatgpt.com 2026-09-14): the attach capture completed on page load because
+  // `__Host-next-auth.csrf-token` matched both the `auth` and `token` arms. They are
+  // never login proof — not at once, and not as the post-settle fallback either.
+  const cg = set(['chatgpt.com|oai-did']);
+  for (const flow of ['__Host-next-auth.csrf-token', '__Secure-next-auth.callback-url', 'XSRF-TOKEN', 'g_state', 'oauth_nonce']) {
+    assert.equal(isAuthCookieName(flow), false, `${flow} is not an auth cookie`);
+    assert.equal(gainedAuthCookie(cg, set([...cg, `chatgpt.com|${flow}`]), true), null, `${flow} never completes a login`);
+  }
+  // The real next-auth session ticket still completes at once.
+  assert.equal(isAuthCookieName('__Secure-next-auth.session-token'), true);
+  assert.equal(
+    gainedAuthCookie(cg, set([...cg, 'chatgpt.com|__Host-next-auth.csrf-token', 'chatgpt.com|__Secure-next-auth.session-token']), false),
+    '__Secure-next-auth.session-token',
+  );
+});
+
+// attach must never hold a CDP connection while the human signs in (measured on
+// chatgpt.com 2026-09-14: a held connection broke auth.openai.com's password step).
+// The gate that decides when a brief read is allowed.
+test('attachCookieReadDecision: no CDP read on a wall, off-site, or with no site page', async () => {
+  const { attachCookieReadDecision } = await import('../dist/tools/session.js');
+  const onSite = (h) => h === 'chatgpt.com' || h.endsWith('.chatgpt.com');
+  const login = { type: 'page', url: 'https://chatgpt.com/auth/login', title: 'Get started | ChatGPT' };
+  const key = `${login.url}|${login.title}`;
+
+  // No rendered login-site page (the tab navigated to the identity provider) → blocked.
+  assert.equal(attachCookieReadDecision([{ type: 'page', url: 'https://auth.openai.com/log-in', title: 'Log in' }], onSite, '', key, 99_999), 'blocked');
+  // A site page exists but another tab is on the identity provider → blocked.
+  assert.equal(attachCookieReadDecision([login, { type: 'page', url: 'https://auth.openai.com/log-in/password', title: 'Enter your password - OpenAI' }], onSite, key, '', 99_999), 'blocked');
+  // Any tab on a bot wall → blocked.
+  assert.equal(attachCookieReadDecision([{ ...login, title: 'Just a moment...' }], onSite, key, '', 99_999), 'blocked');
+  // Non-http targets (new tab page, devtools) do not count as off-site.
+  assert.equal(attachCookieReadDecision([login, { type: 'page', url: 'chrome://newtab/', title: 'New Tab' }], onSite, key, '', 0), 'read');
+  // Safe: read on change, reuse while unchanged, re-read once stale.
+  assert.equal(attachCookieReadDecision([login], onSite, key, '', 0), 'read');
+  assert.equal(attachCookieReadDecision([login], onSite, key, key, 1000), 'reuse');
+  assert.equal(attachCookieReadDecision([login], onSite, key, key, 5000), 'read');
+});
+
+// Measured on chatgpt.com 2026-09-14: past the 15s settle window, pre-login cookies
+// (`oai-asli`, `precise_location_permission`) appeared on the still-logged-out login
+// page and the un-gated fallback saved a logged-out session. A weak signal now needs
+// the URL to have left the login page; only a strong auth cookie completes alone.
+test('attachLoginDone: weak cookie signals need the URL to leave the login page', async () => {
+  const { attachLoginDone } = await import('../dist/tools/session.js');
+  const s = (a) => new Set(a);
+  const base = s(['chatgpt.com|oai-did', 'chatgpt.com|__Host-next-auth.csrf-token']);
+  const baseV = s(['chatgpt.com|oai-did|1']);
+  const preLogin = s([...base, 'chatgpt.com|oai-asli', 'chatgpt.com|precise_location_permission']);
+  const preLoginV = s([...baseV, 'chatgpt.com|oai-asli|x', 'chatgpt.com|precise_location_permission|denied']);
+
+  // The chatgpt.com failure: settled, new opaque cookies, still ON the login page → not done.
+  assert.equal(attachLoginDone(base, preLogin, baseV, preLoginV, false, true), false);
+  // Same cookies once the human is back on chatgpt.com past the login page → done.
+  assert.equal(attachLoginDone(base, preLogin, baseV, preLoginV, true, true), true);
+  // The real session ticket completes at once, URL unmoved (same-origin SPA case).
+  const authed = s([...base, 'chatgpt.com|__Secure-next-auth.session-token']);
+  assert.equal(attachLoginDone(base, authed, baseV, baseV, false, false), true);
+  // URL left but nothing changed (an email step before any cookie) → not done.
+  assert.equal(attachLoginDone(base, base, baseV, baseV, true, true), false);
+});
+
+// Measured on Chrome 153, 2026-09-14: `--remote-debugging-port=0` makes every page
+// report navigator.webdriver=true (a fixed port reports false), and chatgpt.com's
+// sign-in failed with "Route Error (400 Invalid content type: text/html)" in the
+// supposedly plain attach window. The launch must never use port 0.
+test('attachChromeArgs: attach never launches Chrome with debugging port 0', async () => {
+  const { attachChromeArgs } = await import('../dist/tools/session.js');
+  const args = attachChromeArgs('/tmp/pwmcp-attach-x', 40123, 'https://chatgpt.com/auth/login');
+  assert.ok(args.includes('--remote-debugging-port=40123'));
+  assert.ok(!args.includes('--remote-debugging-port=0'));
+  assert.equal(args.at(-1), 'https://chatgpt.com/auth/login');
+  assert.throws(() => attachChromeArgs('/tmp/pwmcp-attach-x', 0, 'https://x.test/'), /port 0/);
 });
 
 // Both capture modes write the same kind of artifact to the same store, so both
