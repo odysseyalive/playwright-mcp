@@ -1,4 +1,4 @@
-# install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
+﻿# install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
 # Builds the server, downloads Chromium, registers it at USER scope with Claude
 # Code and Codex, and applies the WebFetch/claude-in-chrome override automatically,
@@ -100,6 +100,7 @@ if (-not $NoSteer) {
   if ($hasMark) {
     Say "Steering directive already present in $userClaudeMd"
   } else {
+    New-Item -ItemType Directory -Force -Path (Split-Path $userClaudeMd) | Out-Null
     Say "Adding the playwright-mcp steering directive to $userClaudeMd"
     $steer = @'
 
@@ -113,7 +114,11 @@ built-in WebFetch, and playwright-mcp's browser_* tools instead of the
 claude-in-chrome extension. Do NOT scrape search engines. Clean up temporary
 screenshots and files at the end of every debug session.
 '@
-    Add-Content -Path $userClaudeMd -Value $steer
+    # Append as UTF-8 without a BOM, LF-only, newline-terminated: byte-identical to
+    # install.sh's heredoc. Not Add-Content: under 5.1 it writes the ANSI code page
+    # to a new or BOM-less file, and -Encoding UTF8 there would add a BOM.
+    $block = ($steer -replace "`r`n", "`n") + "`n"
+    [System.IO.File]::AppendAllText($userClaudeMd, $block, (New-Object System.Text.UTF8Encoding $false))
     Say "Added steering directive."
   }
 }

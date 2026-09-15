@@ -18,8 +18,15 @@ import { getStealthContext, closeBrowser, isStaleLock } from '../dist/browser.js
 import { fetchUrl } from '../dist/tools/web-fetch.js';
 import { upstreamConfig } from '../dist/upstream.js';
 import { STEALTH_ARGS, STEALTH_INIT, STEALTH_UA } from '../dist/stealth.js';
+import { symlinkSkipReason } from './fixtures/platform.mjs';
 
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
+/**
+ * isStaleLock parses a SingletonLock symlink; the parser is platform-neutral,
+ * so these run wherever a symlink can be made and skip, with the reason, where
+ * it cannot (Windows without Developer Mode or elevation).
+ */
+const NO_SYMLINKS = symlinkSkipReason();
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `pwmcp-${name}-`));
 
 // The browser_* browser must wear the same disguise as web_fetch. Without it a
@@ -73,20 +80,20 @@ test('isStaleLock: no lock at all is not stale', () => {
   assert.equal(isStaleLock(tmp('nolock')), false);
 });
 
-test('isStaleLock: a lock owned by a live process is NOT stale', () => {
+test('isStaleLock: a lock owned by a live process is NOT stale', { skip: NO_SYMLINKS }, () => {
   const dir = tmp('live');
   fs.symlinkSync(`${os.hostname()}-${process.pid}`, path.join(dir, 'SingletonLock'));
   assert.equal(isStaleLock(dir), false);
 });
 
-test('isStaleLock: a lock owned by a dead process IS stale', () => {
+test('isStaleLock: a lock owned by a dead process IS stale', { skip: NO_SYMLINKS }, () => {
   const dir = tmp('dead');
   // 0x7ffffffe — above any real pid_max, so it can never be live.
   fs.symlinkSync(`${os.hostname()}-2147483646`, path.join(dir, 'SingletonLock'));
   assert.equal(isStaleLock(dir), true);
 });
 
-test('isStaleLock: a lock written on another host IS stale', () => {
+test('isStaleLock: a lock written on another host IS stale', { skip: NO_SYMLINKS }, () => {
   const dir = tmp('foreign');
   fs.symlinkSync(`someotherbox-${process.pid}`, path.join(dir, 'SingletonLock'));
   assert.equal(isStaleLock(dir), true);
@@ -123,7 +130,13 @@ test('fetchUrl never throws when the browser cannot start', async () => {
 
 // ── real-chrome recovery (opt-in) ────────────────────────────────────────────
 
-test('a stale profile lock is cleared, not fatal', { skip: !BROWSER_TESTS }, async () => {
+const STALE_RECOVERY_SKIP = !BROWSER_TESTS
+  ? 'opt-in: needs a real chrome (PLAYWRIGHT_MCP_TEST_BROWSER=1)'
+  : process.platform === 'win32'
+    ? 'win32: chrome never reads SingletonLock there, so a planted one cannot observe the recovery'
+    : NO_SYMLINKS;
+
+test('a stale profile lock is cleared, not fatal', { skip: STALE_RECOVERY_SKIP }, async () => {
   const cache = tmp('lockrecover');
   process.env.XDG_CACHE_HOME = cache;
   const profile = path.join(cache, 'playwright-mcp', 'profile');

@@ -5,10 +5,13 @@
 // / missing / unreachable, and project-.env credential precedence. Run: node --test
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+import { withPlatformSync } from './fixtures/platform.mjs';
 
 // Isolate config dirs BEFORE importing the module (it reads env at call time).
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-sess-'));
@@ -21,7 +24,88 @@ fs.writeFileSync(
 
 const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie, makeAuthCookieProbe } =
   await import('../dist/tools/session.js');
-const { getSecret } = await import('../dist/secrets.js');
+const { getSecret, ownerOnlyAclArgs, parseWhoamiSid, ownerOnlyFile, ownerOnlyDir, reassertOwnerOnly, OwnerOnlyError } =
+  await import('../dist/secrets.js');
+
+/** Read once, before any test fakes it, so a leaked fake is detectable. */
+const REAL_PLATFORM = process.platform;
+const IS_WIN32 = REAL_PLATFORM === 'win32';
+
+// ── owner-only verification on win32 (the REAL ACL, not .mode) ─────────────────
+// On Windows fs.statSync().mode derives only from the read-only attribute, so a
+// `.mode & 0o777` check cannot see an ACL at all. What the capture promises there
+// is: the DACL is PROTECTED (no inherited ACEs can apply), it holds exactly ONE
+// ACE, and that ACE allows the current account's SID. Read with Get-Acl asking
+// for SIDs rather than names (icacls prints resolved, localized account names and
+// has no protected flag to show). Tools run by absolute System32 path, argument
+// array, no shell; the target path travels in an environment variable, never in
+// the command text. NOT VERIFIED ON WINDOWS — this repo has no Windows host; the
+// judge (daclProblems) is exercised on every OS against canned dumps below.
+
+const system32 = (...rel) =>
+  path.win32.join(process.env.SystemRoot ?? process.env.windir ?? 'C:\\Windows', 'System32', ...rel);
+
+const DACL_DUMP_SCRIPT = [
+  '$acl = Get-Acl -LiteralPath $env:PWMCP_ACL_TARGET',
+  '"protected=$($acl.AreAccessRulesProtected)"',
+  '$acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {',
+  '  "ace=$($_.IdentityReference.Value)|$($_.AccessControlType)|$($_.IsInherited)|$($_.FileSystemRights)" }',
+].join('\n');
+
+/** The current account's SID from `whoami /user /fo csv /nh`, parsed here, independently of src/secrets.ts. */
+function whoamiSid() {
+  const r = spawnSync(system32('whoami.exe'), ['/user', '/fo', 'csv', '/nh'], {
+    encoding: 'utf8',
+    shell: false,
+    windowsHide: true,
+  });
+  assert.equal(r.status, 0, `whoami failed: ${r.error?.message ?? r.stderr}`);
+  const sid = r.stdout.trim().match(/,"(S-1-\d+(?:-\d+)+)"$/)?.[1];
+  assert.ok(sid, 'whoami printed no SID');
+  return sid;
+}
+
+/** `protected=<bool>` then one `ace=<SID>|<type>|<inherited>|<rights>` line per ACE. */
+function daclDump(target) {
+  const r = spawnSync(
+    system32('WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ['-NoProfile', '-NonInteractive', '-Command', DACL_DUMP_SCRIPT],
+    { encoding: 'utf8', shell: false, windowsHide: true, env: { ...process.env, PWMCP_ACL_TARGET: target } },
+  );
+  assert.equal(r.status, 0, `Get-Acl failed: ${r.error?.message ?? r.stderr}`);
+  return r.stdout;
+}
+
+/**
+ * Everything wrong with a DACL dump for an owner-only artifact; [] when it is
+ * right. Pure, so it is tested on every OS — including that it CAN fail.
+ */
+function daclProblems(dump, sid) {
+  const lines = dump.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const problems = [];
+  const prot = lines.find((l) => l.startsWith('protected='));
+  if (prot !== 'protected=True') problems.push(`DACL not protected (${prot ?? 'no protected= line'}), so inherited ACEs apply`);
+  const aces = lines.filter((l) => l.startsWith('ace=')).map((l) => l.slice(4).split('|'));
+  if (aces.length !== 1) problems.push(`expected exactly one ACE, found ${aces.length}`);
+  for (const [grantee, type, inherited, rights] of aces) {
+    if (grantee !== sid) problems.push(`an ACE grants ${grantee}, not the current account ${sid}`);
+    if (type !== 'Allow') problems.push(`the ACE for ${grantee} is ${type}, not Allow`);
+    if (inherited !== 'False') problems.push(`the ACE for ${grantee} is inherited`);
+    if (rights !== 'FullControl') problems.push(`the ACE for ${grantee} grants ${rights}, not FullControl`);
+  }
+  return problems;
+}
+
+/** Assert the artifact is readable by its owner alone, by whatever this OS enforces. */
+function assertOwnerOnly(file) {
+  if (IS_WIN32) {
+    const problems = daclProblems(daclDump(file), whoamiSid()); // NOT VERIFIED ON WINDOWS
+    assert.deepEqual(problems, [], `artifact is not owner-only:\n${problems.join('\n')}`);
+  } else {
+    const mode = fs.statSync(file).mode & 0o777;
+    assert.equal(mode, 0o600, `mode ${mode.toString(8)} === 600`);
+  }
+}
 
 async function withProjectDir(files, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-proj-'));
@@ -122,7 +206,7 @@ test.after(() => {
   fs.rmSync(TMP, { recursive: true, force: true });
 });
 
-test('session_login captures a session at mode 600 without echoing tokens', async () => {
+test('session_login captures an owner-only session (mode 600; win32: one-ACE protected owner DACL) without echoing tokens', async () => {
   const r = await sessionLogin({
     name: 'demo',
     loginUrl: `${base}/login`,
@@ -132,12 +216,163 @@ test('session_login captures a session at mode 600 without echoing tokens', asyn
   assert.equal(r.ok, true, r.error ?? 'login ok');
   assert.equal(r.mode, 'headless');
   assert.ok(fs.existsSync(r.path), 'storageState file written');
-  const mode = fs.statSync(r.path).mode & 0o777;
-  assert.equal(mode, 0o600, `mode ${mode.toString(8)} === 600`);
+  assertOwnerOnly(r.path);
   // Tool result must never echo cookie/token values.
   assert.ok(!JSON.stringify(r).includes('sid'), 'no cookie token in tool result');
   // The captured artifact does contain the cookie (that is its job).
   assert.match(fs.readFileSync(r.path, 'utf8'), /sid/);
+});
+
+// ── the win32 owner-only contract, exercised on every OS ────────────────────────
+// src/secrets.ts's win32 branch never runs on the Linux gate. These pin its
+// deterministic seams: the exact icacls argv, the whoami SID parse, and the
+// failure path. NOT VERIFIED ON WINDOWS: icacls/whoami themselves never ran here.
+
+test('win32 contract: the DACL judge accepts only a protected, single, owner-SID, non-inherited ACE', () => {
+  const sid = 'S-1-5-21-111-222-333-1001';
+  const good = `protected=True\r\nace=${sid}|Allow|False|FullControl\r\n`;
+  assert.deepEqual(daclProblems(good, sid), []);
+  // Every way it can be wrong is caught (the judge is not vacuous).
+  assert.match(daclProblems(good.replace('True', 'False'), sid).join(), /not protected/);
+  assert.match(daclProblems(`${good}ace=S-1-5-18|Allow|False|FullControl\n`, sid).join(), /exactly one ACE, found 2/);
+  assert.match(daclProblems(good.replace('|False|', '|True|'), sid).join(), /inherited/);
+  assert.match(daclProblems(good, 'S-1-5-21-111-222-333-1002').join(), /not the current account/);
+  assert.match(daclProblems(good.replace('Allow', 'Deny'), sid).join(), /not Allow/);
+  assert.match(daclProblems(good.replace('FullControl', 'ReadAndExecute, Synchronize'), sid).join(), /not FullControl/);
+  assert.equal(daclProblems('', sid).length, 2, 'an empty dump fails twice: no protected line, zero ACEs');
+});
+
+test('win32 contract: ownerOnlyAclArgs is the exact icacls argv for a file and for the dir', () => {
+  const sid = 'S-1-5-21-1-2-3-1001';
+  assert.deepEqual(ownerOnlyAclArgs('C:\\s\\demo.json', sid, 'file'), [
+    'C:\\s\\demo.json',
+    '/inheritance:r',
+    '/grant:r',
+    `*${sid}:(F)`,
+  ]);
+  assert.deepEqual(ownerOnlyAclArgs('C:\\s', sid, 'dir'), ['C:\\s', '/inheritance:r', '/grant:r', `*${sid}:(OI)(CI)(F)`]);
+  // A malformed SID never reaches an argument.
+  for (const bad of ['', 'Everyone', 'S-1-5-21-1 /grant Everyone:F', 'S-1-5-21-1:(F) *S-1-1-0']) {
+    assert.throws(() => ownerOnlyAclArgs('C:\\s', bad, 'file'), OwnerOnlyError, JSON.stringify(bad));
+  }
+});
+
+test('win32 contract: parseWhoamiSid takes the SID field and rejects anything that is not one', () => {
+  assert.equal(parseWhoamiSid('"desktop-x\\francis","S-1-5-21-111-222-333-1001"\r\n'), 'S-1-5-21-111-222-333-1001');
+  assert.equal(parseWhoamiSid('"CORP\\a,b","S-1-5-21-9-9-9-500"'), 'S-1-5-21-9-9-9-500', 'a comma in the name');
+  for (const bad of [
+    '',
+    '"desktop-x\\francis"',
+    '"x","not-a-sid"',
+    '"x","S-1-5-21-1 /grant Everyone:F"', // injection-shaped last field
+    '"x","S-1-5-21-1-1001:(F)"',
+    '"x","S-1-5-21-1-1001" & calc',
+  ]) {
+    assert.throws(() => parseWhoamiSid(bad), OwnerOnlyError, JSON.stringify(bad));
+  }
+});
+
+const WIN32_FAILURE_PATH_SKIP = IS_WIN32
+  ? 'real win32: the path guard passes and icacls runs for real, so this failure is only reachable by ' +
+    'faking the platform on POSIX; the success path is asserted by the capture test above'
+  : false;
+
+test('win32 contract (faked platform): ownerOnlyFile/ownerOnlyDir refuse, with OwnerOnlyError, before any tool runs', { skip: WIN32_FAILURE_PATH_SKIP }, () => {
+  const file = path.join(TMP, 'acl-refuse.json');
+  fs.writeFileSync(file, '{}');
+  const caught = (fn) => {
+    try {
+      fn();
+    } catch (err) {
+      return err;
+    }
+    return undefined;
+  };
+  // Synchronous calls: the fake cannot outlive them, and no other code runs under it.
+  const fileErr = withPlatformSync('win32', () => caught(() => ownerOnlyFile(file)));
+  const dirErr = withPlatformSync('win32', () => caught(() => ownerOnlyDir(path.join(TMP, 'acl-refuse-dir'))));
+  for (const err of [fileErr, dirErr]) {
+    assert.ok(err instanceof OwnerOnlyError, `expected OwnerOnlyError, got ${err}`);
+    // The path guard, not a failed spawn: no whoami or icacls was attempted.
+    assert.match(err.message, /refusing to run icacls on an unexpected path/);
+  }
+  assert.equal(process.platform, REAL_PLATFORM, 'the platform was restored');
+});
+
+test('win32 contract (faked platform): reassertOwnerOnly warns on stderr and never throws', { skip: WIN32_FAILURE_PATH_SKIP }, () => {
+  const file = path.join(TMP, 'acl-reassert.json');
+  fs.writeFileSync(file, '{}', { mode: 0o644 });
+  const lines = [];
+  const realError = console.error;
+  console.error = (...args) => lines.push(args.join(' '));
+  try {
+    assert.doesNotThrow(() => withPlatformSync('win32', () => reassertOwnerOnly(file)));
+  } finally {
+    console.error = realError;
+  }
+  const warning = lines.join('\n');
+  assert.match(warning, /warning: rewrote .*acl-reassert\.json but could NOT restrict it/);
+  assert.match(warning, /not confirmed owner-only/);
+  // The chmod half ran before the ACL half refused.
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
+// The capture policy (src/tools/session.ts restrictCapturedArtifact): when the
+// owner-only step fails, the artifact is DELETED and the capture reports ok:false
+// with "session not saved". Driven through a real sessionLogin, with the
+// win32 branch forced for one synchronous stretch only:
+//   fs.chmodSync(<artifact>)  — patched: does the real chmod, THEN fakes win32
+//   ownerOnlyFile → restrictAclToOwner → path guard throws OwnerOnlyError
+//   fs.rmSync(<artifact>)     — patched: restores the platform, THEN deletes
+// Nothing between those two calls awaits, so no Playwright code (which reads
+// process.platform at call time for its own launch and close paths) ever runs
+// under the fake. Faking the platform around the whole sessionLogin would be
+// unsound for exactly that reason. The counters prove the window opened and
+// closed once, where claimed.
+test('capture fails LOUD when the owner-only step fails: artifact deleted, ok:false, "session not saved"', { skip: WIN32_FAILURE_PATH_SKIP }, async () => {
+  const name = 'aclfail';
+  const artifact = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, `${name}.json`);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const { chmodSync, rmSync } = fs;
+  let opened = 0;
+  let closed = 0;
+  fs.chmodSync = function (p, ...rest) {
+    const out = chmodSync.call(this, p, ...rest);
+    if (path.resolve(String(p)) === artifact) {
+      Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+      opened++;
+    }
+    return out;
+  };
+  fs.rmSync = function (p, ...rest) {
+    if (opened > closed && path.resolve(String(p)) === artifact) {
+      Object.defineProperty(process, 'platform', platform);
+      closed++;
+    }
+    return rmSync.call(this, p, ...rest);
+  };
+  let r;
+  try {
+    r = await sessionLogin({
+      name,
+      loginUrl: `${base}/login`,
+      successSignal: 'h1',
+      credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+    });
+  } finally {
+    fs.chmodSync = chmodSync;
+    fs.rmSync = rmSync;
+    Object.defineProperty(process, 'platform', platform);
+  }
+
+  assert.equal(opened, 1, 'the win32 branch was forced exactly once, on the artifact');
+  assert.equal(closed, 1, 'the fake closed at the artifact delete, before any await');
+  assert.equal(r.ok, false, 'a capture that could not be restricted is not a success');
+  assert.match(r.error ?? '', /^session not saved — the captured file could not be restricted to your account/);
+  assert.match(r.error ?? '', /refusing to run icacls/, 'the reason is the win32 owner-only step');
+  assert.match(r.error ?? '', /so it was deleted rather than left readable by others/);
+  assert.equal(fs.existsSync(artifact), false, 'the unrestricted artifact is gone');
+  assert.ok(!JSON.stringify(r).includes('sid=ok'), 'no cookie token in the failure either');
 });
 
 test('session_login: auto-detects login with NO successSignal (moved past login page)', async () => {

@@ -25,7 +25,7 @@ import {
 } from '../egress.js';
 import { guardOutbound, sessionAllowsUrl, wrapUntrusted } from '../exfil.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
-import { sessionFilePath, secretInventory } from '../secrets.js';
+import { sessionFilePath, secretInventory, reassertOwnerOnly } from '../secrets.js';
 import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 import {
   classifyHealth,
@@ -193,7 +193,7 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
           const landed = page.url();
           if (!/\/(login|signin|sign-in|auth)(\b|\/|\?)/i.test(landed)) {
             await context.storageState({ path: file });
-            fs.chmodSync(file, 0o600);
+            reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
           }
         } catch {
           /* write-back is best-effort; the read result is unaffected */

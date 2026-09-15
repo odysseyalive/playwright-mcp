@@ -19,6 +19,7 @@
 
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -208,7 +209,54 @@ function parseReport(report: unknown): { total: number; failures: FailureDossier
   return { total, failures };
 }
 
+/** Packages that ship the `playwright` test-runner bin, in the order they are preferred. */
+const PLAYWRIGHT_CLI_PACKAGES = ['@playwright/test', 'playwright'] as const;
+
+/**
+ * The project's OWN Playwright CLI, resolved from `cwd` with Node's module
+ * resolution — the same node_modules walk that finds a local bin, never a
+ * download. Returns the absolute path of the package's `bin.playwright` script.
+ *
+ * Why not `npx playwright`: on Windows npx is `npx.cmd`, and a .cmd can be
+ * neither found (libuv's command search tries only the literal name, .com and
+ * .exe) nor launched (Node refuses a .bat/.cmd without a shell since
+ * CVE-2024-27980) by execFile. A shell is not an option either — `specs` is
+ * tool-supplied, and cmd.exe argument parsing is the BatBadBut injection path.
+ * Running the CLI script under this process's own node binary (an .exe) needs
+ * no shell on any platform, so ONE launch path serves every OS.
+ *
+ * Resolved through `<pkg>/package.json` + its `bin` field because both packages
+ * export `./package.json`, while `playwright` does not export `./cli`.
+ */
+export function resolvePlaywrightCli(cwd: string): string {
+  const requireFromProject = createRequire(path.join(cwd, 'package.json'));
+  for (const pkg of PLAYWRIGHT_CLI_PACKAGES) {
+    let manifest: string;
+    try {
+      manifest = requireFromProject.resolve(`${pkg}/package.json`);
+    } catch {
+      continue; // not installed here — try the next package
+    }
+    let bin: unknown;
+    try {
+      bin = (JSON.parse(fs.readFileSync(manifest, 'utf8')) as { bin?: unknown }).bin;
+    } catch (err) {
+      throw new Error(`cannot read ${manifest}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const rel = typeof bin === 'string' ? bin : (bin as Record<string, unknown> | undefined)?.playwright;
+    if (typeof rel !== 'string') continue;
+    const cli = path.resolve(path.dirname(manifest), rel);
+    if (fs.existsSync(cli)) return cli;
+  }
+  throw new Error(
+    `no Playwright test runner is installed for ${cwd} (neither ${PLAYWRIGHT_CLI_PACKAGES.join(' nor ')} ` +
+      'resolves from it). suite_audit runs the project\'s own copy and never downloads one — install it ' +
+      'in the project: npm i -D @playwright/test',
+  );
+}
+
 function runPlaywright(
+  cli: string,
   cwd: string,
   specs: string[],
   reportFile: string,
@@ -216,10 +264,12 @@ function runPlaywright(
 ): Promise<{ stderrTail: string }> {
   return new Promise((resolve, reject) => {
     const child = execFile(
-      'npx',
-      ['playwright', 'test', ...specs, '--reporter=json'],
+      process.execPath,
+      [cli, 'test', ...specs, '--reporter=json'],
       {
         cwd,
+        shell: false, // explicit: specs are tool-supplied and must never reach a shell
+        windowsHide: true,
         timeout: timeoutMs,
         maxBuffer: 64 * 1024 * 1024,
         env: {
@@ -234,7 +284,7 @@ function runPlaywright(
         // Non-zero exit just means test failures — the report file is still the
         // source of truth. Only a missing report is a real execution error.
         if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-          reject(new Error('npx not found on PATH'));
+          reject(new Error(`could not start ${process.execPath} (ENOENT)`));
           return;
         }
         if (err && String((err as Error & { killed?: boolean }).killed) === 'true') {
@@ -269,13 +319,14 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
         .some((f) => /^playwright\.config\.(ts|js|mjs|cjs)$/.test(f));
       if (!hasConfig) throw new Error(`no playwright.config.* in ${cwd} — wrong project root?`);
 
+      const cli = resolvePlaywrightCli(cwd); // throws the install hint before anything is created
       const specs = Array.isArray(args.specs) ? args.specs.map(String) : [];
       const timeoutMs = Math.min(Number(args.timeoutMs) || 600_000, 1_800_000);
       const reportFile = path.join(
         fs.mkdtempSync(path.join(os.tmpdir(), 'suite-audit-')),
         'report.json',
       );
-      const { stderrTail } = await runPlaywright(cwd, specs, reportFile, timeoutMs);
+      const { stderrTail } = await runPlaywright(cli, cwd, specs, reportFile, timeoutMs);
       if (!fs.existsSync(reportFile)) {
         // Two provenances, two parts. The sentence is this server's; the tail is
         // a subprocess's stderr, which carries whatever a spec printed — page
@@ -288,7 +339,7 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
         );
       }
       reportRaw = fs.readFileSync(reportFile, 'utf8');
-      ranNote = `Ran: npx playwright test ${specs.join(' ')} (cwd ${cwd})`;
+      ranNote = `Ran: playwright test${specs.length ? ` ${specs.join(' ')}` : ''} via the project's own CLI ${cli} (cwd ${cwd})`;
     } else {
       throw new Error(
         'Pass reportPath (parse the last run) or run: true (execute the suite) — ' +

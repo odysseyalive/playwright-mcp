@@ -7,7 +7,8 @@
  *
  * CONCURRENCY: the profile is drawn from a small numbered POOL, not one fixed dir.
  * Chromium holds a SingletonLock on a persistent profile for the life of the
- * browser, so two user-scoped instances (two concurrent Claude Code sessions)
+ * browser (on Windows, an exclusively-held `lockfile` instead — see
+ * lockfileState), so two user-scoped instances (two concurrent Claude Code sessions)
  * sharing one dir meant the second's launch was refused — correctly, the lock is
  * live, not stale — and every web_fetch on it read back `blocked`. Each instance
  * now takes the first pool slot no live chrome holds, so every session keeps a
@@ -187,12 +188,55 @@ function pidAlive(pid: number): boolean {
  * (free) and "live lock" (occupied); the difference is whether a lock exists.
  */
 function isOccupied(dir: string): boolean {
+  if (process.platform === 'win32') return lockfileState(dir) === 'live'; // NOT VERIFIED ON WINDOWS
   try {
     fs.readlinkSync(path.join(dir, 'SingletonLock'));
   } catch {
     return false; // no lock, or not a symlink — the slot is free
   }
   return !isStaleLock(dir);
+}
+
+/** What a Windows profile's `lockfile` says about who holds the profile. */
+export type LockfileState = 'free' | 'stale' | 'live';
+
+/** Open for write WITHOUT creating or truncating, then close at once. */
+const openForWrite = (file: string): void => fs.closeSync(fs.openSync(file, 'r+'));
+
+/**
+ * The win32 occupancy probe. Chrome on Windows never creates the POSIX
+ * Singleton* files (process_singleton_win.cc); it holds `<profile>/lockfile`
+ * open for the life of the browser with GENERIC_WRITE, share mode
+ * FILE_SHARE_READ only, and FILE_FLAG_DELETE_ON_CLOSE. So:
+ *   - no file (ENOENT)              → 'free'
+ *   - opens for write               → 'stale': nobody holds it. A chrome that lost
+ *                                     power never ran its delete-on-close; chrome
+ *                                     itself reclaims such a file (CREATE_ALWAYS
+ *                                     succeeds), so the slot is usable and there is
+ *                                     nothing for us to clear
+ *   - any other error               → 'live': EBUSY is the sharing violation a
+ *                                     running chrome's handle causes; EPERM/EACCES
+ *                                     is a delete-pending or foreign-owned file.
+ *                                     Conservative on purpose — a slot we cannot
+ *                                     probe is a slot we do not take, and the pool's
+ *                                     last resort is a temp dir, never a hard fail.
+ * Existence alone is NOT the test: it would burn a slot for good after one power
+ * loss. `'r+'` rather than `'w'` so a free dir never gets a lockfile of ours.
+ * The probe holds its handle for one open/close; a sibling chrome starting in
+ * exactly that instant would see a sharing violation and fail its launch once.
+ *
+ * Pure apart from `probe`, and platform-independent, so tests drive it on any
+ * OS: real files cover 'free' and 'stale'; an injected probe throwing an EBUSY
+ * errno covers 'live', which needs a real Windows sharing violation otherwise.
+ * NOT VERIFIED ON WINDOWS.
+ */
+export function lockfileState(dir: string, probe: (file: string) => void = openForWrite): LockfileState {
+  try {
+    probe(path.join(dir, 'lockfile'));
+    return 'stale';
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'free' : 'live';
+  }
 }
 
 /**

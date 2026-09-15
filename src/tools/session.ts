@@ -2,7 +2,7 @@
  * session.ts — authenticated-session helpers: session_login + session_status.
  * Thin wrappers over Playwright's native storageState (capture-once, reuse-
  * everywhere). The MCP NEVER holds a live session through a test cycle; it emits
- * a portable mode-600 artifact that both interactive debugging (the wrapped
+ * a portable owner-only artifact that both interactive debugging (the wrapped
  * browser_* tools via contextOptions.storageState / userDataDir) and generated
  * Playwright suites (setup-project + dependencies) load.
  *
@@ -11,8 +11,9 @@
  * explicit authed read — web_fetch({ session }) — loads a captured storageState
  * into its OWN ephemeral context (separate cookie jar), so auth and the shared
  * scraping profile still never merge; only the stealth *disguise* (src/stealth.ts)
- * is shared. storageState files are secrets: mode 600, gitignored, never echoed
- * into tool output/logs.
+ * is shared. storageState files are secrets: owner-only (0o600 on POSIX, an
+ * owner-only ACL on win32 — both applied by ownerOnlyFile in src/secrets.ts,
+ * never chmod-ed here), gitignored, never echoed into tool output/logs.
  */
 
 import { spawn } from 'node:child_process';
@@ -25,7 +26,15 @@ import path from 'node:path';
 import { chromium, type Browser } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { sessionsDir, sessionFilePath, getSecret } from '../secrets.js';
+import {
+  sessionsDir,
+  sessionFilePath,
+  getSecret,
+  ownerOnlyDir,
+  ownerOnlyFile,
+  reassertOwnerOnly,
+  OwnerOnlyError,
+} from '../secrets.js';
 import { storageStateDomains, wrapUntrusted } from '../exfil.js';
 import { bindSession } from '../upstream.js';
 import {
@@ -154,6 +163,52 @@ const DEFAULT_SELECTORS = {
   submit: 'button[type="submit"], input[type="submit"], button',
 };
 
+/**
+ * Create and restrict the sessions directory before a capture writes into it.
+ * Runs BEFORE the write, so a failure leaves nothing behind. On win32 the dir's
+ * inheritable owner-only ACL also means the artifact is owner-only from its
+ * first byte, not only after restrictCapturedArtifact runs. A mkdir failure
+ * propagates untouched, exactly as before; only the win32 ACL failure is
+ * reworded to say the capture was abandoned.
+ */
+function prepareSessionsDir(): void {
+  try {
+    ownerOnlyDir(sessionsDir());
+  } catch (err) {
+    if (!(err instanceof OwnerOnlyError)) throw err;
+    throw new Error(`session not saved — ${err.message}. Nothing was written.`);
+  }
+}
+
+/**
+ * Restrict a just-captured artifact to the owning account, or DELETE it and fail
+ * the capture. FAIL LOUD, the same ethos as the SPA truth gate in sessionLogin:
+ * never leave a bad artifact behind. A session file another account can read is
+ * an impersonation credential handed to that account, and `ok:true` over it is
+ * the silent failure this module refuses everywhere else. Returns the truthful
+ * descriptor for the "saved session" log line.
+ */
+function restrictCapturedArtifact(out: string): string {
+  try {
+    return ownerOnlyFile(out);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    try {
+      fs.rmSync(out, { force: true });
+    } catch (rmErr) {
+      throw new Error(
+        `session not saved — the captured file could not be restricted to your account (${why}), and ` +
+          `deleting it ALSO failed (${rmErr instanceof Error ? rmErr.message : String(rmErr)}). ` +
+          `Delete ${out} by hand: it holds live session cookies.`,
+      );
+    }
+    throw new Error(
+      `session not saved — the captured file could not be restricted to your account (${why}), ` +
+        'so it was deleted rather than left readable by others.',
+    );
+  }
+}
+
 export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   const mode: 'headless' | 'headed' = opts.headed ? 'headed' : 'headless';
   const out = sessionFilePath(opts.name);
@@ -234,9 +289,9 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       );
     }
 
-    fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+    prepareSessionsDir();
     await context.storageState({ path: out });
-    fs.chmodSync(out, 0o600); // secret: never world-readable
+    const restriction = restrictCapturedArtifact(out); // secret: never readable by another account
 
     // SPA truth gate. When the login completed with NO caller marker and the URL never
     // left the login page (the same-origin SPA path), a live-probe hit on a strong auth
@@ -266,7 +321,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     }
 
     const hosts = [...new Set(gained.map((c) => (c.domain ?? '').replace(/^\./, '')))].filter(Boolean);
-    log(`saved session "${opts.name}" → ${out} (mode 600; ${gained.length} new cookies on ${hosts.join(', ')})`);
+    log(`saved session "${opts.name}" → ${out} (${restriction}; ${gained.length} new cookies on ${hosts.join(', ')})`);
     return {
       name: opts.name,
       path: out,
@@ -992,7 +1047,17 @@ function readRegistry(): AttachRec[] {
 }
 function writeRegistry(recs: AttachRec[]): void {
   try {
-    fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+    try {
+      ownerOnlyDir(sessionsDir());
+    } catch (err) {
+      // The registry holds pids and temp-profile paths, not a secret, and losing
+      // it is what leaks an orphaned Chrome — so an ACL failure here (win32 only;
+      // NOT VERIFIED ON WINDOWS) warns and still writes. No secret lands in the
+      // unrestricted dir because every capture re-restricts it and fails loud.
+      // A mkdir failure is not an OwnerOnlyError and ends here as it always did.
+      if (!(err instanceof OwnerOnlyError)) throw err;
+      log(`warning: ${err.message} — writing the attach-chrome registry anyway (it holds no secret)`);
+    }
     fs.writeFileSync(registryPath(), JSON.stringify(recs));
   } catch {
     /* best effort */
@@ -1091,12 +1156,12 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       );
     }
 
-    fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+    prepareSessionsDir();
     fs.writeFileSync(out, JSON.stringify(state));
-    fs.chmodSync(out, 0o600);
+    const restriction = restrictCapturedArtifact(out);
     const kind = opts.challenge ? 'challenge' : 'attach';
     log(
-      `saved session "${opts.name}" → ${out} (mode 600, ${kind}${prof.scope ? ', domain-scoped' : ''}, ` +
+      `saved session "${opts.name}" → ${out} (${restriction}, ${kind}${prof.scope ? ', domain-scoped' : ''}, ` +
         `${state.cookies?.length ?? 0} cookies)`,
     );
     // Only challenge captures get clearance telemetry — for a login the meaningful
@@ -1487,7 +1552,7 @@ export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> 
       // forward on every probe instead of aging toward its capture-time expiry.
       try {
         await context.storageState({ path: file });
-        fs.chmodSync(file, 0o600);
+        reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
       } catch {
         /* best-effort; the verdict stands either way */
       }
