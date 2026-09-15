@@ -28,7 +28,8 @@ const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `pwmcp-${name}-`));
 // (2026-09-14). Checked both bound and unbound, since both launch the same browser.
 test('upstreamConfig: browser_* launches with the shared stealth disguise, bound or not', () => {
   const prev = process.env.XDG_CACHE_HOME;
-  process.env.XDG_CACHE_HOME = tmp('cache');
+  const cacheDir = tmp('cache');
+  process.env.XDG_CACHE_HOME = cacheDir;
   try {
     for (const storageState of [undefined, '/nonexistent/session.json']) {
       const b = upstreamConfig(storageState).browser;
@@ -44,6 +45,7 @@ test('upstreamConfig: browser_* launches with the shared stealth disguise, bound
   } finally {
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
   }
 });
 
