@@ -30,7 +30,7 @@ import { secretInventory } from './secrets.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
-import { initUpstream, getUpstream, closeUpstream, boundSession } from './upstream.js';
+import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser } from './upstream.js';
 
 const VERSION = '0.3.0';
 
@@ -472,6 +472,8 @@ export function createOutwardServer(
       }
 
       const result = await upstreamOf().callTool({ name, arguments: args ?? {} });
+      // Upstream's browser_close drops its hold on the browser but not the browser.
+      if (name === 'browser_close') await releaseBrowser();
       return withUntrustedNotice(withSessionBanner(result, boundSession(), remote), name);
     } catch (err) {
       return {

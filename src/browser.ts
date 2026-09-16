@@ -15,7 +15,8 @@
  * STABLE dir and its cookie/reputation continuity, not just whoever launched
  * first. This profile carries no identity (auth lives in session_* storageState
  * artifacts, see stealth.ts), so per-instance isolation costs nothing but that
- * continuity — which is exactly what the pool preserves.
+ * continuity — which is exactly what the pool preserves. The browser_* browser
+ * draws from its own pool by the same mechanism (`launchOnPool`).
  *
  * Stealth layer is manual only — NO playwright-extra/stealth plugin (it wraps
  * Playwright and is a dedupe/compat hazard against the exact-pinned playwright
@@ -38,43 +39,63 @@ const log = (...args: unknown[]) => console.error('[playwright-mcp:browser]', ..
 /** How many persistent pool slots to try before the pid-keyed temp fallback. */
 const PROFILE_POOL_SIZE = 8;
 
-/** Marks the temp profiles this module creates, so the reaper can recognize them. */
-const TEMP_PROFILE_MARK = 'pwmcp-fetch-';
-
 /**
- * An explicit override wins so a SECOND instance (e.g. the krull-web-broker's
- * dedicated HTTP host instance running alongside a Claude Code stdio instance)
- * can be pinned to its own persistent profile: one dir, no pool, no fallback.
+ * One family of pooled profiles. Two exist: web_fetch's stealth profiles, and the
+ * wrapped @playwright/mcp browser that drives browser_* (src/upstream.ts, which
+ * defines that pool). They are separate pools on purpose — a login clicked
+ * through in browser_* must not ride along on stealth fetches — but they share
+ * every rule below.
  */
-const profileOverride = (): string | undefined => process.env.PLAYWRIGHT_MCP_PROFILE_DIR;
+export interface ProfilePool {
+  /** Slot 1's dir, resolved on every call; slots 2..N are `<slot 1>-2` and up. */
+  slot1: () => string;
+  /** Prefix of the pid-keyed temp fallback. Also how the reaper recognizes it. */
+  tempMark: string;
+  /** Put between the mark and the pid in the temp dir's name (e.g. a workspace key). */
+  tempKey?: () => string;
+  /** A dir pinned from the environment: one dir, no pool, no fallback. */
+  override?: () => string | undefined;
+}
 
-/**
- * The pool candidates, best first: slot 1 is the historical `profile` dir (so a
- * single instance keeps the reputation it already accumulated), slots 2..N are
- * its numbered siblings. Read from the environment on every call — the cache
- * root is not fixed for the life of the process.
- */
-function profilePool(): string[] {
-  const base = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache');
-  const first = path.join(base, 'playwright-mcp', 'profile');
+export const FETCH_POOL: ProfilePool = {
+  /**
+   * Slot 1 is the historical `profile` dir, so a single instance keeps the
+   * reputation it already accumulated. Read from the environment on every call —
+   * the cache root is not fixed for the life of the process.
+   */
+  slot1: () =>
+    path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'playwright-mcp', 'profile'),
+  tempMark: 'pwmcp-fetch-',
+  /**
+   * An explicit override wins so a SECOND instance (e.g. the krull-web-broker's
+   * dedicated HTTP host instance running alongside a Claude Code stdio instance)
+   * can be pinned to its own persistent profile: one dir, no pool, no fallback.
+   */
+  override: () => process.env.PLAYWRIGHT_MCP_PROFILE_DIR,
+};
+
+/** The pool candidates, best first: slot 1, then its numbered siblings. */
+function profilePool(pool: ProfilePool): string[] {
+  const first = pool.slot1();
   return [first, ...Array.from({ length: PROFILE_POOL_SIZE - 1 }, (_, i) => `${first}-${i + 2}`)];
 }
 
 /** Last resort when every pool slot is held: unique by construction, so it cannot collide. */
-const tempProfileDir = (): string => path.join(os.tmpdir(), `${TEMP_PROFILE_MARK}${process.pid}`);
+const tempProfileDir = (pool: ProfilePool): string =>
+  path.join(os.tmpdir(), `${pool.tempMark}${pool.tempKey?.() ?? ''}${process.pid}`);
 
 /**
  * Pick the profile dir to launch on. Pure — it only reads locks; making a stale
- * slot usable is `launch()`'s pre-clear, unchanged.
+ * slot usable is `launchOnPool()`'s pre-clear.
  *
  * A stale lock does NOT count as occupied: that slot is recoverable and stays
  * preferred over a lower-reputation one further down the pool.
  */
-function selectProfile(): string {
-  const override = profileOverride();
+function selectProfile(pool: ProfilePool): string {
+  const override = pool.override?.();
   if (override) return override;
-  for (const dir of profilePool()) if (!isOccupied(dir)) return dir;
-  const temp = tempProfileDir();
+  for (const dir of profilePool(pool)) if (!isOccupied(dir)) return dir;
+  const temp = tempProfileDir(pool);
   log(`all ${PROFILE_POOL_SIZE} pooled profiles are in use — falling back to ${temp}`);
   return temp;
 }
@@ -105,29 +126,7 @@ export async function getStealthContext(): Promise<BrowserContext> {
 }
 
 async function launch(): Promise<BrowserContext> {
-  reapOrphanTempProfiles();
-  let dir = selectProfile();
-  clearStaleSingletons(dir);
-  let context: BrowserContext;
-  try {
-    context = await openProfile(dir);
-  } catch (err) {
-    // A chrome that dies without cleaning up leaves its singleton files behind
-    // and every later launch refuses the profile. If the lock went stale during
-    // this launch, clear it and retry once rather than making the user delete
-    // files by hand.
-    if (clearStaleSingletons(dir)) {
-      log('retrying launch after clearing a stale profile lock');
-      context = await openProfile(dir);
-    } else if (!profileOverride() && isOccupied(dir)) {
-      // Lost a start-up race: a sibling instance took this slot between the
-      // occupancy check and the launch. Re-select once — contention must never
-      // hard-fail a fetch. An override is pinned to its one dir and still throws.
-      dir = selectProfile();
-      log(`profile was taken mid-launch — retrying on ${dir}`);
-      context = await openProfile(dir);
-    } else throw err;
-  }
+  const { context, dir } = await launchOnPool(FETCH_POOL, openProfile);
   liveContext = context;
   context.once('close', () => {
     if (liveContext !== context) return;
@@ -137,6 +136,77 @@ async function launch(): Promise<BrowserContext> {
   });
   log(`stealth context up (chrome/${CHROME_MAJOR}, profile=${dir})`);
   return context;
+}
+
+/**
+ * Open a persistent profile from `pool` with `open`, never hard-failing on
+ * contention: reap orphaned temp profiles, take the first free slot, and recover
+ * once from a stale lock or a slot taken mid-launch. Shared by web_fetch and the
+ * browser_* browser (src/upstream.ts), so there is one pool mechanism, not two.
+ */
+export async function launchOnPool<T>(
+  pool: ProfilePool,
+  open: (dir: string) => Promise<T>,
+): Promise<{ context: T; dir: string }> {
+  reapOrphanTempProfiles(pool);
+  let dir = claimTempProfile(pool, selectProfile(pool));
+  clearStaleSingletons(dir);
+  let context: T;
+  try {
+    context = await open(dir);
+  } catch (err) {
+    // A chrome that dies without cleaning up leaves its singleton files behind
+    // and every later launch refuses the profile. If the lock went stale during
+    // this launch, clear it and retry once rather than making the user delete
+    // files by hand.
+    if (clearStaleSingletons(dir)) {
+      log('retrying launch after clearing a stale profile lock');
+      context = await open(dir);
+    } else if (!pool.override?.() && isOccupied(dir)) {
+      // Lost a start-up race: a sibling instance took this slot between the
+      // occupancy check and the launch. Re-select once — contention must never
+      // hard-fail a fetch. An override is pinned to its one dir and still throws.
+      dir = claimTempProfile(pool, selectProfile(pool));
+      log(`profile was taken mid-launch — retrying on ${dir}`);
+      context = await open(dir);
+    } else throw err;
+  }
+  return { context, dir };
+}
+
+/**
+ * Make sure a temp fallback profile is a private dir of this user before chrome
+ * writes into it. Pooled slots live under the user's own cache dir; the temp
+ * fallback lives in the shared os.tmpdir() under a guessable name (mark,
+ * workspace hash, pid). Chrome creates a missing profile dir 0700, but it takes
+ * an EXISTING path as it finds it — a dir another local user made, or a symlink
+ * to one — and a browser_* profile holds whatever logins the model clicked
+ * through. So the dir is created here, 0700 and non-recursive, and a pre-existing
+ * one is used only when it is a real dir (not a symlink) owned by this uid with
+ * no group/other bits. Anything else fails the launch loudly rather than writing
+ * a profile somewhere another account controls. Other dirs pass through as-is.
+ * win32: os.tmpdir() is the per-user %TEMP% and there is no uid or mode to read,
+ * so only the symlink check applies. NOT VERIFIED ON WINDOWS.
+ */
+function claimTempProfile(pool: ProfilePool, dir: string): string {
+  if (dir !== tempProfileDir(pool)) return dir;
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 });
+    return dir;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  }
+  const st = fs.lstatSync(dir);
+  const posix = process.platform !== 'win32';
+  const uid = process.getuid?.();
+  const ours =
+    st.isDirectory() &&
+    (!posix || ((uid === undefined || st.uid === uid) && (st.mode & 0o077) === 0));
+  if (!ours)
+    throw new Error(
+      `refusing temp profile ${dir}: it already exists and is not a private directory owned by this user`,
+    );
+  return dir;
 }
 
 async function openProfile(dir: string): Promise<BrowserContext> {
@@ -240,15 +310,15 @@ export function lockfileState(dir: string, probe: (file: string) => void = openF
 }
 
 /**
- * Reap pid-keyed temp profiles left behind by an instance that was killed before
- * `closeBrowser()` could run. Follows the reap pattern in tools/session.ts: only
- * MARK-ed dirs are eligible and an owner that might still be alive is never
- * touched — here the dir name IS the record (the pid is in it), so there is no
- * registry file to keep in sync, and no process to kill: the browser is this
- * module's own Playwright child, which dies with it. Pooled profiles are
- * persistent and are never reaped.
+ * Reap `pool`'s pid-keyed temp profiles (any workspace's) left behind by an
+ * instance that was killed before `closeBrowser()` or `closeUpstream()` could
+ * run. Follows the reap pattern in tools/session.ts: only MARK-ed dirs are eligible and an owner
+ * that might still be alive is never touched — here the dir name IS the record
+ * (the pid is in it), so there is no registry file to keep in sync, and no
+ * process to kill: the browser is this module's own Playwright child, which dies
+ * with it. Pooled profiles are persistent and are never reaped.
  */
-function reapOrphanTempProfiles(): void {
+function reapOrphanTempProfiles(pool: ProfilePool): void {
   let entries: string[];
   try {
     entries = fs.readdirSync(os.tmpdir());
@@ -256,8 +326,8 @@ function reapOrphanTempProfiles(): void {
     return; // no readable tmpdir — nothing to reap
   }
   for (const name of entries) {
-    if (!name.startsWith(TEMP_PROFILE_MARK)) continue;
-    const pid = Number(name.slice(TEMP_PROFILE_MARK.length));
+    if (!name.startsWith(pool.tempMark)) continue;
+    const pid = Number(name.slice(name.lastIndexOf('-') + 1)); // the pid is always last
     if (!Number.isInteger(pid) || pid <= 0) continue;
     if (pid === process.pid || pidAlive(pid)) continue; // owner may still be running
     const dir = path.join(os.tmpdir(), name);
@@ -304,8 +374,13 @@ export async function closeBrowser(): Promise<void> {
   ctxPromise = undefined;
   liveContext = undefined;
   if (pending) await pending.then((ctx) => ctx.close()).catch(() => {});
+  dropTempProfile(FETCH_POOL);
+}
+
+/** Remove this process's temp fallback profile for `pool`, if one was ever made. */
+export function dropTempProfile(pool: ProfilePool): void {
   try {
-    fs.rmSync(tempProfileDir(), { recursive: true, force: true });
+    fs.rmSync(tempProfileDir(pool), { recursive: true, force: true });
   } catch {
     /* best effort */
   }

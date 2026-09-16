@@ -84,6 +84,8 @@ after(() => {
   if (savedOverride === undefined) delete process.env.PLAYWRIGHT_MCP_PROFILE_DIR;
   else process.env.PLAYWRIGHT_MCP_PROFILE_DIR = savedOverride;
   for (const dir of fixtures) fs.rmSync(dir, { recursive: true, force: true });
+  // The temp fallback is now created (0700) before launch; it is pid-keyed, so ours.
+  fs.rmSync(path.join(os.tmpdir(), `pwmcp-fetch-${process.pid}`), { recursive: true, force: true });
 });
 
 // ── fixtures ─────────────────────────────────────────────────────────────────

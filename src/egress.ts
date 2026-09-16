@@ -9,16 +9,17 @@
  *
  * Active ONLY when the process runs as a remote instance (PLAYWRIGHT_MCP_PUBLIC_URL
  * set) — a local stdio instance is unrestricted, so debugging localhost dev
- * servers keeps working. Covers web_fetch (which we fully control); the wrapped
- * @playwright/mcp browser_* tools are covered via network.blockedOrigins in
- * index.ts plus the OS-level block.
+ * servers keeps working. Covers web_fetch's page (installEgressGuard) and the
+ * browser_* browser, whose context this server launches (installContextEgressGuard,
+ * called from src/upstream.ts), plus @playwright/mcp's own network.blockedOrigins
+ * as a second, coarser layer. The OS-level block stays primary.
  *
  * Never log to stdout (MCP stdio stream).
  */
 
 import net from 'node:net';
 import dns from 'node:dns/promises';
-import type { Page } from 'playwright';
+import type { BrowserContext, Page, Route } from 'playwright';
 
 export class EgressBlockedError extends Error {}
 
@@ -27,30 +28,55 @@ export function egressRestricted(): boolean {
   return !!process.env.PLAYWRIGHT_MCP_PUBLIC_URL;
 }
 
+const range = (from: number, to: number): string =>
+  Array.from({ length: to - from + 1 }, (_, i) => from + i).join(',');
+
 /**
- * Origin patterns for @playwright/mcp's network.blockedOrigins (wrapped browser_*
- * tools). Host-pattern based — a coarse backstop; literal private IPs + the
- * metadata endpoint + localhost. RFC1918 is enumerated as far as patterns allow;
- * the OS-level egress block is the complete control.
+ * Host globs for @playwright/mcp's network.blockedOrigins (wrapped browser_*
+ * tools): a coarse second layer under installContextEgressGuard. The OS-level
+ * egress block is the complete control.
+ *
+ * The FORMAT is upstream's, not a URL pattern. Its `originOrHostGlob`
+ * (playwright-core tools/backend/context.ts) turns an entry into a route glob:
+ *   - `http(s)://host:*`           → `http(s)://host:*` + `/**`
+ *   - anything `new URL()` gives a real origin → `<origin>/**`
+ *   - everything else (a bare host) → `*://<entry>/**`
+ * The glob's `*` is `[^/]*` and `{a,b}` is alternation. So an entry is a BARE
+ * host glob. The previous list was written as `*://127.0.0.1`, which is not an
+ * origin, so it became `*://*://127.0.0.1/**` and matched no URL at all (DEC-2026-
+ * 09-16-remote-egress-block-matched-nothing). A host glob ends at the `/` after
+ * the host, so an exact host needs a `:*` twin to also match a URL with a port;
+ * a glob that already ends in `*` covers the port by itself.
+ * scripts/test-browser-egress.mjs checks this list through upstream's own code.
  */
 export const BLOCKED_ORIGIN_PATTERNS: string[] = [
-  '*://169.254.169.254',
-  '*://metadata.google.internal',
-  '*://localhost',
-  '*://127.0.0.1',
-  '*://[::1]',
-  '*://10.*',
-  '*://192.168.*',
-  '*://172.16.*', '*://172.17.*', '*://172.18.*', '*://172.19.*',
-  '*://172.20.*', '*://172.21.*', '*://172.22.*', '*://172.23.*',
-  '*://172.24.*', '*://172.25.*', '*://172.26.*', '*://172.27.*',
-  '*://172.28.*', '*://172.29.*', '*://172.30.*', '*://172.31.*',
+  // exact hosts, with and without a port
+  ...['localhost', '[::1]', '[::]'].flatMap((h) => [h, `${h}:*`]),
+  // suffixes: *.localhost, *.local, *.internal (incl. metadata.google.internal)
+  ...['*.localhost', '*.local', '*.internal'].flatMap((h) => [h, `${h}:*`]),
+  // IPv4: 0/8, 10/8, 127/8, 169.254/16 (link-local + metadata), 172.16/12, 192.168/16, 100.64/10
+  '0.*',
+  '10.*',
+  '127.*',
+  '169.254.*',
+  `172.{${range(16, 31)}}.*`,
+  '192.168.*',
+  `100.{${range(64, 127)}}.*`,
+  // IPv6: ULA fc00::/7 (incl. fd00:ec2::254), link-local fe80::/10, IPv4-mapped
+  '[fc*',
+  '[fd*',
+  '[fe8*',
+  '[fe9*',
+  '[fea*',
+  '[feb*',
+  '[::ffff:*',
 ];
 
 const BLOCKED_SUFFIXES = ['.localhost', '.internal', '.local'];
 
 function normalizeHost(host: string): string {
-  return host.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  // A trailing dot is the same name to DNS (`localhost.`), so it must not slip past.
+  return host.toLowerCase().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
 }
 
 /** Block a literal IP in a private/loopback/link-local/metadata range. */
@@ -81,6 +107,12 @@ function isBlockedIpv6(ip: string): boolean {
   // IPv4-mapped (::ffff:a.b.c.d) — check the embedded v4.
   const mapped = v.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (mapped) return isBlockedIpv4(mapped[1]);
+  // The same, as a URL parser writes it: `[::ffff:127.0.0.1]` becomes `[::ffff:7f00:1]`.
+  const hex = v.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const n = (parseInt(hex[1], 16) << 16) | parseInt(hex[2], 16);
+    return isBlockedIpv4([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'));
+  }
   const head = v.split(':')[0] ?? '';
   if (head.startsWith('fe8') || head.startsWith('fe9') || head.startsWith('fea') || head.startsWith('feb')) return true; // fe80::/10
   if (head.startsWith('fc') || head.startsWith('fd')) return true; // fc00::/7 ULA
@@ -166,11 +198,10 @@ export interface EgressGuardHandle {
  * would pass a sync check that the same hostname fails as an initial URL — the
  * DNS-TOCTOU asymmetry the catalog names.
  *
- * SCOPE, stated so it is not overread: this covers web_fetch's OWN page only.
- * The upstream `browser_*` tools drive a page this server holds no handle to;
- * their coverage is `network.blockedOrigins` plus, primarily, the OS-level
- * nftables egress block (docs/REMOTE-CONNECTOR.md §6). This is defence in depth
- * on the in-process backstop.
+ * SCOPE, stated so it is not overread: this covers web_fetch's OWN page. The
+ * browser_* browser gets the same layers context-wide from
+ * `installContextEgressGuard` below. Both are defence in depth; the OS-level
+ * nftables egress block (docs/REMOTE-CONNECTOR.md §6) is the primary control.
  *
  * Called only under `egressRestricted()` (see fetchUrl), so a local stdio
  * instance never installs it and localhost dev-server debugging is untouched.
@@ -181,34 +212,129 @@ export async function installEgressGuard(
 ): Promise<EgressGuardHandle> {
   const validate = opts.validate ?? assertEgressAllowed;
   let blocked: string | null = null;
+  const onBlocked = (reason: string) => {
+    blocked ??= reason;
+  };
 
-  await page.route('**/*', (route) => {
-    let host = '';
+  await page.route('**/*', (route) => subResourceGuard(route));
+  await installDocumentGuard(page, validate, onBlocked);
+
+  return { blocked: () => blocked };
+}
+
+/**
+ * The egress guard for a whole browser context: the browser_* browser, which
+ * src/upstream.ts launches and hands to @playwright/mcp. Holding the context is
+ * what makes this possible at all; before that, upstream launched the browser and
+ * this server had no handle on its pages.
+ *
+ * 1. A BROWSER-level CDP `Fetch` session pauses EVERY request, of every type, at
+ *    the request stage, redirect hops included, and runs the DNS-aware
+ *    validator on it (a hostname that resolves to a private address is refused).
+ *    Measured on real chrome, both narrower shapes leaked:
+ *    - per-page sessions attach after the page exists, and a `newPage()` +
+ *      `goto` raced ahead: a 302 from a public host into 127.0.0.1 was served;
+ *    - documents-only let a page's own `fetch('/redir')` follow a 302 into
+ *      127.0.0.1 and read the response.
+ *    The browser session is in place before any page is. This browser serves
+ *    only this context (src/upstream.ts launches one per context), so it guards
+ *    nothing else. Verdicts are cached per host for a short time so a page with
+ *    many sub-resources does not resolve the same name each time.
+ * 2. `context.route` repeats the sync host check on every request (no DNS), so a
+ *    literal private address is refused even before CDP sees it.
+ * 3. WebSockets, which neither layer sees, are routed and validated DNS-aware
+ *    before being connected to the server.
+ *
+ * FAIL-CLOSED, unlike web_fetch's page guard: without a browser handle or a
+ * browser CDP session this throws, and launchBrowser closes the browser rather
+ * than hand upstream an unguarded one. Refusals are logged to stderr. Called only
+ * under `egressRestricted()`.
+ */
+export async function installContextEgressGuard(
+  context: BrowserContext,
+  opts: EgressGuardOptions = {},
+): Promise<EgressGuardHandle> {
+  const validate = cachedByHost(opts.validate ?? assertEgressAllowed);
+  let blocked: string | null = null;
+  const onBlocked = (reason: string) => {
+    blocked ??= reason;
+    console.error('[playwright-mcp] egress: refused', reason);
+  };
+
+  const browser = context.browser();
+  if (!browser) throw new Error('egress guard: no browser handle for this context; refusing to run unguarded');
+  const cdp = await browser.newBrowserCDPSession();
+  cdp.on('Fetch.requestPaused', (event: unknown) => {
+    void handlePausedRequest(cdp, event as FetchRequestPaused, validate, onBlocked, { allTypes: true });
+  });
+  await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+
+  await context.route('**/*', (route) => subResourceGuard(route, onBlocked));
+
+  await context.routeWebSocket(/.*/, async (ws) => {
     try {
-      host = new URL(route.request().url()).hostname;
-    } catch {
-      /* fall through to continue */
-    }
-    if (host && isBlockedHostSync(host)) {
-      void route.abort('blockedbyclient');
+      await validate(ws.url());
+    } catch (err) {
+      onBlocked(`WebSocket ${err instanceof Error ? err.message : String(err)}`);
+      await ws.close({ code: 1008, reason: 'blocked by egress policy' }).catch(() => {});
       return;
     }
-    void route.continue();
+    ws.connectToServer();
   });
 
+  return { blocked: () => blocked };
+}
+
+/** How long a host's verdict is reused (see installContextEgressGuard). */
+const VERDICT_TTL_MS = 30_000;
+
+/**
+ * Reuse a validator's verdict for the same host for VERDICT_TTL_MS. Keyed on the
+ * hostname because that is all assertEgressAllowed looks at; an unparseable URL
+ * is never cached and goes straight to the validator, which refuses it.
+ */
+function cachedByHost(validate: (url: string) => Promise<void>): (url: string) => Promise<void> {
+  const verdicts = new Map<string, { at: number; verdict: Promise<void> }>();
+  return (url) => {
+    let host: string;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      return validate(url);
+    }
+    const hit = verdicts.get(host);
+    if (hit && Date.now() - hit.at < VERDICT_TTL_MS) return hit.verdict;
+    const verdict = validate(url);
+    verdict.catch(() => {}); // observed by every caller; never an unhandled rejection
+    verdicts.set(host, { at: Date.now(), verdict });
+    return verdict;
+  };
+}
+
+/** Sync route check for a non-document request: abort a blocked host, continue the rest. */
+function subResourceGuard(route: Route, onBlocked?: (reason: string) => void): void {
+  let host = '';
   try {
-    const cdp = await page.context().newCDPSession(page);
-    cdp.on('Fetch.requestPaused', (event: unknown) => {
-      const e = event as FetchRequestPaused;
-      void handlePausedRequest(cdp, e, validate, (reason) => {
-        blocked ??= reason;
-      });
-    });
-    // Documents only: sub-resources are already covered by the route above, and
-    // pausing every image through CDP would tax each fetch for nothing.
-    await cdp.send('Fetch.enable', {
-      patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }],
-    });
+    host = new URL(route.request().url()).hostname;
+  } catch {
+    /* fall through to continue */
+  }
+  if (host && isBlockedHostSync(host)) {
+    onBlocked?.(`blocked host: ${host}`);
+    void route.abort('blockedbyclient').catch(() => {});
+    return;
+  }
+  void route.continue().catch(() => {});
+}
+
+/** CDP per-hop validation of one page's DOCUMENT requests (see installEgressGuard). */
+async function installDocumentGuard(
+  page: Page,
+  validate: (url: string) => Promise<void>,
+  onBlocked: (reason: string) => void,
+): Promise<void> {
+  try {
+    await attachDocumentGuard(await page.context().newCDPSession(page), validate, onBlocked);
   } catch (err) {
     // A browser that will not give up a CDP session still gets the sub-resource
     // route above; degrade to the previous coverage rather than failing the
@@ -221,8 +347,22 @@ export async function installEgressGuard(
       err instanceof Error ? err.message : String(err),
     );
   }
+}
 
-  return { blocked: () => blocked };
+/** Pause and validate every DOCUMENT request seen by one CDP session (page- or browser-level). */
+async function attachDocumentGuard(
+  cdp: CdpLike & { on(event: string, fn: (e: unknown) => void): unknown },
+  validate: (url: string) => Promise<void>,
+  onBlocked: (reason: string) => void,
+): Promise<void> {
+  cdp.on('Fetch.requestPaused', (event: unknown) => {
+    void handlePausedRequest(cdp, event as FetchRequestPaused, validate, onBlocked);
+  });
+  // Documents only: sub-resources are already covered by the route layer, and
+  // pausing every image through CDP would tax each request for nothing.
+  await cdp.send('Fetch.enable', {
+    patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }],
+  });
 }
 
 /** The slice of CDP's Fetch.requestPaused payload this guard reads. */
@@ -239,17 +379,19 @@ interface CdpLike {
 
 /**
  * Validate one paused request and let it through, or fail it before it leaves.
- * Only documents are validated; a paused non-document (there should be none,
- * given the pattern) is continued rather than silently dropped.
+ * By default only documents are validated (web_fetch's page guard pauses only
+ * documents; a stray non-document is continued rather than silently dropped).
+ * `allTypes` validates everything, for the browser_* context guard.
  */
 async function handlePausedRequest(
   cdp: CdpLike,
   e: FetchRequestPaused,
   validate: (url: string) => Promise<void>,
   onBlocked: (reason: string) => void,
+  { allTypes = false }: { allTypes?: boolean } = {},
 ): Promise<void> {
   const url = e.request?.url ?? '';
-  if (e.resourceType === 'Document' && url) {
+  if ((allTypes || e.resourceType === 'Document') && url) {
     try {
       await validate(url);
     } catch (err) {

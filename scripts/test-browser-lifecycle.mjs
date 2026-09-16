@@ -16,7 +16,7 @@ import path from 'node:path';
 
 import { getStealthContext, closeBrowser, isStaleLock } from '../dist/browser.js';
 import { fetchUrl } from '../dist/tools/web-fetch.js';
-import { upstreamConfig } from '../dist/upstream.js';
+import { upstreamConfig, upstreamLaunch } from '../dist/upstream.js';
 import { STEALTH_ARGS, STEALTH_INIT, STEALTH_UA } from '../dist/stealth.js';
 import { symlinkSkipReason } from './fixtures/platform.mjs';
 
@@ -39,16 +39,16 @@ test('upstreamConfig: browser_* launches with the shared stealth disguise, bound
   process.env.XDG_CACHE_HOME = cacheDir;
   try {
     for (const storageState of [undefined, '/nonexistent/session.json']) {
-      const b = upstreamConfig(storageState).browser;
-      for (const arg of STEALTH_ARGS) assert.ok(b.launchOptions.args?.includes(arg), `launch arg ${arg}`);
-      assert.equal(b.contextOptions?.userAgent, STEALTH_UA, 'real-Chrome UA, not HeadlessChrome');
-      assert.equal(b.initScript?.length, 1, 'one init script');
-      assert.equal(fs.readFileSync(b.initScript[0], 'utf8'), STEALTH_INIT, 'init script file holds STEALTH_INIT');
-      if (storageState) {
-        assert.equal(b.contextOptions.storageState, storageState, 'bound session still seeds the context');
-        assert.equal(b.isolated, true);
-      }
+      const { launchOptions, contextOptions } = upstreamLaunch(storageState);
+      for (const arg of STEALTH_ARGS) assert.ok(launchOptions.args?.includes(arg), `launch arg ${arg}`);
+      assert.equal(contextOptions.userAgent, STEALTH_UA, 'real-Chrome UA, not HeadlessChrome');
+      assert.equal(contextOptions.storageState, storageState, 'a bound session seeds the context; unbound has none');
     }
+    // The init script is the one piece upstream still applies itself, to the
+    // context our getter hands it (DEF-Q-17: the launch is ours now).
+    const b = upstreamConfig().browser;
+    assert.equal(b.initScript?.length, 1, 'one init script');
+    assert.equal(fs.readFileSync(b.initScript[0], 'utf8'), STEALTH_INIT, 'init script file holds STEALTH_INIT');
   } finally {
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
