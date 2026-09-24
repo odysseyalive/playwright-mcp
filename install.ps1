@@ -1,19 +1,17 @@
 ﻿# install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
 # Builds the server, downloads Chromium, registers it at USER scope with Claude
-# Code and Codex, and applies the WebFetch/claude-in-chrome override automatically,
-# printing a diff of what it changes. Native WebSearch stays enabled. Idempotent +
+# Code and Codex, and appends a steering note to ~\.claude\CLAUDE.md (once —
+# guarded by a marker). It never changes ~\.claude\settings.json. Idempotent +
 # non-interactive: safe to re-run, never prompts. Opt out of the global-config
-# edits with -NoDeny / -NoSteer.
+# edit with -NoSteer.
 #
 #   .\install.ps1            run (non-interactive)
-#   .\install.ps1 -NoDeny    skip the settings.json deny override
 #   .\install.ps1 -NoSteer   skip the CLAUDE.md steering directive
 #   .\install.ps1 -Yes       accepted but no longer needed (back-compat no-op)
 #
 param(
   [switch]$Yes,     # back-compat no-op: the installer no longer prompts
-  [switch]$NoDeny,
   [switch]$NoSteer
 )
 $ErrorActionPreference = 'Stop'
@@ -87,25 +85,7 @@ if ($hasCodex) {
   Write-Host "    codex mcp add playwright-mcp -- node `"$entry`""
 }
 
-# ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────
-$settings = Join-Path $env:USERPROFILE ".claude\settings.json"
-if (-not $NoDeny) {
-  Say "Applying WebFetch/claude-in-chrome override for $settings"
-  New-Item -ItemType Directory -Force -Path (Split-Path $settings) | Out-Null
-  if (-not (Test-Path $settings)) { '{}' | Set-Content -Encoding utf8 $settings }
-  $preview = node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --print
-  if (-not $preview) {
-    Say "Deny rules already present — nothing to change."
-  } else {
-    Write-Host "----- applying this change to settings.json (your other settings untouched) -----"
-    Write-Host $preview
-    Write-Host "---------------------------------------------------------------------------------"
-    node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --write
-    Say "Applied. WebFetch + claude-in-chrome are now denied; native WebSearch stays enabled."
-  }
-}
-
-# ── 6. Steering directive (optional) ──────────────────────────────────────────
+# ── 5. Steering directive (optional) ──────────────────────────────────────────
 $userClaudeMd = Join-Path $env:USERPROFILE ".claude\CLAUDE.md"
 if (-not $NoSteer) {
   $hasMark = (Test-Path $userClaudeMd) -and (Select-String -Quiet -Path $userClaudeMd -Pattern "playwright-mcp steering")
@@ -136,6 +116,3 @@ screenshots and files at the end of every debug session.
 }
 
 Say "Done. Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."
-Write-Host ""
-Write-Host "To temporarily re-enable the Chrome extension for a session, remove"
-Write-Host "`"mcp__claude-in-chrome`" from the deny array in $settings."

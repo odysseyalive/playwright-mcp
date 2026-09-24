@@ -4,7 +4,7 @@ One install, every Claude Code project gets a real browser. Page fetching with c
 
 ## What it is
 
-An MCP server that wraps `@playwright/mcp` and adds nine tools of its own for page fetching, authenticated sessions, and test suites. The installer denies Claude's built-in WebFetch and the claude-in-chrome extension, so `web_fetch` becomes the only page-fetching path Claude has. The extra features just come along for free.
+An MCP server that wraps `@playwright/mcp` and adds nine tools of its own for page fetching, authenticated sessions, and test suites. Its `web_fetch` tool tells Claude it replaces the built-in WebFetch, and the optional note the installer drops into `~/.claude/CLAUDE.md` says the same thing. The extra features just come along for free.
 
 ### How it layers in
 
@@ -87,7 +87,7 @@ The bundled installer handles the whole thing. Checks Node, installs dependencie
 .\install.ps1
 ```
 
-The installer adds deny rules to `~/.claude/settings.json` that route page fetches and browser work through this server (`WebFetch` and `mcp__claude-in-chrome`). Native WebSearch stays enabled. If you're upgrading from an earlier version that denied WebSearch, the installer removes that stale deny rule for you. It also adds an optional steering note in `~/.claude/CLAUDE.md`. Skip either with `--no-deny` / `--no-steer` (PowerShell: `-NoDeny` / `-NoSteer`).
+The installer also adds an optional steering note to `~/.claude/CLAUDE.md` that tells Claude to use `web_fetch` for page fetching and playwright-mcp's `browser_*` tools for site debugging. Skip it with `--no-steer` (PowerShell: `-NoSteer`).
 
 ### Registering by hand
 

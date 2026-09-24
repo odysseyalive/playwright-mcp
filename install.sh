@@ -3,24 +3,21 @@
 # install.sh — Linux/macOS installer for playwright-mcp.
 #
 # Builds the server, downloads headless Chromium, registers the server at USER
-# scope with Claude Code (so every project gets it), and applies the
-# WebFetch/claude-in-chrome override automatically, printing a diff of what it
-# changes. Native WebFetch stays enabled. Idempotent + non-interactive: safe to
-# re-run, never prompts. Opt out of the global-config edits with --no-deny/--no-steer.
+# scope with Claude Code (so every project gets it), and appends a steering note
+# to ~/.claude/CLAUDE.md (once — guarded by a marker). It never changes
+# ~/.claude/settings.json. Idempotent + non-interactive: safe to re-run, never
+# prompts. Opt out of the global-config edit with --no-steer.
 #
 # Flags:
-#   --no-deny    skip the settings.json deny override entirely
 #   --no-steer   skip the ~/.claude/CLAUDE.md steering directive
 #   --yes        accepted but no longer needed (back-compat no-op; nothing prompts)
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DO_DENY=1
 DO_STEER=1
 for arg in "$@"; do
   case "$arg" in
-    --no-deny) DO_DENY=0 ;;
     --no-steer) DO_STEER=0 ;;
     --yes) ;;  # back-compat no-op: the installer no longer prompts
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
@@ -110,26 +107,7 @@ else
   echo "    codex mcp add playwright-mcp -- node \"$HERE/dist/index.js\""
 fi
 
-# ── 5. Override native WebFetch + claude-in-chrome ────────────────────────────
-SETTINGS="$HOME/.claude/settings.json"
-if [ "$DO_DENY" = "1" ]; then
-  say "Applying WebFetch/claude-in-chrome override for $SETTINGS"
-  mkdir -p "$HOME/.claude"
-  [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-  # Compute the merged result and a diff with Node (guaranteed present).
-  PREVIEW="$(node "$HERE/scripts/merge-deny.mjs" "$SETTINGS" --print)" || die "could not read $SETTINGS"
-  if [ -z "$PREVIEW" ]; then
-    say "Deny rules already present — nothing to change."
-  else
-    echo "----- applying this change to settings.json (your other settings untouched) -----"
-    echo "$PREVIEW"
-    echo "---------------------------------------------------------------------------------"
-    node "$HERE/scripts/merge-deny.mjs" "$SETTINGS" --write
-    say "Applied. WebFetch + claude-in-chrome are now denied; native WebSearch stays enabled."
-  fi
-fi
-
-# ── 6. Steering directive (optional) ──────────────────────────────────────────
+# ── 5. Steering directive (optional) ──────────────────────────────────────────
 USER_CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 STEER_MARK="playwright-mcp steering"
 if [ "$DO_STEER" = "1" ]; then
@@ -155,6 +133,3 @@ EOF
 fi
 
 say "Done. Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."
-echo
-echo "To temporarily re-enable the Chrome extension for a session, remove"
-echo "\"mcp__claude-in-chrome\" from the deny array in $SETTINGS."
