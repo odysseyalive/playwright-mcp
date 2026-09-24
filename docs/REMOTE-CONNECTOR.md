@@ -54,7 +54,7 @@ The full posture, including the non-fixes, is in the main
 
 ## Prerequisites
 
-- Node ≥ 18 and this repo built (`npm ci && npm run build`) on the host.
+- Node ≥ 22.13 and this repo built (`npm ci && npm run build`) on the host. If the distro's Node is too old, see [Getting a current Node.js](../README.md#getting-a-current-nodejs).
 - Chromium for Playwright installed for the service user (`npx playwright install chromium`).
 - A DNS name for the connector, e.g. `mcp.example.com`, pointed at the host.
 - nginx + certbot (jstack provides these).

@@ -27,9 +27,39 @@ Thirty-two total. Twenty-three are the wrapped `browser_*` set (navigate, snapsh
 
 ## Requirements
 
-- Node 18 or newer
+- Node 22.13 or newer
 - The Claude Code CLI (`claude`) on your PATH
 - About 170 MB for a one-time Chromium download. On Linux the installer pulls the system libraries Chromium needs too, which may ask for sudo.
+
+### Getting a current Node.js
+
+Server distros and stable Linux releases often ship a Node.js that's too old. That's fine. Any Node, however ancient, comes with npm, and npm comes with npx. So even a behind-the-times distro package gets you the bootstrap tool you need, and npx can pull in a current version from there.
+
+If the machine has no Node at all, install the distro package first. On Debian/Ubuntu that's `nodejs` and `npm`. It'll be old. That's the point.
+
+Then use the [`n`](https://github.com/tj/n) version manager through npx to install the current LTS. With root access, one line does it.
+
+```bash
+sudo npx -y n lts
+```
+
+Without root, point `n` at a directory you own and add it to your PATH.
+
+```bash
+export N_PREFIX="$HOME/.n"
+export PATH="$N_PREFIX/bin:$PATH"
+npx -y n lts
+```
+
+Add those two `export` lines to your shell profile (`~/.bashrc`, `~/.zshrc`, or similar) so they stick.
+
+Open a new shell and confirm.
+
+```bash
+node -v
+```
+
+`n` is a bash script that runs on Linux and macOS. On Windows, grab the installer from [nodejs.org](https://nodejs.org/) or use `winget install OpenJS.NodeJS.LTS`.
 
 ## Install
 

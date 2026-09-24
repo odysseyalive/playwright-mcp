@@ -31,10 +31,23 @@ say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!  \033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mERR\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ── 1. Node ≥ 18 ──────────────────────────────────────────────────────────────
-command -v node >/dev/null 2>&1 || die "Node.js is required (>=18). Install it and re-run."
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 18 ] || die "Node >=18 required; found $(node -v)."
+# ── 1. Node ≥ 22.13 ───────────────────────────────────────────────────────────
+# jsdom 29 (^20.19.0 || ^22.13.0 || >=24.0.0) and pdfjs-dist 6 (>=22.13.0 || >=24)
+# intersect at 22.13.0, and npm only WARNS on an engines mismatch — so this guard
+# is what turns a confusing runtime failure inside a PDF or DOM parse into a clear
+# install-time one. MAJOR.MINOR compare: 22.12 is rejected, 22.13 and later pass.
+# Pure function of a version string — it never reads process.versions itself.
+node_ok() {
+  local rest major minor
+  major="${1%%.*}"
+  rest="${1#*.}"
+  minor="${rest%%.*}"
+  [ "$major" -gt 22 ] || { [ "$major" -eq 22 ] && [ "$minor" -ge 13 ]; }
+}
+
+command -v node >/dev/null 2>&1 || die "Node.js is required (>=22.13.0). See \"Getting a current Node.js\" in README.md, then re-run."
+NODE_VER="$(node -p 'process.versions.node')"
+node_ok "$NODE_VER" || die "Node >=22.13.0 required; found $(node -v). See \"Getting a current Node.js\" in README.md."
 command -v claude >/dev/null 2>&1 || warn "Claude Code CLI 'claude' not found on PATH — the registration step will be skipped."
 command -v codex >/dev/null 2>&1 || warn "Codex CLI 'codex' not found on PATH — the registration step will be skipped."
 say "Node $(node -v) OK"

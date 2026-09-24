@@ -23,10 +23,22 @@ function Say  ($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn ($m) { Write-Host "!   $m" -ForegroundColor Yellow }
 function Die  ($m) { Write-Host "ERR $m" -ForegroundColor Red; exit 1 }
 
-# ── 1. Node >= 18 ─────────────────────────────────────────────────────────────
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node.js is required (>=18)." }
-$nodeMajor = [int](node -p "process.versions.node.split('.')[0]")
-if ($nodeMajor -lt 18) { Die "Node >=18 required; found $(node -v)." }
+# ── 1. Node >= 22.13 ──────────────────────────────────────────────────────────
+# jsdom 29 (^20.19.0 || ^22.13.0 || >=24.0.0) and pdfjs-dist 6 (>=22.13.0 || >=24)
+# intersect at 22.13.0, and npm only WARNS on an engines mismatch — so this guard
+# is what turns a confusing runtime failure inside a PDF or DOM parse into a clear
+# install-time one. MAJOR.MINOR compare: 22.12 is rejected, 22.13 and later pass.
+# Pure function of a version string — it never reads process.versions itself.
+# [version] is the 5.1-safe comparison; strip any 'v' prefix and prerelease tag
+# first, since [version] parses digits and dots only.
+function Test-NodeVersion ($v) {
+  $core = ($v -replace '^v', '') -replace '-.*$', ''
+  return ([version]$core -ge [version]'22.13.0')
+}
+
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node.js is required (>=22.13.0). See `"Getting a current Node.js`" in README.md." }
+$nodeVersion = (node -p "process.versions.node")
+if (-not (Test-NodeVersion $nodeVersion)) { Die "Node >=22.13.0 required; found $(node -v). See `"Getting a current Node.js`" in README.md." }
 $hasClaude = [bool](Get-Command claude -ErrorAction SilentlyContinue)
 if (-not $hasClaude) { Warn "Claude Code CLI 'claude' not found — registration step will be skipped." }
 $hasCodex = [bool](Get-Command codex -ErrorAction SilentlyContinue)
