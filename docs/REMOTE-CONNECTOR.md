@@ -54,8 +54,22 @@ The full posture, including the non-fixes, is in the main
 
 ## Prerequisites
 
-- Node ≥ 22.13 and this repo built (`npm ci && npm run build`) on the host. If the distro's Node is too old, see [Getting a current Node.js](../README.md#getting-a-current-nodejs).
-- Chromium for Playwright installed for the service user (`npx playwright install chromium`).
+- Node ≥ 22.13 and this repo built on the host. If the distro's Node is too old, see [Getting a current Node.js](../README.md#getting-a-current-nodejs).
+
+```sh
+npm ci
+```
+
+```sh
+npm run build
+```
+
+- Chromium for Playwright installed for the service user.
+
+```sh
+npx playwright install chromium
+```
+
 - A DNS name for the connector, e.g. `mcp.example.com`, pointed at the host.
 - nginx + certbot (jstack provides these).
 - A GitHub account (for the OAuth app).
@@ -141,8 +155,17 @@ WantedBy=multi-user.target
 ```
 
 ```sh
-systemctl daemon-reload && systemctl enable --now playwright-mcp-remote
-journalctl -u playwright-mcp-remote -f   # expect: "remote ... ready ... auth: on"
+systemctl daemon-reload
+```
+
+```sh
+systemctl enable --now playwright-mcp-remote
+```
+
+Confirm the service is up. Look for "remote ... ready ... auth: on" in the output.
+
+```sh
+journalctl -u playwright-mcp-remote -f
 ```
 
 The service binds **127.0.0.1:8765 only** — it is never directly reachable from
@@ -195,7 +218,15 @@ server {
 
 ```sh
 ln -s ../sites-available/mcp.example.com /etc/nginx/sites-enabled/
-certbot --nginx -d mcp.example.com        # or certonly, if you manage vhosts by hand
+```
+
+Use `certonly` instead if you manage vhosts by hand.
+
+```sh
+certbot --nginx -d mcp.example.com
+```
+
+```sh
 nginx -t && systemctl reload nginx
 ```
 
@@ -229,7 +260,11 @@ nginx -t && systemctl reload nginx
 
 ```sh
 chmod 755 /usr/local/sbin/refresh-anthropic-allowlist.sh
-# run once now, then daily via cron/timer:
+```
+
+Run it once now, then set up a daily cron job.
+
+```sh
 echo '17 4 * * * root /usr/local/sbin/refresh-anthropic-allowlist.sh' > /etc/cron.d/anthropic-allowlist
 ```
 
@@ -279,17 +314,28 @@ while still allowing it to fetch public sites and reach GitHub over TLS.
 
 ## 8. Verification checklist
 
-- `journalctl -u playwright-mcp-remote` shows `auth: on` and `ready`.
-- `curl https://mcp.example.com/.well-known/oauth-authorization-server` returns
-  JSON with `issuer` = your public URL (from an allowlisted IP), and
-  `authorization_response_iss_parameter_supported: true` — the RFC 9207 flag from
-  MCP spec 2026-07-28. If that field is missing, an old build is running.
-- `curl -X POST https://mcp.example.com/mcp` (no token) → `401` with a
-  `WWW-Authenticate: Bearer …` header.
+Confirm the service shows `auth: on` and `ready`.
+
+```sh
+journalctl -u playwright-mcp-remote
+```
+
+From an allowlisted IP, confirm the response includes `issuer` set to your public URL and `authorization_response_iss_parameter_supported: true` (the RFC 9207 flag from MCP spec 2026-07-28). If that field is missing, an old build is running.
+
+```sh
+curl https://mcp.example.com/.well-known/oauth-authorization-server
+```
+
+Without a token, this should return `401` with a `WWW-Authenticate: Bearer …` header.
+
+```sh
+curl -X POST https://mcp.example.com/mcp
+```
+
 - In claude.ai, the connector lists `web_fetch` + browser tools but **not**
   `browser_run_code_unsafe` / `session_login`.
 - A page fetch of `http://169.254.169.254/` or a localhost URL fails (egress
-  block) — confirm the firewall is doing its job.
+  block). Confirm the firewall is doing its job.
 
 The deterministic half of all this is covered by `npm test`
 (`scripts/test-remote.mjs`): denylist, OAuth metadata/DCR/redirect/401, the RFC

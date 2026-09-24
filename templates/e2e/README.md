@@ -26,6 +26,9 @@ Capture (including headed 2FA/SSO, which a test runner cannot do) belongs to the
 
 ```bash
 npm install -D @playwright/test
+```
+
+```bash
 npx playwright install chromium
 ```
 
@@ -35,6 +38,9 @@ Use the playwright-mcp tools from Claude Code:
 
 ```
 session_login({ name: "<name>", loginUrl: "<login URL>", successSignal: "<post-login selector or URL>", headed: true })
+```
+
+```
 session_status({ name: "<name>", probeUrl: "<an authenticated URL>" })
 ```
 
@@ -63,7 +69,13 @@ out-of-band — never re-login and never put credentials in the suite:
 
    ```bash
    echo "$SESSION_B64" | base64 -d > "$RUNNER_TEMP/session.json"
+   ```
+
+   ```bash
    export STORAGE_STATE="$RUNNER_TEMP/session.json"
+   ```
+
+   ```bash
    npx playwright test
    ```
 

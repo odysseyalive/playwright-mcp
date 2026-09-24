@@ -19,11 +19,24 @@ assistant how to run, author, and audit it safely.
 ## First run
 
 ```bash
-npm i -D @playwright/test && npx playwright install chromium
-# 1. Fill e2e-suite.config.json (env.up/down may stay empty if no mode switch needed)
-# 2. Capture the login once (via the playwright-mcp tools):
-#    session_login({ name: "__SESSION_NAME__", loginUrl: "…", successSignal: "…", headed: true })
-# 3. Run:
+npm i -D @playwright/test
+```
+
+```bash
+npx playwright install chromium
+```
+
+Fill `e2e-suite.config.json` (`env.up`/`env.down` may stay empty if no mode switch is needed).
+
+Capture the login once with the playwright-mcp tools.
+
+```
+session_login({ name: "__SESSION_NAME__", loginUrl: "…", successSignal: "…", headed: true })
+```
+
+Run the suite.
+
+```bash
 BASE_URL=https://your-app.example npx playwright test
 ```
 
@@ -32,8 +45,14 @@ local session path. The storageState file is a bearer credential — never commi
 
 ## Auditing failures
 
-`suite_audit({ cwd: "<this project>", run: true })` (or `reportPath:
-"test-results/last-run.json"` to triage the last run) returns per-failure dossiers plus
-the adjudication rubric. The rule that keeps the suite honest: failures are classified
+Run the audit to get per-failure dossiers plus the adjudication rubric.
+
+```
+suite_audit({ cwd: "<this project>", run: true })
+```
+
+To triage the last run instead, pass `reportPath: "test-results/last-run.json"`.
+
+The rule that keeps the suite honest: failures are classified
 TEST-DEFECT (fix the script) or PRODUCT-BUG (report + hand off — the spec is never
 relaxed to go green). Full workflow: `.claude/skills/test-suite/references/audit-workflow.md`.

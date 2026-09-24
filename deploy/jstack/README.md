@@ -15,16 +15,41 @@ from it and hardcode nothing. Copy these into a jstack site directory and fill `
 The connector image is built from this repo (`../../Dockerfile`).
 
 ## Deploy
-```sh
-# on the jstack host, from the jstack root:
-SITE=sites/<your-domain>            # e.g. sites/mcp.example.com
-mkdir -p "$SITE"
-cp /path/to/playwright-mcp/deploy/jstack/{docker-compose.yml,patch-nginx-sse.sh,.env.example} "$SITE/"
-cp "$SITE/.env.example" "$SITE/.env" && chmod 600 "$SITE/.env"
-# edit "$SITE/.env": set DOMAIN/PORT/CONTAINER + PLAYWRIGHT_MCP_PUBLIC_URL + the GITHUB_* values
 
-DBUSER=unused DBPASS=unused ./jstack.sh --install-site "$SITE"   # builds, starts, nginx + cert
-./"$SITE"/patch-nginx-sse.sh                                      # apply SSE-tuned vhost
+On the jstack host, from the jstack root. Set `SITE` to your domain's site directory, e.g. `sites/mcp.example.com`.
+
+```sh
+SITE=sites/<your-domain>
+```
+
+```sh
+mkdir -p "$SITE"
+```
+
+```sh
+cp /path/to/playwright-mcp/deploy/jstack/{docker-compose.yml,patch-nginx-sse.sh,.env.example} "$SITE/"
+```
+
+```sh
+cp "$SITE/.env.example" "$SITE/.env"
+```
+
+```sh
+chmod 600 "$SITE/.env"
+```
+
+Edit `"$SITE/.env"` and set `DOMAIN`, `PORT`, `CONTAINER`, `PLAYWRIGHT_MCP_PUBLIC_URL`, and the `GITHUB_*` values.
+
+This builds the image, starts the container, and provisions nginx + the TLS cert.
+
+```sh
+DBUSER=unused DBPASS=unused ./jstack.sh --install-site "$SITE"
+```
+
+Apply the SSE-tuned vhost config.
+
+```sh
+./"$SITE"/patch-nginx-sse.sh
 ```
 
 Prerequisites and the full walk-through (GitHub OAuth app, DNS, Cloudflare grey→orange,

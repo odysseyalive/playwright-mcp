@@ -47,7 +47,13 @@ Without root, point `n` at a directory you own and add it to your PATH.
 
 ```bash
 export N_PREFIX="$HOME/.n"
+```
+
+```bash
 export PATH="$N_PREFIX/bin:$PATH"
+```
+
+```bash
 npx -y n lts
 ```
 
@@ -59,7 +65,11 @@ Open a new shell and confirm.
 node -v
 ```
 
-`n` is a bash script that runs on Linux and macOS. On Windows, grab the installer from [nodejs.org](https://nodejs.org/) or use `winget install OpenJS.NodeJS.LTS`.
+`n` is a bash script that runs on Linux and macOS. On Windows, grab the installer from [nodejs.org](https://nodejs.org/) or run:
+
+```powershell
+winget install OpenJS.NodeJS.LTS
+```
 
 ## Install
 
