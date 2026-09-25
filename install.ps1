@@ -3,19 +3,32 @@
 # Builds the server, downloads Chromium, registers it at USER scope with Claude
 # Code and Codex, and appends a steering note to ~\.claude\CLAUDE.md (once —
 # guarded by a marker). It never changes ~\.claude\settings.json. Idempotent +
-# non-interactive: safe to re-run, never prompts. Opt out of the global-config
-# edit with -NoSteer.
+# non-interactive: safe to re-run, never prompts.
 #
 #   .\install.ps1            run (non-interactive)
-#   .\install.ps1 -NoSteer   skip the CLAUDE.md steering directive
 #   .\install.ps1 -Yes       accepted but no longer needed (back-compat no-op)
+#
+# No flag switches off any part of the install; the steering directive is always
+# applied. Anything else on the line — including the retired -NoDeny and
+# -NoSteer — lands in $Rest, is warned about on stderr and ignored rather than
+# rejected, so an old script that still passes one keeps working.
+# ValueFromRemainingArguments is what collects it: a [Parameter()] attribute
+# makes this an advanced script, which would otherwise refuse an unknown
+# parameter before the body runs.
 #
 param(
   [switch]$Yes,     # back-compat no-op: the installer no longer prompts
-  [switch]$NoSteer
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$Rest
 )
 $ErrorActionPreference = 'Stop'
 $Here = $PSScriptRoot
+
+# One line per leftover, on stderr, then carry on — the install.sh twin of this
+# is the `*) echo "ignoring unknown flag: $arg" >&2 ;;` arm. [Console]::Error is
+# the 5.1-safe stderr write: Write-Error would throw under 'Stop', and
+# Write-Warning goes to the warning stream, not stderr.
+if ($Rest) { foreach ($arg in $Rest) { [Console]::Error.WriteLine("ignoring unknown flag: $arg") } }
 
 function Say  ($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn ($m) { Write-Host "!   $m" -ForegroundColor Yellow }
@@ -85,9 +98,12 @@ if ($hasCodex) {
   Write-Host "    codex mcp add playwright-mcp -- node `"$entry`""
 }
 
-# ── 5. Steering directive (optional) ──────────────────────────────────────────
+# ── 5. Steering directive ─────────────────────────────────────────────────────
+# Always applied, with no opt-out: it is what points Claude at the tools this
+# script just installed. Idempotence comes from the marker, not from a flag —
+# a re-run finds it and appends nothing.
 $userClaudeMd = Join-Path $env:USERPROFILE ".claude\CLAUDE.md"
-if (-not $NoSteer) {
+function Add-Steering {
   $hasMark = (Test-Path $userClaudeMd) -and (Select-String -Quiet -Path $userClaudeMd -Pattern "playwright-mcp steering")
   if ($hasMark) {
     Say "Steering directive already present in $userClaudeMd"
@@ -114,5 +130,6 @@ screenshots and files at the end of every debug session.
     Say "Added steering directive."
   }
 }
+Add-Steering
 
 Say "Done. Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."

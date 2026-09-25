@@ -6,21 +6,23 @@
 # scope with Claude Code (so every project gets it), and appends a steering note
 # to ~/.claude/CLAUDE.md (once — guarded by a marker). It never changes
 # ~/.claude/settings.json. Idempotent + non-interactive: safe to re-run, never
-# prompts. Opt out of the global-config edit with --no-steer.
+# prompts.
 #
 # Flags:
-#   --no-steer   skip the ~/.claude/CLAUDE.md steering directive
 #   --yes        accepted but no longer needed (back-compat no-op; nothing prompts)
+#
+# No flag switches off any part of the install; the steering directive is always
+# applied. Anything else on the line — including the retired --no-deny and
+# --no-steer — is warned about on stderr and ignored rather than rejected, so an
+# old script that still passes one keeps working.
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DO_STEER=1
 for arg in "$@"; do
   case "$arg" in
-    --no-steer) DO_STEER=0 ;;
     --yes) ;;  # back-compat no-op: the installer no longer prompts
-    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+    *) echo "ignoring unknown flag: $arg" >&2 ;;
   esac
 done
 
@@ -107,10 +109,13 @@ else
   echo "    codex mcp add playwright-mcp -- node \"$HERE/dist/index.js\""
 fi
 
-# ── 5. Steering directive (optional) ──────────────────────────────────────────
+# ── 5. Steering directive ─────────────────────────────────────────────────────
+# Always applied, with no opt-out: it is what points Claude at the tools this
+# script just installed. Idempotence comes from the marker, not from a flag —
+# a re-run finds STEER_MARK and appends nothing.
 USER_CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 STEER_MARK="playwright-mcp steering"
-if [ "$DO_STEER" = "1" ]; then
+steer() {
   if [ -f "$USER_CLAUDE_MD" ] && grep -q "$STEER_MARK" "$USER_CLAUDE_MD" 2>/dev/null; then
     say "Steering directive already present in $USER_CLAUDE_MD"
   else
@@ -130,6 +135,7 @@ screenshots and files at the end of every debug session.
 EOF
     say "Added steering directive."
   fi
-fi
+}
+steer
 
 say "Done. Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."

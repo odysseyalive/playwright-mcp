@@ -87,7 +87,7 @@ The bundled installer handles the whole thing. Checks Node, installs dependencie
 .\install.ps1
 ```
 
-The installer also adds an optional steering note to `~/.claude/CLAUDE.md` that tells Claude to use `web_fetch` for page fetching and playwright-mcp's `browser_*` tools for site debugging. Skip it with `--no-steer` (PowerShell: `-NoSteer`).
+The installer also adds a steering note to `~/.claude/CLAUDE.md` that tells Claude to use `web_fetch` for page fetching and playwright-mcp's `browser_*` tools for site debugging.
 
 ### Registering by hand
 
