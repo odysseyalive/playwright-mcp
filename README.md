@@ -4,7 +4,7 @@ One install, every Claude Code project gets a real browser. Page fetching with c
 
 ## What it is
 
-An MCP server that wraps `@playwright/mcp` and adds nine tools of its own for page fetching, authenticated sessions, and test suites. Its `web_fetch` tool tells Claude it replaces the built-in WebFetch, and the optional note the installer drops into `~/.claude/CLAUDE.md` says the same thing. The extra features just come along for free.
+An MCP server that wraps `@playwright/mcp` and adds nine tools of its own for page fetching, authenticated sessions, and test suites. The installer points Claude at it: page fetches go to `web_fetch` instead of the built-in WebFetch, and browser work goes to the `browser_*` tools instead of the claude-in-chrome extension. The extra features just come along for free.
 
 ### How it layers in
 
@@ -14,7 +14,7 @@ When this server takes over that job, every fetch also comes back with structure
 
 The other thing the built-in can't do is render. Single-page apps, JavaScript-heavy dashboards, pages behind consent walls. `web_fetch` runs a real headless Chromium with a stealth context, so it sees what a person would see.
 
-This server has nothing to do with web search. Claude runs its own native WebSearch on Anthropic's infrastructure. The optional steering directive the installer adds to `~/.claude/CLAUDE.md` just tells Claude to follow up search results by visiting the top URLs with `web_fetch`, so the citations and page-health data are there when it summarizes. The server handles that page-visit part. Claude does the searching.
+This server has nothing to do with web search. Claude runs its own native WebSearch on Anthropic's infrastructure. The steering directive the installer adds to `~/.claude/CLAUDE.md` just tells Claude to follow up search results by visiting the top URLs with `web_fetch`, so the citations and page-health data are there when it summarizes. The server handles that page-visit part. Claude does the searching.
 
 ### The tools
 
@@ -87,7 +87,7 @@ The bundled installer handles the whole thing. Checks Node, installs dependencie
 .\install.ps1
 ```
 
-The installer also adds a steering note to `~/.claude/CLAUDE.md` that tells Claude to use `web_fetch` for page fetching and playwright-mcp's `browser_*` tools for site debugging.
+The installer adds two entries to `permissions.deny` in `~/.claude/settings.json`: `WebFetch` and `mcp__claude-in-chrome`. They take the built-in fetcher and the Chrome extension out of Claude's way, so page fetches go to `web_fetch` and browser work goes to the `browser_*` tools. They don't block anything this server provides, and native WebSearch stays on. Everything else in the file is left alone, and re-running the installer changes nothing. It also adds a steering note to `~/.claude/CLAUDE.md` that tells Claude the same thing.
 
 ### Registering by hand
 

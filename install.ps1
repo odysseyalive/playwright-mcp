@@ -1,15 +1,20 @@
 ﻿# install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
 # Builds the server, downloads Chromium, registers it at USER scope with Claude
-# Code and Codex, and appends a steering note to ~\.claude\CLAUDE.md (once —
-# guarded by a marker). It never changes ~\.claude\settings.json. Idempotent +
-# non-interactive: safe to re-run, never prompts.
+# Code and Codex, routes Claude's page fetching and browser work to it, and
+# appends a steering note to ~\.claude\CLAUDE.md (once — guarded by a marker).
+# Idempotent + non-interactive: safe to re-run, never prompts.
+#
+# The routing is two entries in ~\.claude\settings.json permissions.deny:
+# WebFetch and mcp__claude-in-chrome. They take the built-in fetcher and the
+# Chrome extension out of the way so Claude uses web_fetch and browser_*
+# instead. They never block a playwright-mcp tool, and native WebSearch stays.
 #
 #   .\install.ps1            run (non-interactive)
 #   .\install.ps1 -Yes       accepted but no longer needed (back-compat no-op)
 #
-# No flag switches off any part of the install; the steering directive is always
-# applied. Anything else on the line — including the retired -NoDeny and
+# No flag switches off any part of the install; the routing and the steering
+# directive are always applied. Anything else on the line — including the retired -NoDeny and
 # -NoSteer — lands in $Rest, is warned about on stderr and ignored rather than
 # rejected, so an old script that still passes one keeps working.
 # ValueFromRemainingArguments is what collects it: a [Parameter()] attribute
@@ -98,7 +103,29 @@ if ($hasCodex) {
   Write-Host "    codex mcp add playwright-mcp -- node `"$entry`""
 }
 
-# ── 5. Steering directive ─────────────────────────────────────────────────────
+# ── 5. Route fetching + browser work to playwright-mcp ────────────────────────
+# Always applied. Adds only WebFetch and mcp__claude-in-chrome to
+# permissions.deny (and drops a stale WebSearch deny from older installs);
+# every other setting is left as it is. A re-run finds both and changes nothing.
+$settings = Join-Path $env:USERPROFILE ".claude\settings.json"
+Say "Routing page fetches and browser work to playwright-mcp in $settings"
+New-Item -ItemType Directory -Force -Path (Split-Path $settings) | Out-Null
+if (-not (Test-Path $settings)) { '{}' | Set-Content -Encoding utf8 $settings }
+$preview = node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --print
+if ($LASTEXITCODE -ne 0) { Die "could not read $settings" }
+if (-not $preview) {
+  Say "Routing already in place — nothing to change."
+} else {
+  Write-Host "----- change to settings.json (your other settings untouched) -----"
+  Write-Host $preview
+  Write-Host "-------------------------------------------------------------------"
+  node (Join-Path $Here "scripts\merge-deny.mjs") "$settings" --write
+  Say "Done. Claude now fetches pages with web_fetch and drives browsers with"
+  Say "playwright-mcp's browser_* tools instead of built-in WebFetch and the"
+  Say "Chrome extension. No playwright-mcp tool is blocked; WebSearch stays on."
+}
+
+# ── 6. Steering directive ─────────────────────────────────────────────────────
 # Always applied, with no opt-out: it is what points Claude at the tools this
 # script just installed. Idempotence comes from the marker, not from a flag —
 # a re-run finds it and appends nothing.

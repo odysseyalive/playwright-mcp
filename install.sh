@@ -3,16 +3,21 @@
 # install.sh — Linux/macOS installer for playwright-mcp.
 #
 # Builds the server, downloads headless Chromium, registers the server at USER
-# scope with Claude Code (so every project gets it), and appends a steering note
-# to ~/.claude/CLAUDE.md (once — guarded by a marker). It never changes
-# ~/.claude/settings.json. Idempotent + non-interactive: safe to re-run, never
-# prompts.
+# scope with Claude Code (so every project gets it), routes Claude's page
+# fetching and browser work to it, and appends a steering note to
+# ~/.claude/CLAUDE.md (once — guarded by a marker). Idempotent + non-interactive:
+# safe to re-run, never prompts.
+#
+# The routing is two entries in ~/.claude/settings.json permissions.deny:
+# WebFetch and mcp__claude-in-chrome. They take the built-in fetcher and the
+# Chrome extension out of the way so Claude uses web_fetch and browser_*
+# instead. They never block a playwright-mcp tool, and native WebSearch stays.
 #
 # Flags:
 #   --yes        accepted but no longer needed (back-compat no-op; nothing prompts)
 #
-# No flag switches off any part of the install; the steering directive is always
-# applied. Anything else on the line — including the retired --no-deny and
+# No flag switches off any part of the install; the routing and the steering
+# directive are always applied. Anything else on the line — including the retired --no-deny and
 # --no-steer — is warned about on stderr and ignored rather than rejected, so an
 # old script that still passes one keeps working.
 #
@@ -109,7 +114,28 @@ else
   echo "    codex mcp add playwright-mcp -- node \"$HERE/dist/index.js\""
 fi
 
-# ── 5. Steering directive ─────────────────────────────────────────────────────
+# ── 5. Route fetching + browser work to playwright-mcp ────────────────────────
+# Always applied. Adds only WebFetch and mcp__claude-in-chrome to
+# permissions.deny (and drops a stale WebSearch deny from older installs);
+# every other setting is left as it is. A re-run finds both and changes nothing.
+SETTINGS="$HOME/.claude/settings.json"
+say "Routing page fetches and browser work to playwright-mcp in $SETTINGS"
+mkdir -p "$HOME/.claude"
+[ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+PREVIEW="$(node "$HERE/scripts/merge-deny.mjs" "$SETTINGS" --print)" || die "could not read $SETTINGS"
+if [ -z "$PREVIEW" ]; then
+  say "Routing already in place — nothing to change."
+else
+  echo "----- change to settings.json (your other settings untouched) -----"
+  echo "$PREVIEW"
+  echo "-------------------------------------------------------------------"
+  node "$HERE/scripts/merge-deny.mjs" "$SETTINGS" --write
+  say "Done. Claude now fetches pages with web_fetch and drives browsers with"
+  say "playwright-mcp's browser_* tools instead of built-in WebFetch and the"
+  say "Chrome extension. No playwright-mcp tool is blocked; WebSearch stays on."
+fi
+
+# ── 6. Steering directive ─────────────────────────────────────────────────────
 # Always applied, with no opt-out: it is what points Claude at the tools this
 # script just installed. Idempotence comes from the marker, not from a flag —
 # a re-run finds STEER_MARK and appends nothing.
