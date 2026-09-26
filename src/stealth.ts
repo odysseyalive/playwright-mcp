@@ -20,6 +20,8 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
+import path from 'node:path';
 
 import { chromium, type BrowserContextOptions } from 'playwright';
 
@@ -40,6 +42,48 @@ function detectChannel(): 'chrome' | undefined {
 }
 
 export const BROWSER_CHANNEL = detectChannel();
+
+/**
+ * Where install.sh unpacks Chromium's system libraries when the host lacks them
+ * and the user has no root to install them (scripts/provision-libs.mjs). Plain
+ * distro packages, extracted as the user, never installed system-wide.
+ */
+export function sysrootDir(): string {
+  return path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'playwright-mcp', 'sysroot');
+}
+
+/** The library dirs inside the sysroot that exist: multiarch, pre-usrmerge, and NSS's own. */
+export function sysrootLibDirs(root = sysrootDir()): string[] {
+  const dirs: string[] = [];
+  for (const base of ['usr/lib', 'lib']) {
+    const abs = path.join(root, base);
+    if (!fs.existsSync(abs)) continue;
+    for (const e of fs.readdirSync(abs))
+      if (/-linux-gnu/.test(e)) dirs.push(path.join(abs, e), path.join(abs, e, 'nss'));
+  }
+  dirs.push(path.join(root, 'usr/lib64'), path.join(root, 'usr/lib'));
+  return dirs.filter((d) => fs.existsSync(d));
+}
+
+/**
+ * Put the sysroot's libraries on the path of every browser this process starts.
+ * Playwright hands process.env to the browser, so all three launch sites and the
+ * installer's check pick it up from here. Runs before detectChromeMajor below,
+ * which runs the browser binary too. Only packages the host was MISSING were
+ * unpacked, so nothing installed system-wide is shadowed. A fontconfig file is
+ * written alongside only when the host had no fontconfig of its own.
+ */
+function useSysroot(): void {
+  if (process.platform !== 'linux') return;
+  const dirs = sysrootLibDirs();
+  if (!dirs.length) return;
+  const prev = process.env.LD_LIBRARY_PATH;
+  process.env.LD_LIBRARY_PATH = [...dirs, ...(prev ? [prev] : [])].join(':');
+  const fontsConf = path.join(sysrootDir(), 'fonts.conf');
+  if (!process.env.FONTCONFIG_FILE && fs.existsSync(fontsConf)) process.env.FONTCONFIG_FILE = fontsConf;
+}
+
+useSysroot();
 
 /**
  * Resolve the host's REAL Google Chrome executable — the same binary

@@ -74,10 +74,10 @@ say "Building (tsc → dist/)…"
 # where those libs already exist from the graphics stack. Those libraries are a
 # runtime requirement of the Chromium BINARY regardless of headless vs headed, so
 # dropping --with-deps does not affect headless operation: headless still works
-# wherever the libs are present (every desktop, macOS, Windows). The lone
-# exception is a bare/headless Linux box (minimal container, server, WSL) with no
-# desktop libs — there, run `npx playwright install-deps` or use the official
-# Playwright Docker image. The installer never invokes a system package manager.
+# wherever the libs are present (every desktop, macOS, Windows). A bare Linux box
+# (minimal container, server, WSL) with no desktop libs is handled next, without
+# root: the step after the download fetches the missing packages into the user's
+# cache. The installer never installs anything system-wide.
 #
 # pw_install filters Playwright's "BEWARE: your OS is not officially supported…"
 # lines (printed on distros it has no native build for, e.g. Arch — the Ubuntu
@@ -92,6 +92,12 @@ pw_install() {
 
 say "Downloading Chromium…"
 pw_install npx playwright install chromium
+
+# Linux: if Chromium's system libraries are missing (a bare server), fetch the
+# distro's own packages and unpack them into ~/.cache/playwright-mcp/sysroot as
+# the user. No root. A host where that is impossible fails here, naming the libs.
+say "Checking Chromium's system libraries…"
+( cd "$HERE" && node scripts/provision-libs.mjs ) || die "Chromium's system libraries could not be provided. See the error above."
 
 # Prove it launches. The server starts the real Google Chrome when the host has
 # one, else this bundled Chromium; check-browser.mjs launches exactly that, so a
