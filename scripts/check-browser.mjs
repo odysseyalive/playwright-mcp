@@ -42,7 +42,8 @@ try {
     );
   if (/sandbox/i.test(msg))
     console.error(
-      "browser_* runs Chromium's sandbox, which needs unprivileged user namespaces; this host has them disabled.",
+      "browser_* runs Chromium's sandbox (except as root), which needs unprivileged user namespaces; " +
+        'this host appears to have them disabled.',
     );
   process.exitCode = 1;
 } finally {

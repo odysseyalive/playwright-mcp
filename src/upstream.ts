@@ -100,14 +100,17 @@ function stealthInitFile(): string {
  *
  * `chromiumSandbox` and the kept `--disable-extensions` default are what
  * @playwright/mcp's own launch set for Chrome, kept so taking the launch over
- * changes nothing about the browser itself.
+ * changes nothing about the browser itself. The one exception is root: Chrome
+ * refuses to start sandboxed as root ("Running as root without --no-sandbox is
+ * not supported", measured 2026-09-26 on a root install), so there browser_*
+ * runs unsandboxed, as web_fetch's launch already does everywhere.
  */
 export function upstreamLaunch(storageState?: string) {
   const launchOptions: LaunchOptions = {
     headless: true,
     channel: BROWSER_CHANNEL,
     args: STEALTH_ARGS,
-    chromiumSandbox: true,
+    chromiumSandbox: process.getuid?.() !== 0,
     ignoreDefaultArgs: ['--disable-extensions'],
   };
   const contextOptions = storageState ? { ...stealthContextOptions, storageState } : { ...stealthContextOptions };
