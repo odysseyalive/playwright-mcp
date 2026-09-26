@@ -93,6 +93,13 @@ pw_install() {
 say "Downloading Chromium…"
 pw_install npx playwright install chromium
 
+# Prove it launches. The server starts the real Google Chrome when the host has
+# one, else this bundled Chromium; check-browser.mjs launches exactly that, so a
+# host where no browser can start fails HERE instead of printing "Done" and
+# leaving every browser tool dead (measured 2026-09-26 on no-sudo hosting).
+say "Checking that the browser launches…"
+( cd "$HERE" && node scripts/check-browser.mjs ) || die "No working browser. See the error above, fix it, and re-run this installer."
+
 # ── 4. Register at user scope (idempotent) ────────────────────────────────────
 if command -v claude >/dev/null 2>&1; then
   say "Registering playwright-mcp at user scope with Claude Code…"

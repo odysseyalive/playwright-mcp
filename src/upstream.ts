@@ -58,7 +58,7 @@ import path from 'node:path';
 
 import { dropTempProfile, launchOnPool, type ProfilePool } from './browser.js';
 import { loadSecrets, sessionFilePath } from './secrets.js';
-import { STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
+import { BROWSER_CHANNEL, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
 import { egressRestricted, installContextEgressGuard, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
@@ -105,7 +105,7 @@ function stealthInitFile(): string {
 export function upstreamLaunch(storageState?: string) {
   const launchOptions: LaunchOptions = {
     headless: true,
-    channel: 'chrome',
+    channel: BROWSER_CHANNEL,
     args: STEALTH_ARGS,
     chromiumSandbox: true,
     ignoreDefaultArgs: ['--disable-extensions'],
@@ -128,7 +128,7 @@ function workspaceHash(): string {
  * The exact dir @playwright/mcp launched browser_* on for this workspace before we
  * took the launch over. Mirrors `createUserDataDir` in playwright-core's
  * tools/mcp/browserFactory.ts (bundled in lib/coreBundle.js):
- * `<PWMCP_PROFILES_DIR_FOR_TEST ?? registryDirectory>/mcp-<channel>-<hash>`. The
+ * `<PWMCP_PROFILES_DIR_FOR_TEST ?? registryDirectory>/mcp-<channel ?? browserName>-<hash>`. The
  * registry dir is read from upstream's own export, so PLAYWRIGHT_BROWSERS_PATH
  * and the platform cache root resolve exactly as they do there.
  * scripts/test-upstream-browser.mjs pins this against upstream's own launch.
@@ -136,12 +136,13 @@ function workspaceHash(): string {
 export function upstreamProfileDir(): string {
   const { registry } = createRequire(import.meta.url)('playwright-core/lib/coreBundle');
   const root: string = process.env.PWMCP_PROFILES_DIR_FOR_TEST ?? registry.registryDirectory;
-  return path.join(root, `mcp-${upstreamLaunch().launchOptions.channel}-${workspaceHash()}`);
+  // Upstream names it by channel, else browserName: `mcp-chrome-…` or `mcp-chromium-…`.
+  return path.join(root, `mcp-${upstreamLaunch().launchOptions.channel ?? 'chromium'}-${workspaceHash()}`);
 }
 
 /**
  * browser_*'s profile pool. Slot 1 is upstream's own dir for this workspace, so
- * a login made there survives the switch; slots 2..N (`mcp-chrome-<hash>-2` …)
+ * a login made there survives the switch; slots 2..N (`mcp-chrome-<hash>-2` …, or `mcp-chromium-…`)
  * and the temp fallback (`pwmcp-browser-<hash>-<pid>`) carry the same hash, so
  * two projects never land on one profile. No override: pinning browser_* to one
  * dir would bring back the lockout this pool exists to end.

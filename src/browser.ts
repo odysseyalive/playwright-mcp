@@ -32,7 +32,7 @@ import path from 'node:path';
 import { chromium, type BrowserContext } from 'playwright';
 
 import { seedConsent } from './consent.js';
-import { CHROME_MAJOR, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
+import { BROWSER_CHANNEL, CHROME_MAJOR, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:browser]', ...args);
 
@@ -211,7 +211,7 @@ function claimTempProfile(pool: ProfilePool, dir: string): string {
 
 async function openProfile(dir: string): Promise<BrowserContext> {
   const context = await chromium.launchPersistentContext(dir, {
-    channel: 'chrome',
+    channel: BROWSER_CHANNEL,
     headless: true,
     args: STEALTH_ARGS,
     ...stealthContextOptions,

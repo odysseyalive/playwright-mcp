@@ -41,7 +41,8 @@ import { createConnection } from '@playwright/mcp';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { BROWSER_POOL, browserOwner, launchBrowser, upstreamConfig, upstreamProfileDir } from '../dist/upstream.js';
+import { BROWSER_CHANNEL } from '../dist/stealth.js';
+import { BROWSER_POOL, browserOwner, launchBrowser, upstreamConfig, upstreamLaunch, upstreamProfileDir } from '../dist/upstream.js';
 import { symlinkSkipReason } from './fixtures/platform.mjs';
 
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
@@ -146,9 +147,13 @@ function freshCache() {
 /** Upstream's workspace hash, recomputed independently: sha256 of the cwd, 7 hex. */
 const hashOf = (dir) => createHash('sha256').update(dir).digest('hex').slice(0, 7);
 
-/** The browser_* pool candidates under `cache` for the current workspace, best slot first. */
+/**
+ * The browser_* pool candidates under `cache` for the current workspace, best slot
+ * first. Named by upstream's rule, `channel ?? browserName`: `mcp-chrome-…` where
+ * Google Chrome is installed, `mcp-chromium-…` on a host running bundled Chromium.
+ */
 function browserPool(cache) {
-  const first = path.join(cache, `mcp-chrome-${hashOf(process.cwd())}`);
+  const first = path.join(cache, `mcp-${BROWSER_CHANNEL ?? 'chromium'}-${hashOf(process.cwd())}`);
   return [first, ...Array.from({ length: POOL_SIZE - 1 }, (_, i) => `${first}-${i + 2}`)];
 }
 
@@ -188,7 +193,10 @@ test('slot 1 is the exact dir @playwright/mcp itself launches browser_* on for t
   onPersistent = async (dir) => {
     throw new Error(`stubbed launch refused ${dir}`);
   };
-  const server = await createConnection({ browser: { browserName: 'chromium', launchOptions: { channel: 'chrome', headless: true } } });
+  // Same channel we launch on (Chrome, or bundled Chromium on a host without it),
+  // so upstream's `channel ?? browserName` naming is pinned for this host's branch.
+  const { channel } = upstreamLaunch().launchOptions;
+  const server = await createConnection({ browser: { browserName: 'chromium', launchOptions: { channel, headless: true } } });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
   const client = new Client({ name: 'pin-upstream-profile', version: '0.0.0' });

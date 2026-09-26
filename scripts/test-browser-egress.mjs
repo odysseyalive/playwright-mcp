@@ -34,6 +34,7 @@ import { chromium } from 'playwright';
 
 import { BLOCKED_ORIGIN_PATTERNS, EgressBlockedError, installContextEgressGuard } from '../dist/egress.js';
 import { launchBrowser } from '../dist/upstream.js';
+import { BROWSER_CHANNEL } from '../dist/stealth.js';
 
 const { iso } = createRequire(import.meta.url)('playwright-core/lib/coreBundle');
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
@@ -463,7 +464,7 @@ test('real: a 302 from a public-looking host into loopback never reaches the loo
   });
   const outerPort = await outer.listen();
   const browser = await chromium.launch({
-    channel: 'chrome',
+    channel: BROWSER_CHANNEL,
     headless: true,
     args: ['--host-resolver-rules=MAP public.test 127.0.0.1'],
   });
@@ -505,7 +506,7 @@ test('real: a page\'s own fetch() that 302s into loopback never reaches the loop
   });
   const outerPort = await outer.listen();
   const browser = await chromium.launch({
-    channel: 'chrome',
+    channel: BROWSER_CHANNEL,
     headless: true,
     args: ['--host-resolver-rules=MAP public.test 127.0.0.1'],
   });

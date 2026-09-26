@@ -77,6 +77,13 @@ try {
   # (the apt-only --with-deps flag is a Linux-CI concern and never applies here).
   Say "Downloading Chromium…"
   npx playwright install chromium
+  if ($LASTEXITCODE -ne 0) { Die "Chromium download failed" }
+
+  # Prove it launches: the real Google Chrome when the host has one, else this
+  # bundled Chromium. A host where no browser can start fails here, not later.
+  Say "Checking that the browser launches…"
+  node scripts/check-browser.mjs
+  if ($LASTEXITCODE -ne 0) { Die "No working browser. See the error above, fix it, and re-run this installer." }
 } finally {
   Pop-Location
 }

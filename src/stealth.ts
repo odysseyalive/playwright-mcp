@@ -19,8 +19,27 @@
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 
-import type { BrowserContextOptions } from 'playwright';
+import { chromium, type BrowserContextOptions } from 'playwright';
+
+/**
+ * Which browser every Playwright launch starts: the REAL Google Chrome
+ * (`'chrome'`) when the host has it, else `undefined` — the bundled Chromium the
+ * installer downloads. Decided by Playwright's own registry, the exact lookup
+ * `channel:'chrome'` performs at launch, so detection and launch cannot disagree
+ * (resolveChromePath below is NOT that check: it also accepts a distro
+ * /usr/bin/chromium, which `channel:'chrome'` refuses). Measured 2026-09-26 on
+ * two no-sudo hosting accounts with no Google Chrome and no way to install it:
+ * a hard-coded `channel:'chrome'` left install.sh reporting success and every
+ * browser tool dead, while the bundled Chromium launched fine.
+ */
+function detectChannel(): 'chrome' | undefined {
+  const { registry } = createRequire(import.meta.url)('playwright-core/lib/coreBundle').registry;
+  return registry.findExecutable('chrome')?.executablePath() ? 'chrome' : undefined;
+}
+
+export const BROWSER_CHANNEL = detectChannel();
 
 /**
  * Resolve the host's REAL Google Chrome executable — the same binary
@@ -91,7 +110,9 @@ const PLATFORM_TOKEN =
 function detectChromeMajor(): number {
   const FALLBACK = 150;
   try {
-    const out = execFileSync(resolveChromePath(), ['--version'], {
+    // Query the binary we will actually launch: Chrome, or the bundled Chromium.
+    const bin = BROWSER_CHANNEL ? resolveChromePath() : chromium.executablePath();
+    const out = execFileSync(bin, ['--version'], {
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).toString();
@@ -119,10 +140,12 @@ export const STEALTH_ARGS = ['--disable-blink-features=AutomationControlled'];
  * distinct fingerprint that aggressive bot walls (DataDome, PerimeterX) flag on
  * sight, and a session captured under one engine is re-challenged when replayed
  * under another — so capture (session_login), probe (session_status), and authed
- * read (web_fetch) all launch the same Chrome the shared scraping context uses.
- * Requires Google Chrome installed on the host. Spread into chromium.launch().
+ * read (web_fetch) all launch the same browser the shared scraping context uses.
+ * On a host without Google Chrome that browser is the bundled Chromium
+ * (BROWSER_CHANNEL): every tool works, and the hardest walls are more likely to
+ * challenge it. Spread into chromium.launch().
  */
-export const STEALTH_LAUNCH = { channel: 'chrome', args: STEALTH_ARGS };
+export const STEALTH_LAUNCH = { channel: BROWSER_CHANNEL, args: STEALTH_ARGS };
 
 /** addInitScript payload: erase the headless tells before any page script runs. */
 export const STEALTH_INIT = `
