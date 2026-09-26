@@ -54,7 +54,7 @@ The full posture, including the non-fixes, is in the main
 
 ## Prerequisites
 
-- Node ≥ 22.13 and this repo built on the host. If the distro's Node is too old, see [Getting a current Node.js](../README.md#getting-a-current-nodejs).
+- Node ≥ 22.13 and this repo built on the host. If the distro's Node is too old, `install.sh` fetches a private one; see [Getting a current Node.js](../README.md#getting-a-current-nodejs).
 
 ```sh
 npm ci

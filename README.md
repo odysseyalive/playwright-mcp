@@ -27,23 +27,15 @@ Thirty-two total. Twenty-three are the wrapped `browser_*` set (navigate, snapsh
 
 ## Requirements
 
-- Node 22.13 or newer
+- Node 22.13 or newer. On Linux and macOS the installer takes care of this for you (see below).
 - The Claude Code CLI (`claude`) on your PATH
-- About 170 MB for a one-time Chromium download. On Linux the installer pulls the system libraries Chromium needs too, which may ask for sudo.
+- About 170 MB for a one-time Chromium download. On a bare Linux server the installer also fetches the system libraries Chromium needs. Nothing on the Linux/macOS side needs root.
 
 ### Getting a current Node.js
 
-Server distros and stable Linux releases often ship a Node.js that's too old. That's fine. Any Node, however ancient, comes with npm, and npm comes with npx. So even a behind-the-times distro package gets you the bootstrap tool you need, and npx can pull in a current version from there.
+On Linux and macOS you don't have to do anything. If the system Node is older than 22.13, or there isn't one, `install.sh` downloads the current LTS from nodejs.org into `~/.cache/playwright-mcp/node`, checks it against the published checksum, and builds and registers the server with it. Your system Node stays as it was. The download goes through curl, wget, or failing both, the old Node itself.
 
-If the machine has no Node at all, install the distro package first. On Debian/Ubuntu that's `nodejs` and `npm`. It'll be old. That's the point.
-
-Then use the [`n`](https://github.com/tj/n) version manager through npx to install the current LTS. With root access, one line does it.
-
-```bash
-sudo npx -y n lts
-```
-
-Without root, point `n` at a directory you own and add it to your PATH.
+If you'd rather have a current Node on your PATH for everything, use the [`n`](https://github.com/tj/n) version manager through npx. Any old Node brings npx with it. Without root, point `n` at a directory you own.
 
 ```bash
 export N_PREFIX="$HOME/.n"
@@ -59,13 +51,7 @@ npx -y n lts
 
 Add those two `export` lines to your shell profile (`~/.bashrc`, `~/.zshrc`, or similar) so they stick.
 
-Open a new shell and confirm.
-
-```bash
-node -v
-```
-
-`n` is a bash script that runs on Linux and macOS. On Windows, grab the installer from [nodejs.org](https://nodejs.org/) or run:
+On Windows, grab the installer from [nodejs.org](https://nodejs.org/) or run:
 
 ```powershell
 winget install OpenJS.NodeJS.LTS
@@ -73,7 +59,7 @@ winget install OpenJS.NodeJS.LTS
 
 ## Install
 
-The bundled installer handles the whole thing. Checks Node, installs dependencies, builds, downloads Chromium, registers the server at user scope. It prints a diff of what it changes to global config so you can see exactly what happened.
+The bundled installer handles the whole thing. Checks Node (fetching a current one if needed), installs dependencies, builds, downloads Chromium and checks it launches, registers the server at user scope. It prints a diff of what it changes to global config so you can see exactly what happened.
 
 **Linux / macOS**
 

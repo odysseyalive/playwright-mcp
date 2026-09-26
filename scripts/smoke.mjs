@@ -4,7 +4,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const transport = new StdioClientTransport({
-  command: 'node',
+  command: process.execPath, // the Node running this test, not whatever `node` is first on PATH
   args: ['dist/index.js'],
   stderr: 'inherit',
 });
