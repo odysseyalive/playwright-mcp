@@ -31,9 +31,16 @@ for arg in "$@"; do
   esac
 done
 
-say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m!  \033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31mERR\033[0m %s\n' "$*" >&2; exit 1; }
+# Colour only on a terminal, and never when NO_COLOR is set (no-color.org): a
+# piped or captured log (Claude Code's `!` runner, `| tee`) otherwise shows the
+# raw escapes as literal "[1;36m==>[0m". stdout and stderr are checked apart,
+# since die writes to stderr and either one can be redirected alone.
+SAY_C=; WARN_C=; OUT_R=; ERR_C=; ERR_R=
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then SAY_C='\033[1;36m'; WARN_C='\033[1;33m'; OUT_R='\033[0m'; fi
+if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then ERR_C='\033[1;31m'; ERR_R='\033[0m'; fi
+say()  { printf "${SAY_C}==>${OUT_R} %s\n" "$*"; }
+warn() { printf "${WARN_C}!  ${OUT_R} %s\n" "$*"; }
+die()  { printf "${ERR_C}ERR${ERR_R} %s\n" "$*" >&2; exit 1; }
 
 # ── 1. Node ≥ 22.13 ───────────────────────────────────────────────────────────
 # jsdom 29 (^20.19.0 || ^22.13.0 || >=24.0.0) and pdfjs-dist 6 (>=22.13.0 || >=24)
@@ -109,7 +116,6 @@ fi
 NODE_VER="$(node -p 'process.versions.node')"
 node_ok "$NODE_VER" || die "Node >=22.13.0 required; found $(node -v)."
 command -v claude >/dev/null 2>&1 || warn "Claude Code CLI 'claude' not found on PATH — the registration step will be skipped."
-command -v codex >/dev/null 2>&1 || warn "Codex CLI 'codex' not found on PATH — the registration step will be skipped."
 say "Node $(node -v) OK"
 
 # ── 2. Install deps + build ───────────────────────────────────────────────────
