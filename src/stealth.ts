@@ -66,21 +66,193 @@ export function sysrootLibDirs(root = sysrootDir()): string[] {
 }
 
 /**
+ * Where install.sh puts a PRIVATE glibc, for a host whose own is too old to run
+ * Chromium at all: CentOS 7 ships glibc 2.17, while every Playwright Chromium
+ * build needs GLIBC_2.25 and dies with
+ * `symbol __cxa_thread_atexit_impl, version GLIBC_2.18 not defined`.
+ * scripts/provision-libs.mjs unpacks glibc 2.28 here and patchelfs the browser
+ * binaries' interpreter and rpath at it — as the user, in the same cache and the
+ * same no-root way as the sysroot above, never system-wide.
+ */
+export function glibcDir(): string {
+  return path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'playwright-mcp', 'glibc');
+}
+
+/**
+ * The private loader inside `glibcDir()`. One spelling of that filename, shared:
+ * the installer WRITES this path, every launch site below TESTS it.
+ */
+export function privateLoaderPath(root = glibcDir()): string {
+  return path.join(root, 'ld-linux-x86-64.so.2');
+}
+
+/**
+ * The oldest glibc a Playwright Chromium build will start on: GLIBC_2.25.
+ * Exported so a test asserts against the real threshold, never a retyped one.
+ */
+export const CHROMIUM_MIN_GLIBC: readonly [number, number] = [2, 25];
+
+/**
+ * The glibc THIS PROCESS is running on, e.g. `'2.44'` — Node's own process report
+ * carries it, so there is no `getconf` subprocess and no second idea of the
+ * number. `undefined` on a host with no glibc to report (musl), a Node that does
+ * not report one, or a host where the report cannot be built at all: a throw here
+ * would kill the server at import time, and "no answer" means HEALTHY, which is
+ * the safe direction (see legacyGlibc). Read once, like detectChromeMajor below:
+ * it cannot change while the process lives, and getReport() is not cheap. Only
+ * the one header field is kept — the report object it comes in also carries the
+ * environment and the command line, and is dropped here.
+ */
+function readRuntimeGlibc(): string | undefined {
+  try {
+    return (process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined)?.header
+      ?.glibcVersionRuntime;
+  } catch {
+    return undefined; // no report to read — treat the host as healthy
+  }
+}
+
+const RUNTIME_GLIBC: string | undefined = readRuntimeGlibc();
+
+/**
+ * True when `version` is older than major.minor. UNPARSEABLE MEANS NOT OLDER: a
+ * host we cannot read a version from is treated as healthy, because a false
+ * "legacy" verdict would strip the sandbox from a browser that was working. The
+ * version is a parameter so tests can drive both answers on any host.
+ */
+export function glibcOlderThan([major, minor]: readonly [number, number], version = RUNTIME_GLIBC): boolean {
+  const m = /^(\d+)\.(\d+)/.exec(version ?? '');
+  if (!m) return false;
+  const [have, haveMinor] = [Number(m[1]), Number(m[2])];
+  return have < major || (have === major && haveMinor < minor);
+}
+
+/**
+ * True iff this host's browsers both NEED the private glibc and were patched onto
+ * it: the running glibc is older than Chromium can start on, AND the private
+ * loader is there. The file's presence is what the installer records and what
+ * makes the positive case cheap; the version is what keeps the verdict HONEST
+ * when the host moves on underneath it.
+ *
+ * File presence alone was not enough (security review C-4, 2026-09-29): a host
+ * provisioned once and later OS-upgraded keeps its `glibc/` dir forever, and
+ * every browser launch would then go on running unsandboxed with an EL8 libc in
+ * front of a modern browser. Un-patching a leftover runtime is the installer's
+ * half of that fix; this is the half that stops a stale directory disarming the
+ * sandbox on its own.
+ */
+export function legacyGlibc(version = RUNTIME_GLIBC): boolean {
+  return (
+    process.platform === 'linux' &&
+    glibcOlderThan(CHROMIUM_MIN_GLIBC, version) &&
+    fs.existsSync(privateLoaderPath())
+  );
+}
+
+/**
+ * Say ONCE, on stderr, that this host's browsers are not what a healthy host
+ * runs: no Chromium sandbox, and a frozen private userland instead of the
+ * system's. A working install otherwise never mentions it — the only other place
+ * the sandbox appears is a FAILURE branch in the installer's check — and a browser
+ * that renders untrusted content unsandboxed must not be discoverable only from
+ * the source (security review C-2, 2026-09-29). Called from browserGlibcEnv(), so
+ * it fires at the first launch on such a host and cannot fire on any other.
+ * stderr, never stdout: stdout is the MCP stream.
+ */
+let noticed = false;
+function noteLegacyRuntime(version: string | undefined): void {
+  if (noticed) return;
+  noticed = true;
+  const release = privateRuntimeRelease();
+  console.error(
+    `[playwright-mcp:stealth] this host's glibc (${version ?? 'unknown'}) is older than Chromium needs, so the ` +
+      `browser runs against a frozen AlmaLinux ${release ?? '8'} userland in ${glibcDir()} — not this host's ` +
+      `libraries — and WITHOUT Chromium's sandbox. Pages you open are rendered unsandboxed.`,
+  );
+}
+
+/**
+ * Which EL8 release the private runtime was built from, per the stamp the library
+ * step leaves beside it (the installer's own notice reads the same file). The
+ * exact release is the INSTALLER's fact, not ours: read it, never hardcode it, and
+ * say plain "8" when the stamp is absent rather than guess a point release.
+ * Sanitised and capped — it is a file under the cache and its content goes
+ * straight to a terminal.
+ */
+function privateRuntimeRelease(): string | undefined {
+  try {
+    const stamp = fs.readFileSync(path.join(glibcDir(), '.el8-release'), 'utf8');
+    return stamp.split('\n', 1)[0].replace(/[^\w.+-]/g, '').slice(0, 20) || undefined;
+  } catch {
+    return undefined; // no stamp — the notice stands without a release
+  }
+}
+
+/** The fontconfig file the library step writes beside the sysroot, when it did. */
+function sysrootFontsConf(): string | undefined {
+  const file = path.join(sysrootDir(), 'fonts.conf');
+  return fs.existsSync(file) ? file : undefined;
+}
+
+/**
+ * The COMPLETE library environment a BROWSER launch needs on a private-glibc
+ * host — and `undefined` on every other host, which Playwright treats exactly as
+ * "not given". This process's environment, plus, in front of it: the private
+ * glibc dir, then the sysroot's dirs.
+ *
+ * The private dir must be on the path and not merely in the patched rpath:
+ * without it the system's own /lib64/librt.so.1 is still pulled in transitively
+ * and fails with `undefined symbol: __clock_nanosleep, version GLIBC_PRIVATE`
+ * (measured on CentOS 7, 2026-09-29). The sysroot's dirs are here rather than on
+ * process.env because on such a host they are EL8 libraries — see useSysroot().
+ *
+ * Deliberately NOT applied to this process the way useSysroot() applies the
+ * sysroot on a healthy host: the server's own Node keeps the SYSTEM loader and
+ * the system libc, because putting a foreign libc.so.6 in front of a Node that
+ * was linked against the host's would kill the server on the very host this
+ * exists to support. These libraries reach the browser through a launch option
+ * only — and since Playwright REPLACES the environment rather than merging it,
+ * process.env is copied in here.
+ *
+ * `version` is the same test seam as legacyGlibc()'s.
+ */
+export function browserGlibcEnv(version = RUNTIME_GLIBC): Record<string, string> | undefined {
+  if (!legacyGlibc(version)) return undefined;
+  noteLegacyRuntime(version);
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+  env.LD_LIBRARY_PATH = [glibcDir(), ...sysrootLibDirs(), process.env.LD_LIBRARY_PATH]
+    .filter(Boolean)
+    .join(':');
+  const fontsConf = sysrootFontsConf();
+  if (!env.FONTCONFIG_FILE && fontsConf) env.FONTCONFIG_FILE = fontsConf;
+  return env;
+}
+
+/**
  * Put the sysroot's libraries on the path of every browser this process starts.
  * Playwright hands process.env to the browser, so all three launch sites and the
  * installer's check pick it up from here. Runs before detectChromeMajor below,
  * which runs the browser binary too. Only packages the host was MISSING were
  * unpacked, so nothing installed system-wide is shadowed. A fontconfig file is
  * written alongside only when the host had no fontconfig of its own.
+ *
+ * NOT on a private-glibc host. There the sysroot holds EL8 libraries, built
+ * against the private glibc 2.28 — and process.env is inherited by every CHILD
+ * PROCESS, not just the browser: `rpm2cpio`, `cpio`, `curl`, `ldd`, `sh`, a
+ * subprocess playwright. An EL8 libz or libpcre in front of a CentOS 7 /bin/sh
+ * breaks the very tools the installer re-runs with on its second run. So on such
+ * a host nothing from the sysroot reaches this process at all, and
+ * browserGlibcEnv() carries the same dirs to the browser alone.
  */
 function useSysroot(): void {
-  if (process.platform !== 'linux') return;
+  if (process.platform !== 'linux' || legacyGlibc()) return;
   const dirs = sysrootLibDirs();
   if (!dirs.length) return;
   const prev = process.env.LD_LIBRARY_PATH;
   process.env.LD_LIBRARY_PATH = [...dirs, ...(prev ? [prev] : [])].join(':');
-  const fontsConf = path.join(sysrootDir(), 'fonts.conf');
-  if (!process.env.FONTCONFIG_FILE && fs.existsSync(fontsConf)) process.env.FONTCONFIG_FILE = fontsConf;
+  const fontsConf = sysrootFontsConf();
+  if (!process.env.FONTCONFIG_FILE && fontsConf) process.env.FONTCONFIG_FILE = fontsConf;
 }
 
 useSysroot();
@@ -150,6 +322,11 @@ const PLATFORM_TOKEN =
  * Runs once at module load (~1 subprocess); falls back to a recent major if the
  * binary can't be queried. NOTE: attach-mode capture uses the plain real Chrome's
  * NATIVE UA and never touches this — this only masks the Playwright-driven path.
+ *
+ * This RUNS the browser binary, so it is a launch site like any other and takes
+ * the private glibc env too: on a patched host without it the binary cannot start
+ * at all, the fallback below would take over, and the UA would then lie about the
+ * major on precisely the host this supports.
  */
 function detectChromeMajor(): number {
   const FALLBACK = 150;
@@ -159,6 +336,7 @@ function detectChromeMajor(): number {
     const out = execFileSync(bin, ['--version'], {
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: browserGlibcEnv(), // undefined ⇒ Node passes process.env, as before
     }).toString();
     const m = out.match(/\b(\d+)\.\d+\.\d+/);
     if (m) return parseInt(m[1], 10);
@@ -189,7 +367,22 @@ export const STEALTH_ARGS = ['--disable-blink-features=AutomationControlled'];
  * (BROWSER_CHANNEL): every tool works, and the hardest walls are more likely to
  * challenge it. Spread into chromium.launch().
  */
-export const STEALTH_LAUNCH = { channel: BROWSER_CHANNEL, args: STEALTH_ARGS };
+export const STEALTH_LAUNCH = {
+  channel: BROWSER_CHANNEL,
+  args: STEALTH_ARGS,
+  /**
+   * A GETTER, not a value: it is read when this object is SPREAD into a launch,
+   * so no snapshot of the environment is ever frozen at module load, and a
+   * healthy host spreads `env: undefined` — which Playwright handles as "not
+   * given" (`env: options.env ? … : undefined`, coreBundle), so nothing about
+   * those launches changes. Every site that spreads STEALTH_LAUNCH (web_fetch,
+   * session_login, session_status, the installer's check-browser) therefore picks
+   * a patched host's private glibc up from here without knowing about it.
+   */
+  get env(): Record<string, string> | undefined {
+    return browserGlibcEnv();
+  },
+};
 
 /** addInitScript payload: erase the headless tells before any page script runs. */
 export const STEALTH_INIT = `

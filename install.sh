@@ -78,22 +78,81 @@ sha256_of() {
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
+# ── 1a. Hosts whose C library is older than Node's own builds need ─────────────
+# Every official Node.js build from 22 onwards is linked against glibc 2.28, so on
+# CentOS 7 (glibc 2.17) the download above unpacked fine and then would not run at
+# all. nodejs.org has no build for such a host; unofficial-builds.nodejs.org does —
+# `linux-x64-glibc-217`, x86_64 only, with libstdc++ linked in statically, so its
+# only needs are libc/libm/libdl/libpthread and the loader.
+#
+# This host's glibc as MAJOR.MINOR, or nothing when it cannot be read — musl, or
+# any getconf/ldd that answers something else. NOTHING MEANS HEALTHY: guessing
+# "too old" would swap a perfectly good Node for an unofficial build, so every
+# comparison below treats an unreadable version as new enough.
+UNOFFICIAL_NODE_BASE=https://unofficial-builds.nodejs.org/download/release
+host_glibc() {
+  # `|| v=` on both: a getconf that does not know the variable exits nonzero, and
+  # under `set -o pipefail` that failure would take the whole installer down with
+  # `set -e` rather than falling through to the ldd reading — or to neither.
+  local v=
+  if command -v getconf >/dev/null 2>&1; then v="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '$1 == "glibc" { print $2 }')" || v=; fi
+  if [ -z "$v" ] && command -v ldd >/dev/null 2>&1; then v="$(ldd --version 2>&1 | awk 'NR == 1 && /GNU libc|GLIBC/ { print $NF }')" || v=; fi
+  case "$v" in [0-9]*.[0-9]*) printf '%s' "$v" ;; *) ;; esac
+}
+
+# Is this host's glibc older than $1.$2? Unreadable → no (see host_glibc).
+glibc_older_than() {
+  local v major minor
+  v="$(host_glibc)"; [ -n "$v" ] || return 1
+  major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
+  [ "$major" -lt "$1" ] || { [ "$major" -eq "$1" ] && [ "$minor" -lt "$2" ]; }
+}
+
+# The newest Node LTS that a given build variant actually ships.
+# nodejs.org's index.tab is the only one that MARKS LTS — column 10 is the LTS
+# codename, "-" when not LTS, and on unofficial-builds' copy it is "-" on every
+# row — so the candidate list always comes from nodejs.org, newest first. For an
+# unofficial variant, that index's own `files` column (3) is what says which of
+# those versions has the build. Both awks read to the end: closing the pipe early
+# breaks the download with SIGPIPE, which pipefail turns into a failed install.
+node_lts_version() { # variant, e.g. linux-x64 or linux-x64-glibc-217
+  local lts
+  lts="$(fetch https://nodejs.org/dist/index.tab | awk -F'\t' 'NR > 1 && $10 != "-" { print $1 }')"
+  [ -n "$lts" ] || die "Could not read the current Node.js LTS version from nodejs.org."
+  case "$1" in
+    *-glibc-217)
+      fetch "$UNOFFICIAL_NODE_BASE/index.tab" | awk -F'\t' -v variant="$1" -v lts="$lts" '
+        NR > 1 && index($3, variant) { have[$1] = 1 }
+        END { n = split(lts, newest_first, "\n"); for (i = 1; i <= n; i++) if (newest_first[i] in have) { print newest_first[i]; exit } }'
+      ;;
+    *) printf '%s\n' "$lts" | awk 'NR == 1 { print }' ;;
+  esac
+}
+
 fetch_node() {
-  local os arch ver name tmp want got
+  local os arch ver name tmp want got base variant
   case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "No automatic Node.js download for $(uname -s). Install Node >=22.13.0 and re-run." ;; esac
   case "$(uname -m)" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; *) die "No automatic Node.js download for $(uname -m). Install Node >=22.13.0 and re-run." ;; esac
-  # index.tab is newest first; column 10 is the LTS codename, "-" when not LTS.
-  # awk reads to the end (no early exit): closing the pipe early breaks the
-  # download with SIGPIPE, and pipefail turns that into a failed install.
-  ver="$(fetch https://nodejs.org/dist/index.tab | awk -F'\t' '!v && NR > 1 && $10 != "-" { v = $1 } END { print v }')"
-  [ -n "$ver" ] || die "Could not read the current Node.js LTS version from nodejs.org."
-  name="node-$ver-$os-$arch"
-  say "Downloading Node.js $ver (LTS) into $PRIVATE_NODE_DIR (no root needed)…"
+  base="https://nodejs.org/dist"
+  variant="$os-$arch"
+  if [ "$os" = linux ] && glibc_older_than 2 28; then
+    # arm64 has no glibc-217 build at all, so this is where such a host stops —
+    # with the real cause and the real remedy, not "its C library may be too old".
+    [ "$arch" = x64 ] || die "This host's glibc is $(host_glibc) and every official Node.js build needs 2.28 or newer. unofficial-builds.nodejs.org has a glibc-2.17 build for x86_64 only, not for $(uname -m), so there is nothing to download here. Install Node >=22.13.0 another way (a distro backport, a source build) and re-run."
+    base="$UNOFFICIAL_NODE_BASE"
+    variant="linux-x64-glibc-217"
+    warn "This host's glibc is $(host_glibc); official Node.js builds need 2.28. Using the $variant build from unofficial-builds.nodejs.org instead."
+  fi
+  ver="$(node_lts_version "$variant")"
+  [ -n "$ver" ] || die "No Node.js LTS release has a $variant build. Install Node >=22.13.0 and re-run."
+  name="node-$ver-$variant"
+  say "Downloading Node.js $ver (LTS, $variant) into $PRIVATE_NODE_DIR (no root needed)…"
   tmp="$(mktemp -d)"
-  fetch "https://nodejs.org/dist/$ver/$name.tar.gz" > "$tmp/$name.tar.gz" || { rm -rf "$tmp"; die "Node.js download failed."; }
-  want="$(fetch "https://nodejs.org/dist/$ver/SHASUMS256.txt" | awk -v f="$name.tar.gz" '$2 == f { print $1 }')"
+  fetch "$base/$ver/$name.tar.gz" > "$tmp/$name.tar.gz" || { rm -rf "$tmp"; die "Node.js download failed."; }
+  want="$(fetch "$base/$ver/SHASUMS256.txt" | awk -v f="$name.tar.gz" '$2 == f { print $1 }')"
   got="$(sha256_of "$tmp/$name.tar.gz")"
   if [ -z "$want" ] || [ "$want" != "$got" ]; then rm -rf "$tmp"; die "Node.js download failed its checksum; nothing was installed."; fi
+  say "Checksum verified: $name.tar.gz sha256 $got"
   tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
   rm -rf "$PRIVATE_NODE_DIR"
   mkdir -p "$(dirname "$PRIVATE_NODE_DIR")"
@@ -109,7 +168,12 @@ if ! system_node_ok; then
   if ! { [ -x "$PRIVATE_NODE_DIR/bin/node" ] && node_ok "$("$PRIVATE_NODE_DIR/bin/node" -p 'process.versions.node' 2>/dev/null)"; }; then
     fetch_node
   fi
-  "$PRIVATE_NODE_DIR/bin/node" -v >/dev/null 2>&1 || die "The downloaded Node.js does not run on this host (its C library may be too old). Install Node >=22.13.0 and re-run."
+  # A host below the 2.28 line got the glibc-217 build above, so reaching this is
+  # something else again — name what was measured so the report is useful.
+  if ! "$PRIVATE_NODE_DIR/bin/node" -v >/dev/null 2>&1; then
+    HOST_GLIBC="$(host_glibc)"
+    die "The downloaded Node.js does not run on this host (glibc ${HOST_GLIBC:-unreadable}, $(uname -m)). Install Node >=22.13.0 and re-run."
+  fi
   export PATH="$PRIVATE_NODE_DIR/bin:$PATH"
   NODE_CMD="$PRIVATE_NODE_DIR/bin/node"
 fi

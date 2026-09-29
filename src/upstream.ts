@@ -58,7 +58,14 @@ import path from 'node:path';
 
 import { dropTempProfile, launchOnPool, type ProfilePool } from './browser.js';
 import { loadSecrets, sessionFilePath } from './secrets.js';
-import { BROWSER_CHANNEL, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
+import {
+  BROWSER_CHANNEL,
+  browserGlibcEnv,
+  legacyGlibc,
+  STEALTH_ARGS,
+  STEALTH_INIT,
+  stealthContextOptions,
+} from './stealth.js';
 import { egressRestricted, installContextEgressGuard, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
@@ -100,17 +107,29 @@ function stealthInitFile(): string {
  *
  * `chromiumSandbox` and the kept `--disable-extensions` default are what
  * @playwright/mcp's own launch set for Chrome, kept so taking the launch over
- * changes nothing about the browser itself. The one exception is root: Chrome
- * refuses to start sandboxed as root ("Running as root without --no-sandbox is
- * not supported", measured 2026-09-26 on a root install), so there browser_*
- * runs unsandboxed, as web_fetch's launch already does everywhere.
+ * changes nothing about the browser itself. There are two exceptions, and both
+ * run unsandboxed, as web_fetch's launch already does everywhere:
+ *   - root: Chrome refuses to start sandboxed as root ("Running as root without
+ *     --no-sandbox is not supported", measured 2026-09-26 on a root install);
+ *   - a legacy-glibc host whose browsers were patched onto a private glibc
+ *     (stealth.ts). What was MEASURED there is that the patched browser launches
+ *     with --no-sandbox as a non-root uid (CentOS 7, 2026-09-29) — not that a
+ *     sandboxed launch fails, and not the usual explanation for it (CentOS 7
+ *     defaults unprivileged user namespaces off), which nobody in this project
+ *     has verified. The gate is therefore WIDER than the measurement: every
+ *     sub-2.25 host that was provisioned runs browser_* unsandboxed, including
+ *     one where the sandbox might have worked. That class is accepted
+ *     deliberately (security review C-3; ledger DEC), not proven host by host.
+ * Such a host also needs the private glibc on the browser's library path, which
+ * is what `env` carries — undefined, i.e. absent, on every other host.
  */
 export function upstreamLaunch(storageState?: string) {
   const launchOptions: LaunchOptions = {
     headless: true,
     channel: BROWSER_CHANNEL,
     args: STEALTH_ARGS,
-    chromiumSandbox: process.getuid?.() !== 0,
+    chromiumSandbox: process.getuid?.() !== 0 && !legacyGlibc(),
+    env: browserGlibcEnv(),
     ignoreDefaultArgs: ['--disable-extensions'],
   };
   const contextOptions = storageState ? { ...stealthContextOptions, storageState } : { ...stealthContextOptions };

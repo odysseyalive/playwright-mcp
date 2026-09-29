@@ -32,7 +32,14 @@ import path from 'node:path';
 import { chromium, type BrowserContext } from 'playwright';
 
 import { seedConsent } from './consent.js';
-import { BROWSER_CHANNEL, CHROME_MAJOR, STEALTH_ARGS, STEALTH_INIT, stealthContextOptions } from './stealth.js';
+import {
+  BROWSER_CHANNEL,
+  browserGlibcEnv,
+  CHROME_MAJOR,
+  STEALTH_ARGS,
+  STEALTH_INIT,
+  stealthContextOptions,
+} from './stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:browser]', ...args);
 
@@ -214,6 +221,11 @@ async function openProfile(dir: string): Promise<BrowserContext> {
     channel: BROWSER_CHANNEL,
     headless: true,
     args: STEALTH_ARGS,
+    // The private glibc a legacy host's browser was patched onto (stealth.ts).
+    // undefined everywhere else, which Playwright reads as "not given". This
+    // launch is already unsandboxed — Playwright's chromiumSandbox default is
+    // false — so it needs nothing else for such a host.
+    env: browserGlibcEnv(),
     ...stealthContextOptions,
   });
   await context.addInitScript(STEALTH_INIT);

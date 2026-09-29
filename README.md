@@ -30,10 +30,13 @@ Thirty-two total. Twenty-three are the wrapped `browser_*` set (navigate, snapsh
 - Node 22.13 or newer. On Linux and macOS the installer takes care of this for you (see below).
 - The Claude Code CLI (`claude`) on your PATH
 - About 170 MB for a one-time Chromium download. On a bare Linux server the installer also fetches the system libraries Chromium needs. Nothing on the Linux/macOS side needs root.
+- An old x86_64 Linux distribution works too, and it carries two security trade-offs you should read before you install on one. See [Older Linux hosts](#older-linux-hosts-glibc-older-than-228).
 
 ### Getting a current Node.js
 
 On Linux and macOS you don't have to do anything. If the system Node is older than 22.13, or there isn't one, `install.sh` downloads the current LTS from nodejs.org into `~/.cache/playwright-mcp/node`, checks it against the published checksum, and builds and registers the server with it. Your system Node stays as it was. The download goes through curl, wget, or failing both, the old Node itself.
+
+Every official Node build from 22 onward needs glibc 2.28, which some long-lived Linux installs don't have. On such a host the installer takes the same LTS version from `unofficial-builds.nodejs.org` instead, the `linux-x64-glibc-217` build, checksummed the same way. More on that case below.
 
 If you'd rather have a current Node on your PATH for everything, use the [`n`](https://github.com/tj/n) version manager through npx. Any old Node brings npx with it. Without root, point `n` at a directory you own.
 
@@ -56,6 +59,24 @@ On Windows, grab the installer from [nodejs.org](https://nodejs.org/) or run:
 ```powershell
 winget install OpenJS.NodeJS.LTS
 ```
+
+### Older Linux hosts (glibc older than 2.28)
+
+CentOS 7 and the distributions of that era are old enough that neither a current Node nor Chromium will run on them as shipped. The installer handles that case, and it still never asks for root.
+
+Two thresholds, both read off the host's own glibc. Below 2.28 the private Node is the `linux-x64-glibc-217` build described above. Below 2.25, which is the floor Chromium's own builds were measured at, the installer also assembles a private glibc 2.28 runtime from checksum-pinned AlmaLinux 8.9 packages on `vault.almalinux.org`, fetches a pinned static `patchelf` from `github.com`, and patches Chromium's executables to run under that private loader. Anything at 2.28 or newer takes none of those paths, and so does a host whose glibc version can't be read at all, musl for instance. Healthy hosts are untouched.
+
+All of it lands under `~/.cache/playwright-mcp/`, in `node/`, `glibc/`, `el8/`, `patchelf/`, and `sysroot/`. Nothing is installed system-wide and nothing needs sudo.
+
+**On a host that needed that private runtime, Chromium runs with `--no-sandbox`, and it runs against frozen libraries.** Two trade-offs, and both are the reason to read this section before installing on such a host. The browser renders pages nobody vetted, and for the `browser_*` tools the sandbox is the layer that normally keeps a compromised renderer away from the rest of the account it runs as. That layer is not attempted here. Nobody measured whether the sandbox would have worked on any particular old host either, and the rule covers every host below 2.25, so the whole class is accepted rather than each machine checked. The other half is the runtime itself. AlmaLinux 8.9 is a closed minor, pinned exactly so its checksums cannot move, which also means those libraries never receive a security update. The only thing that changes them is a code change here.
+
+Nothing about the sandbox changed anywhere else. The browser behind the `browser_*` tools keeps it on every other host, the long-standing exception being a root uid, where Chromium refuses the sandbox itself.
+
+arm64 hosts with old glibc are not supported. There is no glibc-2.17 Node build for arm64 to fetch, so the installer stops there with a message naming that as the reason instead of failing further along. That message comes from reading `install.sh`. No arm64 host was run.
+
+The old-glibc path needs to reach `unofficial-builds.nodejs.org`, `vault.almalinux.org`, `github.com`, and `cdn.playwright.dev`. A host firewalled off from any of them fails at that fetch with the URL in the error.
+
+This was all measured in exactly one place, and only one. A clean-cache `./install.sh`, then `browser_navigate` plus a snapshot, then a `web_fetch`, on CentOS 7 x86_64 as a non-root uid, inside a container. No real old-glibc machine has been tested yet, and neither has that network reach from behind a firewall that blocks any of those four hosts.
 
 ## Install
 
@@ -150,6 +171,8 @@ Beyond the basic scaffold, three `suite_*` tools carry a full, project-agnostic 
 ## Untrusted content and prompt injection
 
 Every page this server fetches is controlled by somebody else. A page carrying instructions aimed at the model reading it is indirect prompt injection, and no known mitigation fully prevents it. What follows is what this server does about it, and what it does not fix.
+
+One piece of the exposure story lives up in the install notes rather than here, because it depends on your host. On a Linux host old enough to need the private glibc runtime, Chromium runs with `--no-sandbox`, against a frozen set of AlmaLinux 8.9 libraries that get no security updates. See [Older Linux hosts](#older-linux-hosts-glibc-older-than-228).
 
 The technique is called spotlighting (Hines et al., Microsoft Research, arXiv:2403.14720). This server uses its delimiting mode, which fences untrusted content inside explicit delimiters with a warning in the opening tag. The project's internal name for the control is provenance framing. The paper's other two modes were considered and rejected. Datamarking was dropped for token cost on large documents and because it mangles code blocks and the quoted citation text `web_fetch` exists to produce. Encoding was not implemented.
 
