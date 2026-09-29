@@ -67,7 +67,10 @@ function fail(msg, libs) {
 const bins = binaries();
 if (!bins.length) fail('No Chromium binary found to check. Did `npx playwright install chromium` run?');
 const before = missingLibs(bins);
-if (!before.length) process.exit(0);
+if (!before.length) {
+  console.log('Chromium system libraries OK.');
+  process.exit(0);
+}
 
 console.log(`Chromium is missing ${before.length} system libraries; fetching them into ${ROOT} (no root needed)…`);
 if (!['apt-get', 'dpkg-deb', 'dpkg-query'].every(has))
