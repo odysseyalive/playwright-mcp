@@ -23,8 +23,14 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
-import { chromium, type Browser } from 'playwright';
+import { chromium, type Browser, type BrowserContext } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+// Type-only, so nothing is imported at runtime and the registry that imports THIS
+// module is not part of a require cycle. ToolContext carries the surface trust
+// tier (and the progress channel) the tool handlers below need.
+import type { ToolContext } from '../tools.js';
+import type { SurfaceTrust } from '../index.js';
 
 import {
   sessionsDir,
@@ -80,7 +86,17 @@ export interface LoginOptions {
   // "the challenge markers are gone on the SAME url". Implies attach (a wall that
   // needs a human is exactly the wall that rejects a driven browser).
   challenge?: boolean;
-  timeoutMs?: number; // how long to wait for login (default 300s headed/attach / 30s headless)
+  // An OPT-IN cap on the wait. Absent is the normal case for a human login: see
+  // `wait` below and resolveHumanWait(). The HEADLESS credential path still reads
+  // this directly and still defaults to 30s — there is no human there to wait for.
+  timeoutMs?: number;
+  /**
+   * The resolved human-present wait. Set by the TOOL HANDLER, which is the only
+   * layer that knows the surface trust tier, and therefore the only layer that can
+   * ask for `{ deadline: 'none' }`. Absent means the surface is unknown, and an
+   * unknown surface is treated as a non-stdio one — capped, not unbounded.
+   */
+  wait?: WaitBudget;
   credKeys?: { user: string; pass: string }; // dotenv key names (project .env / secrets.env)
   envFile?: string; // explicit dotenv file for credKeys (default: ./.env in cwd, then secrets.env)
   selectors?: { user?: string; pass?: string; submit?: string };
@@ -100,6 +116,12 @@ export interface LoginResult {
    * `capturedDetail` instead.
    */
   error?: string;
+  /**
+   * The failure was the human closing the window, not the site or the capture. Set
+   * only for a LoginCancelledError, so a caller can tell "you stopped" from "it
+   * broke" without reading the sentence.
+   */
+  cancelled?: true;
   /**
    * The CAPTURED half of a failure diagnosis: the final URL after redirects and
    * the page's own `<title>`. Both are attacker-choosable on a hostile or
@@ -148,6 +170,161 @@ class CapturedTextError extends Error {
     super(message);
     this.name = 'CapturedTextError';
   }
+}
+
+// ── how long a human gets, and what ends the wait ─────────────────────────────
+// A human login has no honest duration. Password-only, password + TOTP, an SSO
+// hop through two identity providers, a CAPTCHA in the middle — the caller cannot
+// tell which it is from outside, and the old 300s default cut the long ones off
+// mid-2FA. So a human-present capture waits with NO deadline and ends on a real
+// END SIGNAL instead: the human finished, or the window is gone.
+//
+// The deadline is replaced, never merely lengthened, because every finite number
+// is wrong for somebody. What replaces it has to be load-bearing: if the window
+// is gone and nothing notices, the tool hangs for the life of the process.
+
+/** The wait the human gets. `'none'` is UNBOUNDED — only the tool handler may ask for it. */
+export type WaitBudget = { deadline: 'none' } | { deadline: 'capped'; ms: number };
+
+/**
+ * The bounded default kept for every surface that is NOT stdio, and the fail-closed
+ * default anywhere the surface is unknown.
+ */
+export const CAPPED_HUMAN_WAIT_MS = 300_000;
+
+/**
+ * Resolve the human-present wait from the caller's `timeoutMs` and the SURFACE the
+ * call arrived on (engineering-lead's trust-tier rule, 2026-09-29):
+ *
+ *  • an explicit positive `timeoutMs` always arms a real deadline — an opt-in cap;
+ *  • otherwise `stdio` (the local Claude Code process, a human at this display)
+ *    waits with no deadline;
+ *  • otherwise — `local` and `cloud` HTTP surfaces — the 300s cap STAYS. The headed
+ *    window opens on the SERVER host, so on a non-stdio surface there is nobody at
+ *    that display and an unbounded wait is an unreclaimable browser.
+ *
+ * NaN / zero / negative are treated as ABSENT (the surface decides) rather than as
+ * Playwright's "0 means forever": a caller that passes garbage asked for nothing.
+ *
+ * Pure, so the tier rule is testable without a surface or a browser.
+ */
+export function resolveHumanWait(explicit: number | undefined, trust: SurfaceTrust): WaitBudget {
+  if (explicit !== undefined && Number.isFinite(explicit) && explicit > 0)
+    return { deadline: 'capped', ms: explicit };
+  return trust === 'stdio' ? { deadline: 'none' } : { deadline: 'capped', ms: CAPPED_HUMAN_WAIT_MS };
+}
+
+/** `Infinity` for an unbounded budget — so one `while (Date.now() < deadline)` shape covers both. */
+const deadlineOf = (w: WaitBudget): number => (w.deadline === 'none' ? Infinity : Date.now() + w.ms);
+
+/** Playwright's own timeout convention: 0 disables it. Only reached for an unbounded budget. */
+const pwTimeout = (w: WaitBudget): number => (w.deadline === 'none' ? 0 : w.ms);
+
+/**
+ * The human closed the window (or the browser went away) before the login finished.
+ *
+ * A NAMED error, not a timeout: nothing was saved, nothing is wrong with the site,
+ * and the remedy is different — reopen and leave the window alone until the tool
+ * reports the session saved. It is also what guarantees the unbounded wait can end:
+ * every human-present path races this against completion.
+ */
+export class LoginCancelledError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LoginCancelledError';
+  }
+}
+
+const CANCELLED_DRIVEN =
+  'login cancelled: the window was closed before the login finished — nothing was saved. The capture ' +
+  'waits as long as you need, so reopen it with session_login and leave the window open until the tool ' +
+  'reports the session saved.';
+const CANCELLED_ATTACH =
+  'login cancelled: the Chrome window was closed before the login finished — nothing was saved. The ' +
+  'capture waits as long as you need, so reopen it and leave the window open until the tool reports the ' +
+  'session saved.';
+const CANCELLED_CHALLENGE =
+  'challenge cancelled: the Chrome window was closed before the wall was cleared — nothing was saved. ' +
+  'Reopen it and stay on the page until the tool reports the session saved.';
+
+/** The end signal a human-present wait races against completion. */
+export interface CaptureCancel {
+  /** Rejects with LoginCancelledError once the window is gone; otherwise never settles. */
+  readonly promise: Promise<never>;
+  /** Already fired — every unbounded poll loop checks this so none can spin on forever. */
+  cancelled(): boolean;
+}
+
+/**
+ * Grace between "a window closed" and giving up.
+ *
+ * Two jobs. It lets an in-flight completion win the race — the human who finishes
+ * and immediately closes the window is the common case, and the 1.5s stability hold
+ * in waitPastLogin has to land somewhere. And it lets an SSO POPUP appear: an
+ * identity provider that opens a popup and closes the original tab would otherwise
+ * read as "the window was closed" and cancel the very login this exists to fix.
+ */
+const WINDOW_CLOSE_GRACE_MS = 3000;
+
+/**
+ * "The window is gone", for the DRIVEN (chromium.launch) capture path.
+ *
+ * MEASURED 2026-09-29 on playwright 1.61.0-alpha, headed AND headless: closing the
+ * last page does NOT disconnect the browser — `isConnected()` stays true and
+ * `context.pages()` drops to 0. So `disconnected` alone can never end this wait;
+ * the zero-pages arm is the load-bearing one, and both are wired.
+ *
+ * A closed PAGE is deliberately not a cancel by itself. An SSO provider that pops a
+ * window and closes the original tab is a login in progress, not an abandoned one —
+ * so after the grace we ask again whether ANY page is left. Fully injectable
+ * (`probe` + `schedule`), the same way makeAuthCookieProbe takes its clock, so the
+ * decision is testable with no browser and no wall-clock wait.
+ */
+export function makeWindowClosedWatch(
+  probe: { pagesOpen: () => number; connected: () => boolean },
+  deps: { schedule?: (fn: () => void, ms: number) => void; graceMs?: number; message?: string } = {},
+): CaptureCancel & { pageClosed(): void; browserGone(): void } {
+  const schedule =
+    deps.schedule ??
+    ((fn: () => void, ms: number) => {
+      setTimeout(fn, ms).unref();
+    });
+  const graceMs = deps.graceMs ?? WINDOW_CLOSE_GRACE_MS;
+  let fired = false;
+  let reject!: (err: Error) => void;
+  const promise = new Promise<never>((_, rj) => {
+    reject = rj;
+  });
+  // One handler attached at birth so a cancel nobody raced (the capture already
+  // finished) is never an unhandled rejection. Promise.race still sees it.
+  promise.catch(() => {});
+  const fire = () => {
+    if (fired) return;
+    fired = true;
+    reject(new LoginCancelledError(deps.message ?? CANCELLED_DRIVEN));
+  };
+  return {
+    promise,
+    cancelled: () => fired,
+    /** A page closed — cancel only once nothing is left to log in with. */
+    pageClosed() {
+      schedule(() => {
+        if (!probe.connected() || probe.pagesOpen() === 0) fire();
+      }, graceMs);
+    },
+    /** The browser itself is gone; nothing can complete after this. */
+    browserGone() {
+      schedule(fire, graceMs);
+    },
+  };
+}
+
+/** A LoginCancelledError anywhere in `err`, including inside Promise.any's AggregateError. */
+function cancellation(err: unknown): LoginCancelledError | undefined {
+  if (err instanceof LoginCancelledError) return err;
+  if (err instanceof AggregateError)
+    return (err.errors as unknown[]).map(cancellation).find((e): e is LoginCancelledError => !!e);
+  return undefined;
 }
 
 /**
@@ -209,6 +386,32 @@ function restrictCapturedArtifact(out: string): string {
   }
 }
 
+/**
+ * Wire the driven browser's own events to makeWindowClosedWatch.
+ *
+ * Kept apart from the watch so the DECISION ("is anything left to log in with?")
+ * stays pure and testable and only this thin adapter touches Playwright. Every
+ * page is watched, not just the first — a popup that becomes the login is the
+ * page whose closing matters, and `context.on('page')` is how it arrives.
+ */
+function watchDrivenWindow(
+  browser: Browser,
+  context: BrowserContext,
+  first: PwPage,
+  message: string,
+): CaptureCancel {
+  const watch = makeWindowClosedWatch(
+    { pagesOpen: () => context.pages().filter((p) => !p.isClosed()).length, connected: () => browser.isConnected() },
+    { message },
+  );
+  const onPage = (p: PwPage) => p.once('close', () => watch.pageClosed());
+  onPage(first);
+  context.on('page', onPage);
+  context.once('close', () => watch.browserGone());
+  browser.once('disconnected', () => watch.browserGone());
+  return watch;
+}
+
 export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   const mode: 'headless' | 'headed' = opts.headed ? 'headed' : 'headless';
   const out = sessionFilePath(opts.name);
@@ -247,11 +450,19 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       // Human completes the challenge in the SEPARATE automation window this
       // launched (not their everyday browser). We auto-detect completion when
       // they move past the login page; an explicit successSignal, if given,
-      // also resolves. Generous timeout for typing + 2FA.
+      // also resolves. NO deadline on the stdio surface — a person typing a
+      // password, waiting for an SMS code and clicking through two SSO hops takes
+      // however long it takes. The wait ends when they finish or when the window
+      // is gone (cancel), never on a clock somebody guessed.
+      //
+      // An absent `wait` is a DIRECT caller, not a surface: capped, never unbounded.
+      const wait = opts.wait ?? resolveHumanWait(opts.timeoutMs, 'local');
       log(
-        `headed login for "${opts.name}" — a SEPARATE automation window opened; complete the login in THAT window`,
+        `headed login for "${opts.name}" — a SEPARATE automation window opened; complete the login in THAT window` +
+          (wait.deadline === 'none' ? ' (no time limit; closing the window cancels)' : ''),
       );
-      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 300_000, authGained);
+      const cancel = watchDrivenWindow(browser, context, page, CANCELLED_DRIVEN);
+      await waitForLogin(page, loginUrl, opts.successSignal, wait, authGained, cancel);
     } else {
       const sel = { ...DEFAULT_SELECTORS, ...opts.selectors };
       const lookup = { envFile: opts.envFile };
@@ -267,7 +478,15 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
         page.click(sel.submit).catch(() => page.keyboard.press('Enter')),
         page.waitForLoadState('domcontentloaded').catch(() => {}),
       ]);
-      await waitForLogin(page, loginUrl, opts.successSignal, opts.timeoutMs ?? 30_000, authGained);
+      // UNCHANGED: the credential path has no human in it, so a clock is the right
+      // instrument and 30s is still the default.
+      await waitForLogin(
+        page,
+        loginUrl,
+        opts.successSignal,
+        { deadline: 'capped', ms: opts.timeoutMs ?? 30_000 },
+        authGained,
+      );
     }
 
     // The wait heuristics can resolve while the human is still mid-login (see
@@ -346,6 +565,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       mode,
       ok: false,
       error: err instanceof Error ? err.message : String(err),
+      ...(err instanceof LoginCancelledError ? { cancelled: true as const } : {}),
       ...(captured ? { capturedDetail: captured.captured, capturedSource: captured.source } : {}),
     };
   } finally {
@@ -508,28 +728,106 @@ export function challengeCleared(currentUrl: string, targetUrl: string, title: s
 }
 
 /**
+ * Is a DevTools read failure evidence the endpoint is GONE, or just a miss?
+ *
+ * Both poll loops used to swallow every failure as "endpoint hiccup — keep
+ * waiting". With a deadline that merely wasted time; with NO deadline it is the
+ * forever-hang, so the two cases have to be told apart. A connection-level refusal
+ * means nothing is listening on that port any more — Chrome exited. A read that
+ * timed out, or answered with something unparseable, is a busy browser mid-navigation
+ * and says nothing about whether it is alive.
+ *
+ * Pure, so the classification is testable with a synthetic error.
+ */
+export function devtoolsUnreachable(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && ['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH'].includes(code))
+    return true;
+  return /socket hang up/i.test(err instanceof Error ? err.message : '');
+}
+
+/** Consecutive unreachable reads before the endpoint counts as gone on its own evidence. */
+const DEVTOOLS_GONE_STRIKES = 3;
+/** Consecutive polls with NO page target at all before a windowless Chrome counts as gone. */
+const NO_TARGET_STRIKES = 10;
+
+/**
+ * "Has the attached Chrome gone away?", accumulated across polls.
+ *
+ * Strikes rather than a single failure, because one refused read during Chrome's own
+ * teardown of a tab is not proof; a run of them is. A spawned Chrome that has ALSO
+ * exited collapses that to one strike — but the endpoint stays the authority, which
+ * is what keeps a wrapper script that execs and exits (or hands off to a running
+ * Chrome) from reading as a cancelled login.
+ *
+ * `noTargets` covers the other shape of gone: the endpoint still answers while the
+ * human has closed every window. There is nothing left to log in with, and no
+ * completion can ever arrive.
+ */
+export function makeEndpointWatch(strikes = DEVTOOLS_GONE_STRIKES, targetStrikes = NO_TARGET_STRIKES) {
+  let unreachable = 0;
+  let empty = 0;
+  return {
+    /** A read succeeded — reset the unreachable run. */
+    alive(): void {
+      unreachable = 0;
+    },
+    /** A read failed. True once the endpoint is gone for good. */
+    failed(err: unknown, chromeExited: boolean): boolean {
+      if (!devtoolsUnreachable(err)) {
+        unreachable = 0;
+        return false;
+      }
+      unreachable += 1;
+      return chromeExited || unreachable >= strikes;
+    },
+    /** How many page targets this poll saw. True once a windowless Chrome counts as gone. */
+    targets(count: number): boolean {
+      empty = count > 0 ? 0 : empty + 1;
+      return empty >= targetStrikes;
+    },
+  };
+}
+
+/** What ends an attach wait: the budget, and whether the Chrome we spawned has exited. */
+interface AttachWait {
+  wait: WaitBudget;
+  /** The spawned child exited — a hint that makes one unreachable read conclusive. */
+  chromeExited: () => boolean;
+}
+
+/**
  * Poll the DevTools endpoint until `isDone` holds for one of the open page targets,
  * stable for 2s (a challenge clear flickers through intermediate states before the
  * real document settles). Passive by construction: HTTP reads of /json/list only,
  * never a CDP attach, so nothing drives the page while the human works.
+ *
+ * Shared by BOTH attach callers (login and challenge), so the gone-detection above
+ * lands once for both.
  */
 async function pollAttached(
   port: number,
   isDone: (page: { url: string; title: string }) => boolean,
-  timeout: number,
+  w: AttachWait,
   timeoutMessage: string,
+  cancelMessage: string,
 ): Promise<void> {
-  const deadline = Date.now() + timeout;
+  const deadline = deadlineOf(w.wait);
+  const endpoint = makeEndpointWatch();
   let stableSince = 0;
   while (Date.now() < deadline) {
     let pages: Array<{ type?: string; url?: string; title?: string }> = [];
     try {
       pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
-    } catch {
-      /* endpoint hiccup — keep waiting */
+      endpoint.alive();
+    } catch (err) {
+      // A hiccup keeps waiting, exactly as before; an endpoint that is GONE ends it.
+      if (endpoint.failed(err, w.chromeExited())) throw new LoginCancelledError(cancelMessage);
     }
-    const done = pages.some(
-      (p) => p.type === 'page' && typeof p.url === 'string' && isDone({ url: p.url, title: p.title ?? '' }),
+    const targets = pages.filter((p) => p.type === 'page');
+    if (endpoint.targets(targets.length)) throw new LoginCancelledError(cancelMessage);
+    const done = targets.some(
+      (p) => typeof p.url === 'string' && isDone({ url: p.url, title: p.title ?? '' }),
     );
     if (done) {
       if (!stableSince) stableSince = Date.now();
@@ -598,7 +896,7 @@ const safeHostname = (u: string): string => {
  * page normally. So each read is connect → cookies → close, gated by
  * attachCookieReadDecision.
  */
-async function pollAttachedLogin(port: number, loginUrl: string, timeout: number): Promise<void> {
+async function pollAttachedLogin(port: number, loginUrl: string, w: AttachWait): Promise<void> {
   const reg = siteDomain(loginUrl);
   const onSite = (host: string) => {
     const h = host.replace(/^\./, '').toLowerCase();
@@ -614,15 +912,22 @@ async function pollAttachedLogin(port: number, loginUrl: string, timeout: number
   let lastReadAt = 0;
   let lastDone = false; // the verdict of the most recent read, carried across skipped polls
   const start = Date.now();
-  const deadline = Date.now() + timeout;
+  const deadline = deadlineOf(w.wait);
+  const endpoint = makeEndpointWatch();
   let stableSince = 0;
   while (Date.now() < deadline) {
     let pages: Array<{ type?: string; url?: string; title?: string }> = [];
     try {
       pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
-    } catch {
-      /* endpoint hiccup — keep waiting */
+      endpoint.alive();
+    } catch (err) {
+      // Same split as pollAttached: a hiccup keeps waiting, a GONE endpoint cancels.
+      // Without this the "CDP hiccup" catch below would keep an unbounded wait alive
+      // forever after the human closed Chrome.
+      if (endpoint.failed(err, w.chromeExited())) throw new LoginCancelledError(CANCELLED_ATTACH);
     }
+    if (endpoint.targets(pages.filter((p) => p.type === 'page').length))
+      throw new LoginCancelledError(CANCELLED_ATTACH);
     // The login-host page, if its document has rendered. The URL arm observes it
     // every poll (latching the login page, firing when the human leaves it) — that is
     // HTTP only and touches no page. The cookie arms need CDP, so they run only when
@@ -730,13 +1035,14 @@ export function attachCookieReadDecision(
 }
 
 /** Wait for the human to clear the wall only — no login expected, same url throughout. */
-const pollAttachedChallenge = (port: number, url: string, timeout: number): Promise<void> =>
+const pollAttachedChallenge = (port: number, url: string, w: AttachWait): Promise<void> =>
   pollAttached(
     port,
     (p) => challengeCleared(p.url, url, p.title),
-    timeout,
+    w,
     'attach: the challenge was not cleared before the timeout — solve the CAPTCHA in the Chrome window ' +
       'that opened and stay on the page; it captures automatically once the real content loads',
+    CANCELLED_CHALLENGE,
   );
 
 const TEMP_PROFILE_MARK = 'pwmcp-attach-';
@@ -1119,6 +1425,14 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     const args = attachChromeArgs(prof.dir, port, opts.loginUrl);
     child = spawn(chromePath, args, { stdio: 'ignore', detached: true }); // own process group → clean tree-kill
     child.on('error', (e) => log(`attach: chrome spawn error: ${e.message}`));
+    // The end signal for the unbounded wait, HINT half: the Chrome we spawned is
+    // gone. Deliberately only a hint — the DevTools endpoint stays the authority,
+    // because a launcher script that execs (or hands off to an already-running
+    // Chrome) exits while the browser the human is using lives on.
+    let chromeExited = false;
+    child.on('exit', () => {
+      chromeExited = true;
+    });
     if (child.pid && prof.cleanup) registerAttachRecord(child.pid, prof.dir); // temp/copy dirs are reap-eligible
     log(
       opts.challenge
@@ -1126,10 +1440,17 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
         : `attach login for "${opts.name}" — a real Chrome window opened; solve the challenge and log in there`,
     );
 
-    await waitForDevtools(port, 20_000);
-    const waitMs = opts.timeoutMs ?? 300_000;
-    if (opts.challenge) await pollAttachedChallenge(port, opts.loginUrl, waitMs);
-    else await pollAttachedLogin(port, opts.loginUrl, waitMs);
+    await waitForDevtools(port, 20_000); // startup, not a human wait — still bounded
+    // No deadline on the stdio surface: a Cloudflare solve plus a two-hop SSO login
+    // takes as long as it takes. An absent `wait` is a direct caller, not a surface,
+    // so it stays capped (resolveHumanWait).
+    const w: AttachWait = {
+      wait: opts.wait ?? resolveHumanWait(opts.timeoutMs, 'local'),
+      chromeExited: () => chromeExited,
+    };
+    if (w.wait.deadline === 'none') log('attach: no time limit — closing the Chrome window cancels the capture');
+    if (opts.challenge) await pollAttachedChallenge(port, opts.loginUrl, w);
+    else await pollAttachedLogin(port, opts.loginUrl, w);
 
     // Challenge cleared + logged in. Attach passively and read the session out.
     cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
@@ -1190,6 +1511,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       mode: opts.challenge ? 'challenge' : 'attach',
       ok: false,
       error: err instanceof Error ? err.message : String(err),
+      ...(err instanceof LoginCancelledError ? { cancelled: true as const } : {}),
     };
   } finally {
     await cdp?.close().catch(() => {}); // detaches the CDP client — does not close the browser
@@ -1264,12 +1586,16 @@ async function hasPasswordField(page: PwPage): Promise<boolean> {
 async function waitPastLogin(
   page: PwPage,
   loginUrl: string,
-  timeout: number,
+  wait: WaitBudget,
   authGained?: () => Promise<boolean>,
+  cancel?: CaptureCancel,
 ): Promise<void> {
-  const deadline = Date.now() + timeout;
+  const deadline = deadlineOf(wait);
   let stableSince = 0;
-  while (Date.now() < deadline) {
+  // `cancel.cancelled()` is in the loop condition, not just in the race: with an
+  // unbounded budget the loser of Promise.race would otherwise keep polling a dead
+  // page for the life of the process — one spinning loop per cancelled capture.
+  while (Date.now() < deadline && !cancel?.cancelled()) {
     const url = page.url();
     const movedOff = !samePath(url, loginUrl);
     const noPassword = !(await hasPasswordField(page).catch(() => false));
@@ -1288,8 +1614,11 @@ async function waitPastLogin(
     } else {
       stableSince = 0;
     }
-    await page.waitForTimeout(500).catch(() => {});
+    // A plain sleep, NOT page.waitForTimeout: on a closed page that rejects at once,
+    // and its .catch() would turn this poll into a tight CPU loop.
+    await sleep(500);
   }
+  if (cancel?.cancelled()) throw new LoginCancelledError(CANCELLED_DRIVEN);
   throw new Error('waitPastLogin: timed out');
 }
 
@@ -1304,10 +1633,12 @@ async function waitForLogin(
   page: PwPage,
   loginUrl: string,
   signal: string | undefined,
-  timeout: number,
+  wait: WaitBudget,
   authGained?: () => Promise<boolean>,
+  cancel?: CaptureCancel,
 ): Promise<void> {
   const sig = signal?.trim();
+  const timeout = pwTimeout(wait); // 0 == no Playwright timeout, for an unbounded budget
   // The generic heuristic is a FALLBACK, not a co-equal racer. Multi-step logins
   // walk through several pages that all satisfy it — DocuSign goes
   // /oauth/auth → /username for email entry: new path, no password field, so
@@ -1320,7 +1651,7 @@ async function waitForLogin(
   // authGained is the SPA-login completion signal (a new auth cookie) and it rides
   // with the fallback for the same reason: it is consulted only when the caller gave
   // no marker, so an explicit successSignal stays the sole authority.
-  const arms: Promise<unknown>[] = sig ? [] : [waitPastLogin(page, loginUrl, timeout, authGained)];
+  const arms: Promise<unknown>[] = sig ? [] : [waitPastLogin(page, loginUrl, wait, authGained, cancel)];
   if (sig) {
     // (a) CSS/XPath/Playwright-engine selector, (b) visible text, (c) URL
     // substring — but guarded so the login URL itself never counts (D).
@@ -1338,10 +1669,17 @@ async function waitForLogin(
         .then(() => {}),
     );
   }
+  // The cancel arm is RACED, never added to Promise.any: `any` waits for every arm
+  // to reject, so a cancel inside it would sit behind a marker arm that (unbounded)
+  // never settles. Promise.race lets the end signal win the instant it fires.
+  const completed = Promise.any(arms).then(() => {});
   try {
-    await Promise.any(arms);
-  } catch {
-    throw await loginDiagnostic(page, loginUrl, sig, timeout);
+    await (cancel ? Promise.race([completed, cancel.promise]) : completed);
+  } catch (err) {
+    // "The window was closed" is not a diagnosis of the site — report it as itself.
+    const stopped = cancellation(err);
+    if (stopped) throw stopped;
+    throw await loginDiagnostic(page, loginUrl, sig, wait);
   }
 }
 
@@ -1360,7 +1698,7 @@ async function loginDiagnostic(
   page: PwPage,
   loginUrl: string,
   signal: string | undefined,
-  timeoutMs: number,
+  wait: WaitBudget,
 ): Promise<CapturedTextError> {
   let url = '';
   let title = '';
@@ -1385,7 +1723,11 @@ async function loginDiagnostic(
   // can simply type into its own <title>. What is observed goes below; what is
   // advised stays here.
   const parts = [
-    `login capture timed out after ${Math.round(timeoutMs / 1000)}s`,
+    // An unbounded wait cannot have "timed out" — it ended because a completion arm
+    // failed, so the sentence must not claim a clock that was never set.
+    wait.deadline === 'capped'
+      ? `login capture timed out after ${Math.round(wait.ms / 1000)}s`
+      : 'the login capture ended without a completion signal',
     'the final URL and page title observed at that moment are quarantined below',
   ];
   const observed = [`final URL: ${url || 'unknown'}`];
@@ -1409,6 +1751,147 @@ async function loginDiagnostic(
     );
   }
   return new CapturedTextError(parts.join('; ') + '.', observed.join('\n'), url);
+}
+
+// ── in-flight human captures ──────────────────────────────────────────────────
+// A human login can outlive the CALL that started it. Claude Code aborts a tool
+// call that stays silent (MEASURED 2026-09-29 on Claude Code 2.1.284: a silent call
+// was killed at 30s with `sent no response or progress for 30s`. WHICH internal limit
+// that 30s is was never established, so no mechanism is claimed here), and the
+// CallToolRequest handler in src/index.ts deliberately never reads extra.signal —
+// so an abandoned call does NOT stop the login: the window stays open and the save
+// still happens server-side. This registry is how the agent finds that out. It is
+// the durable-handle-and-poll shape ledger DEC-2026-07-28 recorded as DEFERRED and
+// "implementable as plain tools TODAY with no protocol dependency" — session_status
+// is the poll, and no protocol extension was needed.
+//
+// Server-authored values ONLY: enums, ISO timestamps, a count, and the artifact path
+// this server chose. No page text, no title, no final URL, not even the caller's
+// loginUrl — session_status is exempt from the untrusted-content marking
+// (CUSTOM_TOOL_EXEMPTIONS in src/index.ts) and this record must keep that true.
+
+export type CaptureState = 'waiting' | 'saved' | 'cancelled' | 'failed';
+
+export interface CaptureProgress {
+  mode: LoginResult['mode'];
+  state: CaptureState;
+  startedAt: string;
+  /** Absent while `state` is 'waiting'. */
+  endedAt?: string;
+  /** Set only on 'saved' — the proof the long login landed on disk. */
+  savedTo?: string;
+  cookiesGained?: number;
+  /** What the agent should do about this record, in this server's own words. */
+  note: string;
+}
+
+const NOTES: Record<CaptureState, string> = {
+  waiting:
+    'a capture is IN PROGRESS: a window is open and the human is logging in. It has no deadline — poll ' +
+    'this tool again rather than starting a second login, and never tell the user it failed.',
+  saved: 'the capture COMPLETED and the session was saved, even if the tool call that started it was abandoned.',
+  cancelled: 'the human closed the window before the login finished. Nothing was saved; start a new capture.',
+  failed: 'the capture failed. Read the session_login result for the diagnosis.',
+};
+
+const inFlight = new Map<string, CaptureProgress>();
+
+/** The last capture attempt for `name`, if this process ran one. */
+export function captureProgress(name: string): CaptureProgress | undefined {
+  return inFlight.get(name);
+}
+
+/** Record a capture as under way. Returns the record `endCapture` closes. */
+function beginCapture(name: string, mode: LoginResult['mode']): CaptureProgress {
+  const rec: CaptureProgress = {
+    mode,
+    state: 'waiting',
+    startedAt: new Date().toISOString(),
+    note: NOTES.waiting,
+  };
+  inFlight.set(name, rec);
+  return rec;
+}
+
+/** Close a capture record from its result. Mutated in place: session_status reads the same object. */
+function endCapture(rec: CaptureProgress, result: LoginResult): void {
+  closeCapture(rec, result.ok ? 'saved' : result.cancelled ? 'cancelled' : 'failed');
+  if (result.ok) {
+    rec.savedTo = result.path;
+    rec.cookiesGained = result.cookiesGained;
+  }
+}
+
+/**
+ * Close a record whose capture THREW instead of returning a result.
+ *
+ * Both engines convert their own failures into an `ok: false` LoginResult, so this is
+ * only reachable from the handful of lines that run BEFORE their `try` —
+ * sessionFilePath, resolveAttachProfile, resolveChromePath. Reachable or not, the
+ * record must never be left 'waiting': session_status reads that state as "in
+ * progress, poll again, never tell the user it failed", and a stranded record would
+ * keep saying that for the life of the process.
+ */
+function failCapture(rec: CaptureProgress): void {
+  closeCapture(rec, 'failed');
+}
+
+/** The one place a record leaves 'waiting' — so no exit path can forget the note. */
+function closeCapture(rec: CaptureProgress, state: CaptureState): void {
+  rec.state = state;
+  rec.endedAt = new Date().toISOString();
+  rec.note = NOTES[state];
+}
+
+/** Which capture engine a set of options selects — the `mode` a record starts with. */
+function captureMode(opts: LoginOptions): LoginResult['mode'] {
+  if (opts.challenge) return 'challenge';
+  if (opts.attach) return 'attach';
+  return opts.headed ? 'headed' : 'headless';
+}
+
+/**
+ * How often a human wait tells the client it is still alive, and what it says.
+ *
+ * The client's own limit is IDLE, not total, so a periodic notification is what keeps
+ * a long login's call open — and nothing else does, so this interval IS the whole
+ * safety margin. MEASURED 2026-09-29 against Claude Code 2.1.284 (the full two-run
+ * method is recorded on callContext in src/index.ts): a 45s silent call was killed
+ * with `sent no response or progress for 30s`, while the same 45s call sending
+ * notifications/progress returned normally. 30s is what was OBSERVED, on that one
+ * client at that one version — it is the client's number, not ours, and a client
+ * default can change under us, so re-measure rather than trusting this line.
+ *
+ * The arithmetic, stated because a bare number would be unreviewable: 30_000 observed
+ * deadline / 8_000 interval = a 3.75x margin. Ticks land at 8s, 16s and 24s — three
+ * inside the deadline with 6s to spare, so a tick delayed by a busy event loop, a GC
+ * pause, or a slow browser operation on this thread still leaves only a ~16s silence,
+ * well short of 30s. 10_000 was rejected: its third tick lands ON the 30s deadline,
+ * which is a coincidence rather than a margin.
+ *
+ * The message builder is pure and separate from the timer so it can be asserted
+ * without waiting for one.
+ */
+const HEARTBEAT_EVERY_MS = 8_000;
+
+export function heartbeatMessage(what: string, elapsedMs: number): string {
+  return `${what} — still waiting for the human (${Math.round(elapsedMs / 1000)}s). No deadline; closing the window cancels.`;
+}
+
+/**
+ * Start telling the client this call is alive. Returns the stop function.
+ *
+ * Sends NOTHING unless the incoming request carried a progressToken: ctx.progress is
+ * undefined then, and a progress notification for a token the client never issued
+ * makes it complain about an unknown token. The guard is not optional.
+ */
+function startHeartbeat(ctx: ToolContext | undefined, what: string): () => void {
+  const progress = ctx?.progress;
+  if (!progress) return () => {};
+  const started = Date.now();
+  const timer = setInterval(() => progress(heartbeatMessage(what, Date.now() - started)), HEARTBEAT_EVERY_MS);
+  timer.unref(); // a heartbeat must never be the reason this process stays alive
+  return () => clearInterval(timer);
 }
 
 // ── session_status ────────────────────────────────────────────────────────────
@@ -1444,6 +1927,12 @@ export interface StatusResult {
   /** Set only on the offline branch — its absence means a live probe ran. */
   check?: 'artifact';
   artifact?: ArtifactSummary;
+  /**
+   * A capture this process started for this name — in progress, or how it ended.
+   * Present on BOTH branches: an in-flight headed capture has no file yet, so the
+   * artifact verdict alone would read 'missing' while a window is open.
+   */
+  capture?: CaptureProgress;
 }
 
 /**
@@ -1503,7 +1992,20 @@ function artifactStatus(name: string, file: string, checkedAt: string): StatusRe
   };
 }
 
+/**
+ * The session verdict, plus any capture this process ran for the name.
+ *
+ * The capture record is attached HERE rather than inside each branch so every
+ * verdict carries it — including 'missing', which is exactly what an in-flight
+ * headed capture looks like on disk while the human is still typing.
+ */
 export async function sessionStatus(opts: StatusOptions): Promise<StatusResult> {
+  const verdict = await statusVerdict(opts);
+  const capture = captureProgress(opts.name);
+  return capture ? { ...verdict, capture } : verdict;
+}
+
+async function statusVerdict(opts: StatusOptions): Promise<StatusResult> {
   const file = sessionFilePath(opts.name);
   const checkedAt = new Date().toISOString();
   // No probe URL to hit ⇒ answer from the artifact alone. Blank and whitespace
@@ -1572,22 +2074,24 @@ const loginDefinition: Tool = {
   name: 'session_login',
   description:
     'Log into a site once and save the authenticated session (cookies + storage) to a named file ' +
-    'for reuse in debugging and generated Playwright tests. Use headed:true for 2FA/SSO — this opens ' +
-    'a SEPARATE automation window; the human must complete the login in THAT window (not their ' +
-    'everyday browser), and it saves automatically once past the login page. successSignal is ' +
-    'OPTIONAL (headed logins auto-detect completion — including a same-origin single-page app whose ' +
-    'URL never changes, e.g. iCloud, via the auth cookie it issues). ' +
+    'for reuse in debugging and generated Playwright tests. ' +
+    'For ANY login, use headed:true. A SEPARATE automation window opens and the human completes ' +
+    'every step (password, 2FA, SSO, CAPTCHA) at their own pace. Do NOT probe the login form with ' +
+    'browser_* tools to work out what kind of login it is. Just call session_login({headed:true}) ' +
+    'and let the person handle it. On the stdio surface there is no time limit; the wait ends when ' +
+    'the human finishes or closes the window. successSignal is OPTIONAL (headed logins auto-detect ' +
+    'completion, including single-page apps like iCloud, via the auth cookie). ' +
     "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
-    'user-scoped secrets.env, then process.env — never embedded; tokens are never echoed back. ' +
-    'For a site fronted by Cloudflare/Turnstile or a similar human check — including one embedded in ' +
-    'the login form, e.g. dash.cloudflare.com or chatgpt.com — use attach:true FROM THE START: the ' +
-    'headed automation window is rejected by these checks and loops until the timeout. attach:true ' +
-    'opens a real Chrome window, the human clears the check and logs in, and the session is harvested ' +
-    'passively (no CDP driving during the solve). ' +
-    'To capture a CLEARED BOT WALL with NO login at all (the human just solves the CAPTCHA), use the ' +
-    'session_solve_challenge tool instead. ' +
-    'To freeze a flow as a deterministic test suite that reuses this session, call the ' +
-    'session_scaffold_tests tool.',
+    'user-scoped secrets.env, then process.env. Tokens are never echoed back. ' +
+    'For a site fronted by Cloudflare/Turnstile or a similar human check, including one embedded in ' +
+    'the login form (e.g. dash.cloudflare.com, chatgpt.com), use attach:true FROM THE START: the ' +
+    'headed automation window is rejected by these checks. attach:true opens a real Chrome window ' +
+    'and the session is harvested passively (no CDP driving during the solve). ' +
+    'If your own call is cut short while the human is still logging in, the capture KEEPS GOING and ' +
+    'still saves; poll session_status({name}) to see it finish instead of starting a second login. ' +
+    'To capture a CLEARED BOT WALL with NO login at all, use session_solve_challenge instead. ' +
+    'To freeze a flow as a deterministic test suite that reuses this session, call ' +
+    'session_scaffold_tests.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1604,8 +2108,8 @@ const loginDefinition: Tool = {
       headed: {
         type: 'boolean',
         description:
-          'Open a visible browser for 2FA/SSO/hardware keys. Default false. A SEPARATE automation ' +
-          'window opens — complete the login there, not in your normal browser.',
+          'Open a visible browser for the human to log in. Use this for ANY login, not just 2FA/SSO. ' +
+          'A SEPARATE automation window opens. Complete the login there, not in your normal browser.',
       },
       attach: {
         type: 'boolean',
@@ -1628,8 +2132,9 @@ const loginDefinition: Tool = {
       timeoutMs: {
         type: 'number',
         description:
-          'How long to wait for the login to complete, in ms. Default 300000 (headed/attach) / 30000 ' +
-          '(headless credKeys).',
+          'Optional timeout cap in ms. On the stdio surface, headed and attach modes wait indefinitely ' +
+          'by default (the human takes as long as they need). On HTTP surfaces the default is 300000. ' +
+          'Headless credKeys mode defaults to 30000 everywhere.',
       },
       credKeys: {
         type: 'object',
@@ -1654,7 +2159,7 @@ const loginDefinition: Tool = {
   },
 };
 
-async function loginHandler(args: Record<string, unknown>): Promise<CallToolResult> {
+async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
   const opts: LoginOptions = {
     name: String(args.name ?? ''),
     loginUrl: String(args.loginUrl ?? ''),
@@ -1667,11 +2172,44 @@ async function loginHandler(args: Record<string, unknown>): Promise<CallToolResu
     envFile: args.envFile ? String(args.envFile) : undefined,
     selectors: args.selectors as LoginOptions['selectors'],
   };
-  // attach mode harvests a human-solved real Chrome (Cloudflare/Turnstile sites);
-  // otherwise the standard Playwright-driven capture runs.
-  const result = opts.attach ? await sessionAttach(opts) : await sessionLogin(opts);
+  // Only the handler knows the SURFACE, so only the handler can grant an unbounded
+  // wait; a missing ctx is an unknown surface, and an unknown surface is capped.
+  const human = opts.headed === true || opts.attach === true;
+  if (human) opts.wait = resolveHumanWait(opts.timeoutMs, ctx?.trust ?? 'local');
+  return bindAndReport(await runCapture(opts, ctx, human));
+}
 
-  return bindAndReport(result);
+/**
+ * Run a capture with the two things a LONG human wait needs around it: a heartbeat
+ * that keeps the client's idle timer from aborting the call, and a registry record
+ * that makes the outcome recoverable even if the call is abandoned anyway.
+ *
+ * Shared by session_login and session_solve_challenge — the two tools that block on
+ * a person — for the same reason bindAndReport is shared. It deliberately stops at
+ * the LoginResult: binding stays the callers' single `return bindAndReport(...)`, so
+ * there is still exactly one bind path and it is still visible in each handler.
+ */
+async function runCapture(
+  opts: LoginOptions,
+  ctx: ToolContext | undefined,
+  human: boolean,
+): Promise<LoginResult> {
+  const mode = captureMode(opts);
+  const rec = beginCapture(opts.name, mode);
+  const stop = human ? startHeartbeat(ctx, `${mode} capture of "${opts.name}"`) : () => {};
+  let result: LoginResult;
+  try {
+    // attach mode harvests a human-solved real Chrome (Cloudflare/Turnstile sites);
+    // otherwise the standard Playwright-driven capture runs.
+    result = opts.attach ? await sessionAttach(opts) : await sessionLogin(opts);
+  } catch (err) {
+    failCapture(rec); // never leave the record claiming a login is still under way
+    throw err;
+  } finally {
+    stop();
+  }
+  endCapture(rec, result);
+  return result;
 }
 
 /**
@@ -1781,6 +2319,9 @@ const statusDefinition: Tool = {
     'PASS probeUrl to additionally live-probe an authenticated route; that reports fresh / stale / ' +
     'missing / unreachable. "unreachable" means the probe itself failed (app down, network error) — ' +
     'the session may still be fine, so fix reachability instead of re-logging-in. ' +
+    'It ALSO reports a capture this server is still running for that name, and whether it finished and ' +
+    'saved: if a session_login call of yours was cut short while the human was mid-login, poll this ' +
+    'instead of starting a second one. The login keeps going and still saves. ' +
     'Cookie values are never returned by either mode.',
   inputSchema: {
     type: 'object',
@@ -1845,28 +2386,47 @@ const solveChallengeDefinition: Tool = {
       },
       timeoutMs: {
         type: 'number',
-        description: 'How long to wait for the human to clear the challenge, in ms. Default 300000.',
+        description:
+          'Optional timeout cap in ms. On the stdio surface the default is no limit (the human takes ' +
+          'as long as they need to clear the challenge). On HTTP surfaces the default is 300000.',
       },
     },
     required: ['name', 'url'],
   },
 };
 
-async function solveChallengeHandler(args: Record<string, unknown>): Promise<CallToolResult> {
-  // Delegates to the SAME engine session_login's attach mode uses — only the
-  // completion predicate differs, and that difference lives in sessionAttach.
-  const result = await sessionAttach({
-    name: String(args.name ?? ''),
-    loginUrl: String(args.url ?? ''),
-    challenge: true,
-    attach: true,
-    profile: args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
-    timeoutMs: args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
-  });
-  // Same binding as a login: clearing a wall is only worth doing if the tools
-  // that hit the wall can then get past it. Note the clearance is short-lived
-  // (see clearanceSummary's expiresAt) — the bind lasts as long as the cookies do.
-  return bindAndReport(result);
+/**
+ * Delegates to the SAME engine session_login's attach mode uses — only the
+ * completion predicate differs, and that difference lives in sessionAttach. The
+ * human wait, its heartbeat and its capture record come from the same runCapture,
+ * so a CAPTCHA solve gets exactly the patience a login does.
+ *
+ * Same binding as a login: clearing a wall is only worth doing if the tools that hit
+ * the wall can then get past it. Note the clearance is short-lived (see
+ * clearanceSummary's expiresAt) — the bind lasts as long as the cookies do.
+ */
+async function solveChallengeHandler(
+  args: Record<string, unknown>,
+  ctx?: ToolContext,
+): Promise<CallToolResult> {
+  const timeoutMs = args.timeoutMs != null ? Number(args.timeoutMs) : undefined;
+  return bindAndReport(
+    await runCapture(
+      {
+        name: String(args.name ?? ''),
+        loginUrl: String(args.url ?? ''),
+        challenge: true,
+        attach: true,
+        profile:
+          args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
+        timeoutMs,
+        // Always human-present: the whole point is a person clearing the wall by hand.
+        wait: resolveHumanWait(timeoutMs, ctx?.trust ?? 'local'),
+      },
+      ctx,
+      true,
+    ),
+  );
 }
 
 export const sessionLoginTool = { definition: loginDefinition, handler: loginHandler };

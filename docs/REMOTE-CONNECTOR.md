@@ -40,6 +40,16 @@ The remote surface deliberately differs from the local one:
   window for the human; `session_status` only reports whether a saved session
   exists. None of this touches the local stdio surface. Claude Code on your own
   machine still has every tool, `browser_evaluate` included.
+  **Timeout difference by surface.** On the stdio surface (Claude Code),
+  `session_login` and `session_solve_challenge` wait with no deadline when a
+  human is logging in. The wait ends when the person finishes or closes the
+  window. On the local no-auth HTTP surface, where those two tools are
+  allowed, they keep a bounded 300-second default because the headed window
+  would open on the server host where nobody is sitting. (On the cloud
+  surface both tools are denied outright, so the timeout never applies there.)
+  `timeoutMs` is still accepted as an opt-in cap on stdio and as an override
+  on HTTP. The headless credential path (`credKeys`, no human involved) keeps
+  its 30-second default everywhere.
 - **Authenticated** with GitHub-backed OAuth, locked to **one** GitHub login.
 - **Hardened** three ways, because the driving LLM is prompt-injectable by any
   page it visits: (1) GitHub OAuth, (2) an OS-level **egress block** to cloud

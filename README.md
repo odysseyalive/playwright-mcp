@@ -21,7 +21,7 @@ This server has nothing to do with web search. Claude runs its own native WebSea
 Thirty-two total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The nine custom ones:
 
 - **`web_fetch`** stealth-renders a URL (HTML or PDF), returns readable text plus the citation and health data described above.
-- **`session_login`**, **`session_status`**, **`session_solve_challenge`**, and **`session_attach`** handle authenticated sessions across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. `session_solve_challenge` clears CAPTCHAs and bot walls the same way. `session_attach` binds a captured session to the `browser_*` tools so interactive browsing is authenticated too. Headed mode handles 2FA and SSO when you need it.
+- **`session_login`**, **`session_status`**, **`session_solve_challenge`**, and **`session_attach`** handle authenticated sessions across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. `session_solve_challenge` clears CAPTCHAs and bot walls the same way. `session_attach` binds a captured session to the `browser_*` tools so interactive browsing is authenticated too. For any login, call `session_login({headed:true})` and let the human handle the whole thing in the headed window. Password, 2FA, SSO, CAPTCHA, whatever the site throws. There is no time limit on the stdio surface. The wait ends when the human finishes or closes the window, not on a clock.
 - **`session_scaffold_tests`** generates a deterministic Playwright E2E test suite into any project, wired to reuse a session captured by `session_login`. No model in the loop. Just `npx playwright test`.
 - **`suite_scaffold`**, **`suite_audit`**, and **`suite_methodology`** carry a full e2e test-suite methodology. Scaffold the complete pack into any project, audit results with per-failure dossiers, or pull the playbook on demand. More in the Test-suite builder section below.
 
@@ -138,7 +138,7 @@ npm run gate
 
 Credentials for `session_login` live outside the repo in `~/.config/playwright-mcp/secrets.env`, mode 600 and gitignored. See `.env.example` for the format, and set `PLAYWRIGHT_MCP_SECRETS` if you want the file somewhere else.
 
-If the project you're working in keeps its own `.env`, `session_login` reads that first. The project file wins when both define a key, and only the keys you name in `credKeys` are ever read. If the file isn't at the project root, point the `envFile` parameter at it.
+If the project you're working in keeps its own `.env`, `session_login` reads that first. The project file wins when both define a key, and only the keys you name in `credKeys` are ever read. If the file isn't at the project root, point the `envFile` parameter at it. The headless `credKeys` path keeps a 30-second default timeout. There's nobody to wait for.
 
 ## Authenticated end-to-end tests
 
@@ -156,7 +156,7 @@ There's a CLI front door over the same generator, too.
 npm run scaffold:e2e -- --session <name> --out /path/to/your/project
 ```
 
-The generated config resolves the storageState from the same path `session_login` writes to. It honors `PLAYWRIGHT_MCP_SESSIONS`, then `XDG_CONFIG_HOME` or `APPDATA`, so it works on any machine without a hard-coded home directory. The setup project never logs in. It guards that the captured session is present and fresh, and points you back to `session_login` (headed for 2FA) if it isn't. For CI, where the gitignored session file won't exist, point `STORAGE_STATE` at a file the job materializes from a masked secret. The generated `README.md` has the details.
+The generated config resolves the storageState from the same path `session_login` writes to. It honors `PLAYWRIGHT_MCP_SESSIONS`, then `XDG_CONFIG_HOME` or `APPDATA`, so it works on any machine without a hard-coded home directory. The setup project never logs in. It guards that the captured session is present and fresh, and points you back to `session_login` (headed) if it isn't. For CI, where the gitignored session file won't exist, point `STORAGE_STATE` at a file the job materializes from a masked secret. The generated `README.md` has the details.
 
 ## Test-suite builder
 
@@ -198,7 +198,7 @@ Escape hatches are environment variables (`PLAYWRIGHT_MCP_FETCH_LIMIT`, `PLAYWRI
 
 On the remote surface (`PLAYWRIGHT_MCP_PUBLIC_URL` set), `assertEgressAllowed` blocks targets that resolve to private or metadata addresses. Per-hop redirect re-validation catches redirect chains that land on a private address after the initial URL passed. Both apply to `web_fetch`'s page and to the `browser_*` browser, which this server launches and hands to `@playwright/mcp`. For `browser_*` the check covers every request in the browser context, every redirect hop, and WebSockets. Upstream's own `network.blockedOrigins` list is a second layer on top. The OS-level nftables egress block ([docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md) section 6) is the primary SSRF control. The in-process checks are the backstop.
 
-Tools are stripped by tier. `browser_run_code_unsafe`, `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, and `suite_audit` are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`. The operator's own stdio surface (Claude Code) keeps every tool. These denylists only apply to the HTTP transport.
+Tools are stripped by tier. `browser_run_code_unsafe`, `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, and `suite_audit` are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`. The operator's own stdio surface (Claude Code) keeps every tool. These denylists only apply to the HTTP transport. On the HTTP surfaces where `session_login` and `session_solve_challenge` are allowed (local no-auth), they keep a bounded 300-second default because the headed window would open on the server host where nobody is sitting. The full tier distinction is in [docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md).
 
 ### What this does not fix
 

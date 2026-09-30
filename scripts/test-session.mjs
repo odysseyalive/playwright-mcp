@@ -10,6 +10,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { withPlatformSync } from './fixtures/platform.mjs';
 
@@ -22,9 +23,9 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie, makeAuthCookieProbe } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie, makeAuthCookieProbe, resolveHumanWait, CAPPED_HUMAN_WAIT_MS, makeWindowClosedWatch, makeEndpointWatch, devtoolsUnreachable, LoginCancelledError, captureProgress, sessionLoginTool, sessionSolveChallengeTool } =
   await import('../dist/tools/session.js');
-const { getSecret, ownerOnlyAclArgs, parseWhoamiSid, ownerOnlyFile, ownerOnlyDir, reassertOwnerOnly, OwnerOnlyError } =
+const { getSecret, ownerOnlyAclArgs, parseWhoamiSid, ownerOnlyFile, ownerOnlyDir, reassertOwnerOnly, OwnerOnlyError, sessionFilePath } =
   await import('../dist/secrets.js');
 
 /** Read once, before any test fakes it, so a leaked fake is detectable. */
@@ -1067,4 +1068,519 @@ test('session_login: credentials from a project envFile, tokens still not echoed
     assert.equal(r.ok, true, r.error ?? 'login ok');
     assert.ok(!JSON.stringify(r).includes('sid'), 'no cookie token in tool result');
   });
+});
+
+// ── the human wait: no deadline, and what ends it instead ─────────────────────
+// A human login has no honest duration (password only, password + TOTP, two SSO
+// hops, a CAPTCHA mid-flow), so the 300s default was replaced rather than raised.
+// Replaced, not merely lengthened, is what makes the END SIGNALS load-bearing:
+// with no clock, a window that is gone and nothing noticing is a forever-hang.
+// Everything below drives the injected seams — never a real timer.
+
+test('resolveHumanWait: only the stdio surface gets an unbounded wait; an explicit timeoutMs still arms one', () => {
+  // The tier rule. stdio is the LOCAL Claude Code process — a person is at this
+  // display, so the window they opened is theirs to take as long as they need.
+  assert.deepEqual(resolveHumanWait(undefined, 'stdio'), { deadline: 'none' });
+
+  // The HTTP surfaces keep the cap: the headed window opens on the SERVER host, so
+  // nobody is at that display and an unbounded wait is an unreclaimable browser.
+  assert.equal(CAPPED_HUMAN_WAIT_MS, 300_000, 'the bounded default is unchanged where it still applies');
+  for (const trust of ['local', 'cloud']) {
+    assert.deepEqual(
+      resolveHumanWait(undefined, trust),
+      { deadline: 'capped', ms: 300_000 },
+      `${trust} must keep the 300s cap`,
+    );
+  }
+
+  // THE OPT-IN CAP. Without this half a build that ignored timeoutMs entirely would
+  // pass the row above: the caller who asks for a deadline must still get a real one,
+  // on stdio as much as anywhere.
+  assert.deepEqual(resolveHumanWait(2500, 'stdio'), { deadline: 'capped', ms: 2500 });
+  assert.deepEqual(resolveHumanWait(2500, 'local'), { deadline: 'capped', ms: 2500 });
+  assert.deepEqual(resolveHumanWait(1, 'stdio'), { deadline: 'capped', ms: 1 });
+
+  // Garbage asked for nothing, so the SURFACE decides — never Playwright's
+  // "0 means forever", which would hand an unbounded wait to a capped surface.
+  for (const junk of [0, -1, Number.NaN, Infinity, -Infinity]) {
+    assert.deepEqual(resolveHumanWait(junk, 'local'), { deadline: 'capped', ms: 300_000 }, `local, timeoutMs=${junk}`);
+    assert.deepEqual(resolveHumanWait(junk, 'stdio'), { deadline: 'none' }, `stdio, timeoutMs=${junk}`);
+  }
+});
+
+test('makeWindowClosedWatch: a closed window cancels, but an SSO popup must NOT', async () => {
+  // Injected schedule: the grace is asserted as a NUMBER handed to the scheduler,
+  // never waited out. graceMs stays the shipped default so a change to it is visible.
+  const pending = [];
+  const schedule = (fn, ms) => pending.push({ fn, ms });
+  const run = () => {
+    const due = pending.splice(0, pending.length);
+    for (const p of due) p.fn();
+  };
+
+  // 1. The human closed the last window. Nothing is left to log in with → cancel.
+  let pages = 1;
+  const gone = makeWindowClosedWatch({ pagesOpen: () => pages, connected: () => true }, { schedule, message: 'closed-x' });
+  pages = 0;
+  gone.pageClosed();
+  assert.equal(pending.length, 1, 'the decision is deferred by the grace, not taken inline');
+  assert.equal(pending[0].ms, 3000, 'WINDOW_CLOSE_GRACE_MS');
+  assert.equal(gone.cancelled(), false, 'not cancelled until the grace elapses');
+  run();
+  assert.equal(gone.cancelled(), true);
+  await assert.rejects(gone.promise, (err) => {
+    assert.ok(err instanceof LoginCancelledError, `named error, got ${err?.name}`);
+    assert.equal(err.name, 'LoginCancelledError');
+    assert.equal(err.message, 'closed-x');
+    return true;
+  });
+
+  // 2. THE CASE THIS FEATURE EXISTS FOR. An identity provider opens a popup and
+  // closes the original tab: a page closed, but a page is still OPEN. Cancelling
+  // here would break the very SSO logins the unbounded wait was added to rescue.
+  const sso = makeWindowClosedWatch({ pagesOpen: () => 1, connected: () => true }, { schedule, message: 'closed-sso' });
+  sso.pageClosed();
+  run();
+  assert.equal(sso.cancelled(), false, 'an SSO popup must survive the original tab closing');
+  // ...and it keeps surviving: a second hop closes another tab, one still open.
+  sso.pageClosed();
+  run();
+  assert.equal(sso.cancelled(), false, 'still logging in after a second hop');
+  // Only when the last one goes does it end.
+  let ssoPages = 0;
+  const ssoEnd = makeWindowClosedWatch({ pagesOpen: () => ssoPages, connected: () => true }, { schedule, message: 'closed-sso' });
+  ssoEnd.pageClosed();
+  run();
+  assert.equal(ssoEnd.cancelled(), true, 'the last page closing does cancel');
+
+  // 3. A disconnected browser cancels even while it still reports pages: nothing
+  //    can complete after that, so waiting on it is the forever-hang.
+  const dead = makeWindowClosedWatch({ pagesOpen: () => 2, connected: () => false }, { schedule });
+  dead.pageClosed();
+  run();
+  assert.equal(dead.cancelled(), true, 'a disconnected browser is gone whatever it reports');
+  await assert.rejects(dead.promise, /login cancelled: the window was closed/);
+
+  // 4. The browser itself went away — no re-ask, it cannot come back.
+  const bye = makeWindowClosedWatch({ pagesOpen: () => 5, connected: () => true }, { schedule });
+  bye.browserGone();
+  run();
+  assert.equal(bye.cancelled(), true);
+
+  // 5. Fires once. Two closes must not produce a second rejection to go unhandled.
+  const once = makeWindowClosedWatch({ pagesOpen: () => 0, connected: () => true }, { schedule });
+  once.pageClosed();
+  once.browserGone();
+  run();
+  assert.equal(once.cancelled(), true);
+  await assert.rejects(once.promise, /login cancelled/);
+});
+
+test('makeEndpointWatch: Chrome having EXITED cancels; a transient devtools miss never does', () => {
+  const refused = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:40123'), { code: 'ECONNREFUSED' });
+  const hangup = new Error('socket hang up');
+  // What devtoolsJson actually throws on its own 4000ms read timeout, and what a
+  // half-written /json/list body throws. Neither says the browser is gone: a busy
+  // Chrome mid-navigation produces both, and treating them as gone would cancel a
+  // LIVE login — with no deadline left, the wrong half of this split is fatal.
+  const slow = new Error('devtools endpoint timeout');
+  const garbage = new SyntaxError('Unexpected end of JSON input');
+  assert.equal(devtoolsUnreachable(slow), false, 'a read timeout is a busy browser, not a dead one');
+  assert.equal(devtoolsUnreachable(garbage), false, 'an unparseable body is not a dead browser');
+  assert.equal(devtoolsUnreachable(refused), true);
+  assert.equal(devtoolsUnreachable(hangup), true);
+
+  // A transient miss, however often it repeats, never cancels — and it RESETS the
+  // unreachable run, so alternating slow reads cannot accumulate into a cancel.
+  const transient = makeEndpointWatch();
+  for (let i = 0; i < 50; i += 1) {
+    assert.equal(transient.failed(slow, false), false, `slow read #${i + 1} must not cancel`);
+    assert.equal(transient.failed(garbage, false), false, `garbage read #${i + 1} must not cancel`);
+  }
+  assert.equal(transient.failed(refused, false), false, 'one refusal after a reset is still strike 1');
+
+  // Unreachable reads need a RUN of DEVTOOLS_GONE_STRIKES: one refusal during
+  // Chrome's own teardown of a tab is not proof.
+  const flaky = makeEndpointWatch();
+  assert.equal(flaky.failed(refused, false), false, 'strike 1');
+  assert.equal(flaky.failed(refused, false), false, 'strike 2');
+  assert.equal(flaky.failed(refused, false), true, 'strike 3 — gone on the endpoint\'s own evidence');
+
+  // A success anywhere in the run clears it.
+  const recovered = makeEndpointWatch();
+  recovered.failed(refused, false);
+  recovered.failed(refused, false);
+  recovered.alive();
+  assert.equal(recovered.failed(refused, false), false, 'the run restarted after a good read');
+  assert.equal(recovered.failed(refused, false), false);
+  assert.equal(recovered.failed(refused, false), true);
+
+  // CHROME HAS EXITED: the child we spawned is gone AND the port refuses. One
+  // strike is conclusive — this is what stops a closed window hanging forever.
+  const exited = makeEndpointWatch();
+  assert.equal(exited.failed(refused, true), true, 'exited child + refused port cancels at once');
+  // But the ENDPOINT stays the authority: a launcher that execs and exits while the
+  // browser lives on answers its reads, so a dead child alone is never a cancel.
+  const wrapper = makeEndpointWatch();
+  assert.equal(wrapper.failed(slow, true), false, 'a dead wrapper script with a live endpoint is not a cancel');
+  assert.equal(wrapper.failed(garbage, true), false);
+
+  // The other shape of gone: the endpoint answers while every window is closed.
+  // A popup keeps the count >= 1, so it can never trip this.
+  const windows = makeEndpointWatch();
+  for (let i = 0; i < 40; i += 1) assert.equal(windows.targets(1), false, `one page open, poll ${i + 1}`);
+  for (let i = 1; i <= 9; i += 1) assert.equal(windows.targets(0), false, `NO_TARGET_STRIKES not reached (${i})`);
+  assert.equal(windows.targets(0), true, 'ten windowless polls — nothing left to log in with');
+  // A single page reappearing resets it (an SSO popup arriving late).
+  const late = makeEndpointWatch();
+  for (let i = 0; i < 9; i += 1) late.targets(0);
+  assert.equal(late.targets(1), false, 'a page came back');
+  for (let i = 0; i < 9; i += 1) assert.equal(late.targets(0), false, `count restarted (${i + 1})`);
+});
+
+// ── attach mode end to end, against a fake DevTools endpoint ──────────────────
+// attach mode's human wait speaks to the browser through /json/version and
+// /json/list ONLY (passively — attaching mid-solve is what makes a managed
+// challenge loop), so scripts/fixtures/fake-chrome.mjs is a faithful stand-in
+// for the whole wait. It exercises the real handler, the real cancel/timeout
+// decisions, the real capture registry and the real artifact path — with no
+// browser, no display and no wall-clock guess. POSIX only: the spawn goes
+// through the fixture's shebang.
+const FAKE_CHROME = fileURLToPath(new URL('./fixtures/fake-chrome.mjs', import.meta.url));
+const FAKE_LOGIN_URL = 'https://app.fake.test/login';
+
+async function withFakeChrome(mode, fn) {
+  const prevPath = process.env.PLAYWRIGHT_MCP_CHROME_PATH;
+  const prevMode = process.env.PWMCP_FAKE_CHROME_MODE;
+  process.env.PLAYWRIGHT_MCP_CHROME_PATH = FAKE_CHROME;
+  process.env.PWMCP_FAKE_CHROME_MODE = mode;
+  try {
+    return await fn();
+  } finally {
+    if (prevPath === undefined) delete process.env.PLAYWRIGHT_MCP_CHROME_PATH;
+    else process.env.PLAYWRIGHT_MCP_CHROME_PATH = prevPath;
+    if (prevMode === undefined) delete process.env.PWMCP_FAKE_CHROME_MODE;
+    else process.env.PWMCP_FAKE_CHROME_MODE = prevMode;
+  }
+}
+
+/** The tool result's JSON envelope (bindAndReport writes exactly one text block). */
+const envelopeOf = (res) => JSON.parse(res.content[0].text.split('\n<untrusted')[0]);
+
+const skipOnWin32 = IS_WIN32 ? 'POSIX only: win32 cannot exec the fixture\'s shebang' : false;
+
+test(
+  'attach + stdio: an UNBOUNDED wait still ends when the window is gone — cancelled, nothing saved, recoverable via session_status',
+  { skip: skipOnWin32 },
+  async () => {
+    // trust:'stdio' with no timeoutMs is the unbounded wait. If the end signals did
+    // not work this call could never return, so the test finishing at all is half the
+    // assertion; the other half is that it ends as a CANCEL and leaves no artifact.
+    const name = 'attach-cancelled';
+    const file = sessionFilePath(name);
+    await withFakeChrome('die', async () => {
+      const pending = sessionLoginTool.handler(
+        { name, loginUrl: FAKE_LOGIN_URL, attach: true },
+        { trust: 'stdio' },
+      );
+
+      // The recovery path, observed IN FLIGHT: beginCapture runs before the first
+      // await, so an agent whose call was cut short can poll session_status right
+      // now and be told a login is still under way rather than that it failed.
+      const inFlight = await sessionStatus({ name });
+      assert.equal(inFlight.state, 'missing', 'nothing on disk yet — that is what an in-flight capture looks like');
+      assert.equal(inFlight.capture?.state, 'waiting');
+      assert.equal(inFlight.capture?.mode, 'attach');
+      assert.equal(inFlight.capture?.endedAt, undefined, 'a waiting record has no end time');
+      assert.match(inFlight.capture?.note ?? '', /IN PROGRESS/, 'and it says so in the server\'s own words');
+      assert.match(inFlight.capture?.note ?? '', /never tell the user it failed/);
+
+      const env = envelopeOf(await pending);
+      assert.equal(env.ok, false);
+      assert.equal(env.cancelled, true, 'a closed window is a CANCEL, not a timeout');
+      assert.equal(env.mode, 'attach');
+      assert.match(env.error, /^login cancelled: the Chrome window was closed/);
+      assert.match(env.error, /waits as long as you need/, 'the remedy, not a shorter clock');
+    });
+
+    assert.equal(fs.existsSync(file), false, 'a cancelled capture must leave NO artifact behind');
+
+    // ...and the record now says so, for the agent that comes back to poll.
+    const after = await sessionStatus({ name });
+    assert.equal(after.state, 'missing');
+    assert.equal(after.capture?.state, 'cancelled');
+    assert.ok(after.capture?.endedAt, 'a closed record carries an end time');
+    assert.match(after.capture?.note ?? '', /closed the window before the login finished/);
+    assert.equal(after.capture?.savedTo, undefined, 'nothing was saved, so nothing is claimed');
+  },
+);
+
+test(
+  'attach + stdio: an EXPLICIT timeoutMs still arms a real deadline, and ends as a timeout — not a cancel',
+  { skip: skipOnWin32 },
+  async () => {
+    // The discriminating half of the tier rule at the handler boundary: a build that
+    // dropped timeoutMs and always waited unbounded would hang here forever, and a
+    // build that mistook a live-but-unfinished login for a closed window would report
+    // `cancelled`. Neither is what the caller asked for.
+    const name = 'attach-opt-in-cap';
+    const started = Date.now();
+    await withFakeChrome('alive', async () => {
+      const env = envelopeOf(
+        await sessionLoginTool.handler(
+          { name, loginUrl: FAKE_LOGIN_URL, attach: true, timeoutMs: 3000 },
+          { trust: 'stdio' },
+        ),
+      );
+      assert.equal(env.ok, false);
+      assert.notEqual(env.cancelled, true, 'a live endpoint with a page open was never cancelled');
+      assert.match(env.error, /was not completed before the timeout/);
+    });
+    assert.ok(Date.now() - started < 120_000, 'the opt-in cap bounded the wait');
+    assert.equal(fs.existsSync(sessionFilePath(name)), false, 'a timed-out capture saves nothing either');
+    assert.equal(captureProgress(name)?.state, 'failed', 'a timeout is a failure, not a cancel');
+  },
+);
+
+test(
+  'attach: an SSO popup that closes the original tab must NOT cancel the login',
+  { skip: skipOnWin32 },
+  async () => {
+    // THE CASE THIS WHOLE ORDER EXISTS FOR, on the attach path. The identity provider
+    // pops a consent window and closes the tab Chrome was launched with. A page is
+    // still open, so the human is still logging in — a cancel here would break exactly
+    // the long SSO logins the unbounded wait was added to rescue. It must run to the
+    // caller's own deadline instead, and say so.
+    const name = 'attach-sso-popup';
+    await withFakeChrome('popup', async () => {
+      const env = envelopeOf(
+        await sessionLoginTool.handler(
+          { name, loginUrl: FAKE_LOGIN_URL, attach: true, timeoutMs: 4000 },
+          { trust: 'stdio' },
+        ),
+      );
+      assert.notEqual(env.cancelled, true, 'the original tab closing is not an abandoned login');
+      assert.doesNotMatch(env.error ?? '', /cancelled/, 'never a cancel while a page is open');
+      assert.match(env.error ?? '', /was not completed before the timeout/);
+    });
+  },
+);
+
+test(
+  'runCapture: a throw BEFORE the engine\'s own try never strands the record at "waiting"',
+  { skip: skipOnWin32 },
+  async () => {
+    // The few lines that run before sessionAttach's try (resolveAttachProfile ->
+    // mkdtempSync) can throw, and a stranded 'waiting' record would tell every later
+    // session_status "a capture is IN PROGRESS, never tell the user it failed" for the
+    // life of the process. An unwritable temp dir is the cheapest way to make that
+    // throw happen for real. os.tmpdir() reads these at call time.
+    const name = 'attach-early-throw';
+    const bogus = path.join(TMP, 'no-such-tmpdir', 'deeper');
+    const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+    await withFakeChrome('die', async () => {
+      process.env.TMPDIR = bogus;
+      process.env.TEMP = bogus;
+      process.env.TMP = bogus;
+      try {
+        await assert.rejects(
+          sessionLoginTool.handler({ name, loginUrl: FAKE_LOGIN_URL, attach: true }, { trust: 'stdio' }),
+          /ENOENT|no such file/i,
+          'the throw propagates untouched',
+        );
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+    const rec = captureProgress(name);
+    assert.equal(rec?.state, 'failed', 'the record must never be left claiming a login is under way');
+    assert.ok(rec?.endedAt, 'and it is closed, with an end time');
+    assert.match(rec?.note ?? '', /the capture failed/);
+    assert.doesNotMatch(rec?.note ?? '', /IN PROGRESS/);
+  },
+);
+
+/** Everything the module logged while `fn` ran. `log` is console.error (session.ts:54). */
+async function captureLog(fn) {
+  const lines = [];
+  const real = console.error;
+  console.error = (...args) => lines.push(args.map(String).join(' '));
+  try {
+    await fn();
+  } finally {
+    console.error = real;
+  }
+  return lines.join('\n');
+}
+
+test(
+  'the tier rule reaches the HANDLER: the same call is unbounded on stdio and capped on an HTTP surface',
+  { skip: skipOnWin32 },
+  async () => {
+    // resolveHumanWait being right is worth nothing if the handler does not hand it
+    // the surface. Only the tool handler knows the surface, so this is where the
+    // feature is either live or dead — and `ctx.trust` is the server's own value,
+    // never a tool argument, so a caller cannot ask for the unbounded wait.
+    //
+    // The budget itself has no exported getter; sessionAttach announces it
+    // (session.ts:1451, `if (w.wait.deadline === 'none')`), so the log line is the
+    // observable. 'die' mode makes BOTH surfaces finish in about a second — the
+    // capped one never reaches its 300s deadline, it is cancelled long before.
+    await withFakeChrome('die', async () => {
+      const onStdio = await captureLog(() =>
+        sessionLoginTool.handler(
+          { name: 'tier-stdio', loginUrl: FAKE_LOGIN_URL, attach: true },
+          { trust: 'stdio' },
+        ),
+      );
+      assert.match(onStdio, /no time limit/, 'stdio: a person is at this display — no deadline');
+
+      for (const trust of ['local', 'cloud']) {
+        const onHttp = await captureLog(() =>
+          sessionLoginTool.handler(
+            { name: `tier-${trust}`, loginUrl: FAKE_LOGIN_URL, attach: true },
+            { trust },
+          ),
+        );
+        assert.doesNotMatch(onHttp, /no time limit/, `${trust}: the window opens on the SERVER host — still capped`);
+      }
+
+      // An unknown surface is an HTTP surface as far as this is concerned: the
+      // fail-closed `?? 'local'` must never resolve to the permissive tier.
+      const noCtx = await captureLog(() =>
+        sessionLoginTool.handler({ name: 'tier-noctx', loginUrl: FAKE_LOGIN_URL, attach: true }),
+      );
+      assert.doesNotMatch(noCtx, /no time limit/, 'no surface at all must not grant an unbounded wait');
+    });
+  },
+);
+
+test('headless credKeys: the 30s default is unchanged and cannot be reached by an unbounded budget', async () => {
+  // There is no human on the credential path, so a clock is the right instrument
+  // there and 30s is still the default. The load-bearing half is that the headed
+  // rule cannot LEAK onto it: the headless arm builds its own capped budget and
+  // ignores `wait` entirely, so even an explicitly unbounded budget stays bounded.
+  const started = Date.now();
+  const r = await sessionLogin({
+    name: 'headless-stays-capped',
+    loginUrl: `${base}/login`,
+    successSignal: 'nonexistent-marker',
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_BADPASS' },
+    wait: { deadline: 'none' }, // what a stdio human capture would have been handed
+    timeoutMs: 2500,
+  });
+  assert.equal(r.ok, false);
+  assert.ok(Date.now() - started < 25_000, 'the headless arm ignored the unbounded budget');
+  assert.notEqual(r.cancelled, true, 'no window-close machinery is wired on the credential path');
+  assert.match(r.error ?? '', /timed out|login form/, 'still the bounded diagnostic');
+
+  // The default itself, and the wiring, read from the source: the headless arm has
+  // no exported seam, and a structural read is how this file already guards drift.
+  const src = fs.readFileSync(new URL('../src/tools/session.ts', import.meta.url), 'utf8');
+  const headlessDefaults = src.match(/opts\.timeoutMs \?\? 30_000/g) ?? [];
+  assert.equal(headlessDefaults.length, 1, 'exactly one 30s credential default, still 30_000');
+  // ...and it is NOT resolveHumanWait: the surface rule must stay unreachable from here.
+  const headlessArm = src.slice(src.indexOf('const sel = { ...DEFAULT_SELECTORS'), src.indexOf('// The wait heuristics can resolve'));
+  assert.doesNotMatch(headlessArm, /resolveHumanWait/, 'the credential path never consults the surface');
+  assert.match(headlessArm, /deadline: 'capped'/, 'and it builds a capped budget of its own');
+});
+
+test('DRIFT GUARD: the unbounded wait is granted by the SURFACE only, and fails closed', () => {
+  // Two ways this feature turns into a vulnerability by accident: a handler that
+  // defaults an unknown surface to 'stdio' (permissive), or a second hard-coded
+  // 300_000 that quietly re-imposes the deadline the tier rule removed.
+  const src = fs.readFileSync(new URL('../src/tools/session.ts', import.meta.url), 'utf8');
+
+  const humanHandlers = ['async function loginHandler', 'async function solveChallengeHandler'];
+  for (const marker of humanHandlers) {
+    const body = src.slice(src.indexOf(marker), src.indexOf(marker) + 1500);
+    assert.match(body, /resolveHumanWait\([^)]*ctx\?\.trust \?\? 'local'\)/, `${marker} must fail closed to 'local'`);
+    assert.doesNotMatch(body, /\?\? 'stdio'/, `${marker} must never default to the permissive tier`);
+  }
+
+  // The tier rule is the ONLY place the human budget is decided.
+  assert.equal((src.match(/\?\? 300_000|\?\? 300000/g) ?? []).length, 0, 'no hard-coded human deadline survives');
+  assert.equal(
+    (src.match(/CAPPED_HUMAN_WAIT_MS = 300_000/g) ?? []).length,
+    1,
+    'one named constant, read only by resolveHumanWait',
+  );
+
+  // The HEADED engine consuming that budget. Unreachable behaviourally (a headed
+  // window needs a display the gate has not got), so the wiring is pinned here:
+  // the branch must take the resolved budget AND arm the end signal, because with
+  // no deadline the watch is the only thing that can end the wait.
+  const headedArm = src.slice(src.indexOf('if (opts.headed) {'), src.indexOf('const sel = { ...DEFAULT_SELECTORS'));
+  assert.match(headedArm, /opts\.wait \?\? resolveHumanWait\(opts\.timeoutMs, 'local'\)/, 'headed takes the resolved budget, capped for a direct caller');
+  assert.match(headedArm, /watchDrivenWindow\(/, 'and arms the window-close end signal');
+  assert.match(headedArm, /waitForLogin\(page, loginUrl, opts\.successSignal, wait, authGained, cancel\)/, 'the wait is raced against the cancel');
+
+  // Every attach poll loop counts PAGE targets only. Counting devtools/webview/
+  // service-worker targets as pages would make a windowless Chrome look alive;
+  // counting a popup as not-a-page would cancel an SSO login mid-flow.
+  for (const marker of ['async function pollAttached(', 'async function pollAttachedLogin(']) {
+    const body = src.slice(src.indexOf(marker), src.indexOf(marker) + 2600);
+    assert.match(body, /p\.type === 'page'/, `${marker} must filter page targets`);
+    assert.match(body, /endpoint\.targets\(/, `${marker} must consult the shared endpoint watch`);
+  }
+});
+
+test(
+  'session_solve_challenge: a closed window cancels the SOLVE too, with its own wording and no artifact',
+  { skip: skipOnWin32 },
+  async () => {
+    // The third human path. It is a thin front door over the SAME attach engine, so
+    // the end signals are shared by construction — but the tool the user actually
+    // calls has to say the right thing, and it must not leave a half-cleared
+    // artifact behind any more than a login does.
+    const name = 'challenge-cancelled';
+    await withFakeChrome('die', async () => {
+      const env = envelopeOf(
+        await sessionSolveChallengeTool.handler({ name, url: FAKE_LOGIN_URL }, { trust: 'stdio' }),
+      );
+      assert.equal(env.ok, false);
+      assert.equal(env.cancelled, true);
+      assert.equal(env.mode, 'challenge', 'reported as a challenge, not a login');
+      assert.match(env.error, /^challenge cancelled: the Chrome window was closed/);
+      assert.match(env.error, /stay on the page until the tool reports the session saved/);
+    });
+    assert.equal(fs.existsSync(sessionFilePath(name)), false, 'nothing saved');
+    const rec = captureProgress(name);
+    assert.equal(rec?.state, 'cancelled');
+    assert.equal(rec?.mode, 'challenge');
+    assert.match(rec?.note ?? '', /Nothing was saved; start a new capture/);
+  },
+);
+
+test('session_status reports a COMPLETED capture, so an abandoned call is still recoverable', async () => {
+  // The other half of the recovery path: the capture outlives the call that started
+  // it, so an agent whose call was cut short must be able to learn it SUCCEEDED —
+  // "poll session_status" is worthless if a finished capture leaves no record.
+  const name = 'capture-saved';
+  const res = await sessionLoginTool.handler({
+    name,
+    loginUrl: `${base}/login`,
+    successSignal: 'h1',
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+  });
+  const env = envelopeOf(res);
+  assert.equal(env.ok, true, env.error ?? 'login ok');
+
+  const status = await sessionStatus({ name });
+  assert.equal(status.capture?.state, 'saved');
+  assert.equal(status.capture?.savedTo, sessionFilePath(name), 'the record names the artifact on disk');
+  assert.ok(status.capture?.cookiesGained > 0, 'and how much it got');
+  assert.ok(status.capture?.endedAt, 'closed, with an end time');
+  assert.match(status.capture?.note ?? '', /COMPLETED and the session was saved, even if the tool call/);
+  assert.doesNotMatch(status.capture?.note ?? '', /IN PROGRESS/);
+  assert.ok(fs.existsSync(status.capture.savedTo), 'the claim is true');
+
+  // Server-authored values only — session_status is exempt from the untrusted-content
+  // marking, so a capture record must never carry page text or the caller's own URL.
+  const blob = JSON.stringify(status.capture);
+  assert.ok(!blob.includes(base), 'no caller URL in the record');
+  assert.ok(!blob.includes('secret'), 'no credential value in the record');
 });

@@ -24,7 +24,7 @@ import {
 
 import { pathToFileURL } from 'node:url';
 
-import { customTools, callCustomTool, isCustomTool } from './tools.js';
+import { customTools, callCustomTool, isCustomTool, type ToolContext } from './tools.js';
 import { guardOutbound, UNTRUSTED_NOTICE, UNTRUSTED_IMAGE_NOTICE } from './exfil.js';
 import { secretInventory } from './secrets.js';
 import { closeBrowser } from './browser.js';
@@ -45,7 +45,23 @@ const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 function buildInstructions(
   upstreamTools: { name: string }[],
   custom: { name: string }[],
+  /**
+   * The rendering surface's trust tier, because one line differs by surface: the
+   * human-present captures wait with NO deadline on stdio and keep the bounded
+   * 300s default on an HTTP surface (the headed window opens on the SERVER host
+   * there). This map is the only always-visible discovery surface once tool
+   * schemas are deferred (DEC-2026-07-28), so it is the one string that must be
+   * TRUE on the surface that renders it — an unqualified "no time limit" here
+   * would be a lie on the local tier.
+   *
+   * REQUIRED, with no default, deliberately. A default here could only be the
+   * permissive one, and that is the inverse of the fail-closed rule the wait itself
+   * follows (`?? 'local'` in the session handlers): a caller who forgot the tier
+   * would ship "no time limit" to a surface that caps. Let the compiler ask.
+   */
+  trust: SurfaceTrust,
 ): string {
+  const noTimeLimit = trust === 'stdio';
   const names = new Set([...upstreamTools, ...custom].map((t) => t.name));
   const lines = [
     'playwright-mcp provides headless Playwright browsing for web work:',
@@ -67,23 +83,35 @@ function buildInstructions(
   if (names.has('session_login')) {
     lines.push(
       '',
-      'SITE BEHIND A LOGIN: capture it ONCE with session_login({name, loginUrl, headed:true}) — a real window opens ' +
-        'for the human to log in (2FA/SSO fine; credentials never pass through the model). Point loginUrl at the app ' +
-        'page you want; redirects to the identity provider are followed, and the capture FAILS LOUDLY rather than ' +
-        'saving an unauthenticated session. Then read authenticated pages with web_fetch({url, session:"name"}); ' +
-        'session_status({name}) says OFFLINE (no browser) whether that session already exists and which domains it ' +
-        'covers — check it BEFORE proposing a login; add probeUrl to live-probe it. The capture BINDS the browser automatically: browser_* ' +
-        'are then authenticated too, so you can click through the authed UI, not just read it. ' +
-        'session_attach({name}) re-binds a session captured in an earlier run; session_attach({name:null}) drops back ' +
-        'to anonymous.',
+      'SITE BEHIND A LOGIN: call session_login({name, loginUrl, headed:true}) and let the human ' +
+        'handle the entire login in the headed window. Do NOT use browser_* tools to probe the ' +
+        'login form or work out whether it needs a password, 2FA, SSO, or a CAPTCHA. The human ' +
+        'does every step, at their own pace, ' +
+        (noTimeLimit
+          ? 'with no time limit. The wait ends when they finish or close the window. '
+          : 'up to this surface\'s bounded 300000ms default (pass timeoutMs to change it). ') +
+        'Credentials never pass through ' +
+        'the model. Point loginUrl at the app page you want; redirects to the identity provider ' +
+        'are followed, and the capture FAILS LOUDLY rather than saving an unauthenticated session. ' +
+        'Then read authenticated pages with web_fetch({url, session:"name"}); session_status({name}) ' +
+        'says OFFLINE (no browser) whether that session already exists and which domains it covers. ' +
+        'Check it BEFORE proposing a login; add probeUrl to live-probe it. It also reports a capture ' +
+        'still in progress and whether it saved, so a tool call cut short mid-login is recovered by ' +
+        'polling it rather than by logging in again. The capture BINDS the ' +
+        'browser automatically, so browser_* are then authenticated too. ' +
+        'session_attach({name}) re-binds a session captured in an earlier run; ' +
+        'session_attach({name:null}) drops back to anonymous.',
     );
   }
   if (names.has('session_solve_challenge')) {
     lines.push(
       '',
-      'BLOCKED BY A CAPTCHA / BOT WALL: session_solve_challenge opens a real Chrome for the human to solve it once, ' +
-        'then saves the cleared session AND binds it exactly as session_login does — browser_* and ' +
-        'web_fetch({url, session}) both get past the wall afterwards. Short-lived (minutes); re-solve when it lapses.',
+      'BLOCKED BY A CAPTCHA / BOT WALL: session_solve_challenge opens a real Chrome for the ' +
+        'human to solve it once, ' +
+        (noTimeLimit ? 'with no time limit, ' : 'within this surface\'s bounded 300000ms default, ') +
+        'then saves the cleared session AND binds it ' +
+        'exactly as session_login does. browser_* and web_fetch({url, session}) both get past the ' +
+        'wall afterwards. Short-lived (minutes); re-solve when it lapses.',
     );
   }
   if (names.has('session_scaffold_tests')) {
@@ -165,8 +193,16 @@ const REMOTE_DENYLIST = new Set([...ALWAYS_DENIED, ...CLOUD_DENIED]);
  *              toolset minus `ALWAYS_DENIED` (keeps the human-gated `session_*`).
  * - `cloud`  — the public OAuth claude.ai surface; full toolset minus
  *              `REMOTE_DENYLIST`.
+ *
+ * Exported because the tier is no longer only a denylist selector: it also decides
+ * how long a HUMAN-PRESENT capture may wait. `stdio` means a person is at THIS
+ * display, so session_login/session_solve_challenge wait with no deadline there; on
+ * an HTTP surface the headed window opens on the server host, where an unbounded
+ * wait is an unreclaimable browser, so the bounded default stays. The tier travels
+ * to the tools through ToolContext (src/tools.ts) — never through a tool argument,
+ * which a caller could simply set.
  */
-type SurfaceTrust = 'stdio' | 'local' | 'cloud';
+export type SurfaceTrust = 'stdio' | 'local' | 'cloud';
 
 interface OutwardServerOptions {
   /** Trust tier governing the denylist. Defaults from `remote` for back-compat. */
@@ -283,7 +319,11 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
   session_status:
     'statusHandler (src/tools/session.ts) serialises StatusResult only: a state enum, a timestamp, ' +
     'and summariseArtifact’s explicit field allowlist over the stored storageState. No probe error ' +
-    'text reaches it — every failure path returns the enum (unreachable/stale/missing), never a message.',
+    'text reaches it — every failure path returns the enum (unreachable/stale/missing), never a message. ' +
+    'Its `capture` field is the same kind of value by construction: beginCapture/endCapture record only ' +
+    'a mode enum, a state enum, ISO timestamps, a cookie COUNT, a fixed note string and the artifact ' +
+    'path this server chose (sessionFilePath) — no page title, no final URL, not even the caller’s ' +
+    'loginUrl, so nothing a site wrote can ride in on it.',
   session_scaffold_tests:
     'The handler in src/tools/scaffold.ts reports the template-relative paths scaffold() wrote plus ' +
     'fixed next-step prose. Its only runtime imports are node:path and ../scaffold.js: no browser, ' +
@@ -391,6 +431,78 @@ function outboundUrlArg(args: Record<string, unknown> | undefined): string | und
   return /^https?:\/\//i.test(raw) ? raw : undefined;
 }
 
+/** Just the notification shape this server sends — narrower than the SDK union on purpose. */
+type ProgressSend = (notification: {
+  method: 'notifications/progress';
+  params: { progressToken: string | number; progress: number; message?: string };
+}) => Promise<void>;
+
+/**
+ * The per-call context a custom tool receives: the surface's trust tier, plus a
+ * progress channel WHEN the client asked for one.
+ *
+ * Why a heartbeat exists at all. A headed session_login now waits as long as the
+ * human needs, and a client aborts a call that goes silent. The limit that bites is
+ * IDLE, not total, and a progress notification resets it.
+ *
+ * MEASURED 2026-09-29 against Claude Code 2.1.284 with an instrumented stub server
+ * over `claude -p --strict-mcp-config`, two runs differing only in whether the stub
+ * heartbeated:
+ *
+ *   • the stub slept 45s in silence → the call was killed with `MCP server "probe"
+ *     tool "slow_probe" sent no response or progress for 30s; aborting`;
+ *   • the same 45s sleep sending notifications/progress every 3s → the call SURVIVED
+ *     and returned its result (14 notifications, no error).
+ *
+ * Both runs received `_meta: {progressToken: 2, "claudecode/toolUseId": …}`, so the
+ * token really is issued and the heartbeat really does hold the call open. 30s is what
+ * was OBSERVED on this client version, and nothing more: CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=5000
+ * was exported for both runs and did not change it, so 30s is not configurable from the
+ * environment alone — but WHICH internal limit it is was never established, so do not
+ * restate a mechanism from it. The interval chosen against that 30s is
+ * HEARTBEAT_EVERY_MS in src/tools/session.ts, with its derivation beside the constant —
+ * one number, one place, so the two files cannot drift.
+ *
+ * `progress` is built ONLY when the request carried `_meta.progressToken`. An
+ * unsolicited progress notification makes the client complain about an unknown
+ * token, so absence must stay absence rather than becoming a no-op that pretends.
+ * A client that sends no token is therefore not covered by the heartbeat at all, and
+ * NOTHING else holds its call open — no client or registration setting is relied on
+ * here, so do not write one into this comment again. Such a call is simply abandoned
+ * when the client gives up; the LOGIN still survives, because the capture keeps going
+ * server-side and session_status recovers it. That recovery path is the only belt this
+ * case has, which is why it is not optional.
+ *
+ * Exported and parameterised (token, signal, send) so the token guard and the
+ * abort behaviour are testable without a live client.
+ */
+export function callContext(
+  trust: SurfaceTrust,
+  token: string | number | undefined,
+  signal: AbortSignal,
+  send: ProgressSend,
+): ToolContext {
+  if (token === undefined) return { trust };
+  let live = true;
+  // extra.signal is read for HEARTBEAT HYGIENE ONLY. The capture deliberately keeps
+  // going when the client abandons the call — that is what makes a long human login
+  // recoverable through session_status instead of lost. All this stops is speaking
+  // to a token nobody is listening for, once per heartbeat interval, for hours.
+  signal.addEventListener('abort', () => (live = false), { once: true });
+  let sent = 0;
+  return {
+    trust,
+    progress: (message: string) => {
+      if (!live) return;
+      sent += 1;
+      void send({
+        method: 'notifications/progress',
+        params: { progressToken: token, progress: sent, message },
+      }).catch((err) => log('progress notification failed:', err instanceof Error ? err.message : err));
+    },
+  };
+}
+
 /**
  * Build one outward-facing MCP Server bound to the shared upstream proxy. A
  * Server owns exactly one transport (SDK contract: connect() assumes sole
@@ -426,7 +538,7 @@ export function createOutwardServer(
     { name: 'playwright-mcp', version: VERSION },
     {
       capabilities: { tools: {} },
-      instructions: buildInstructions(visibleUpstream, visibleCustom),
+      instructions: buildInstructions(visibleUpstream, visibleCustom, trust),
     },
   );
 
@@ -435,7 +547,7 @@ export function createOutwardServer(
     return { tools: [...tools.filter((t) => allow(t.name)), ...visibleCustom] };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
     if (!allow(name)) {
       return {
@@ -456,7 +568,14 @@ export function createOutwardServer(
       // Covers RETURNED results only: a handler that throws leaves through the
       // catch below, which is server prose and is not marked.
       if (isCustomTool(name))
-        return withUntrustedNotice(await callCustomTool(name, args ?? {}), name);
+        return withUntrustedNotice(
+          await callCustomTool(
+            name,
+            args ?? {},
+            callContext(trust, request.params._meta?.progressToken, extra.signal, extra.sendNotification),
+          ),
+          name,
+        );
 
       // Same outbound guard web_fetch runs, on the same shared ledger — so
       // browser_navigate cannot be used to route around it (DEC-2026-07-29).
