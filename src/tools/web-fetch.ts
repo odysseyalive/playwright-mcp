@@ -265,8 +265,10 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
       // Index rescue: the page carries no usable prose (a surviving banner, or
       // simply a listing) but is dense with on-site links. Return that index as
       // the body rather than a privacy notice or an empty string.
+      // Never rescue a wall the classifier already named: a bot-check page with
+      // a link-dense footer would otherwise come back 'ok' with no content.
       let note: string | undefined;
-      if (fetchStatus === 'consent-wall' || readable.text.length < 600) {
+      if (fetchStatus === 'consent-wall' || (fetchStatus === 'ok' && readable.text.length < 600)) {
         const index = extractLinkIndex(html, finalUrl);
         if (index.split('\n').length >= 10) {
           readable = { title: readable.title, text: index };
@@ -288,6 +290,11 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
         result.error =
           'a cookie-consent notice was returned instead of page content and could not be dismissed; ' +
           'the real content may still be in the DOM. Retry, or add an accept selector to ACCEPT_SELECTORS in src/consent.ts';
+      }
+      if (fetchStatus === 'blocked' && !opts.session) {
+        result.error =
+          'a bot check or CAPTCHA was returned instead of page content. Have the human clear it once with ' +
+          'session_solve_challenge({name, url}), then retry with web_fetch({url, session: name})';
       }
       if (opts.links) {
         const leads = harvestLinks(html, finalUrl, linkScope);

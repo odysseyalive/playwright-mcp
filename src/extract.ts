@@ -32,7 +32,8 @@ export interface Citation {
 
 // ── Page health ────────────────────────────────────────────────────────────
 
-const BLOCK_TELL = /unusual traffic|are you a robot|captcha|verify you are human|access denied|cf-error-details/i;
+const BLOCK_TELL =
+  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify you are human|access denied|cf-error-details/i;
 const LOGIN_TELL = /sign in to continue|log ?in to continue|please sign in|you must be logged in/i;
 const PAYWALL_TELL = /subscribe to (read|continue)|subscribers only|this article is for subscribers|create a free account to (read|continue)|metered/i;
 const NOTFOUND_TELL = /\b(404|page not found|page can.?t be found|no longer exists|content (is )?unavailable)\b/i;

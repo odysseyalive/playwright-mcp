@@ -1,0 +1,22 @@
+<html><head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <title>Bot Verification</title>
+    <script type="text/javascript">
+        function onSubmit() {
+            document.getElementById('lsrecaptcha-form').submit();
+        }
+        var onloadCallback = function() {
+            var cont = hcaptcha.render('recaptchadiv', { 'sitekey': 'fixture', 'callback': onSubmit });
+            hcaptcha.execute(cont);
+        };
+    </script>
+</head>
+<body>
+    <div class="panel">
+        <h3 class="title">Verifying that you are not a robot...</h3>
+        <form id="lsrecaptcha-form" method="POST" action="/.lsrecap/recaptcha">
+            <div id="recaptchadiv" class="recaptcha-center"></div>
+        </form>
+    </div>
+    <script async src="https://js.hcaptcha.com/1/api.js?onload=onloadCallback&amp;render=explicit" defer></script>
+</body></html>

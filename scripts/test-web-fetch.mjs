@@ -61,6 +61,18 @@ test('fetchStatus: a captcha interstitial with a tiny body is still blocked', ()
   assert.equal(classifyHealth(wall, 200, 'verify you are human'), 'blocked');
 });
 
+test('fetchStatus: LiteSpeed "Bot Verification" hCaptcha interstitial is blocked', () => {
+  // afcinema.com, 2026-10-18: served to every visitor without a clearance cookie.
+  const h = html('bot-verification-lsrecap.html');
+  const { text } = extractReadable(h, 'https://www.afcinema.com/a.html');
+  assert.equal(classifyHealth(h, 200, text), 'blocked');
+});
+
+test('fetchStatus: a bot check is blocked even without the word captcha', () => {
+  const wall = '<html><head><title>Bot Verification</title></head><body><h3>Verifying that you are not a robot...</h3></body></html>';
+  assert.equal(classifyHealth(wall, 200, 'Verifying that you are not a robot...'), 'blocked');
+});
+
 test('citation: JSON-LD yields author + dateConfidence high', () => {
   const c = extractCitation(html('article-jsonld.html'), 'https://coastalreview.test/tides');
   assert.ok(c.author.length >= 1, 'has an author');
