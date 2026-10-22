@@ -154,18 +154,22 @@ export function sandboxUnavailable(): boolean {
  * Run a browser_* launch; if Chromium refuses it with "No usable sandbox!", say
  * so ONCE on stderr (the C-2 rule: an unsandboxed browser is never discoverable
  * only from the source) and run it again, now unsandboxed. `launch` must read
- * upstreamLaunch() itself, so the retry picks up the changed gate.
+ * upstreamLaunch() itself, so the retry picks up the changed gate. The
+ * installer's check passes `quiet`: it says the same thing on its success path,
+ * and printing both put the warning on screen twice in a row (cPanel host,
+ * 2026-10-22).
  */
-export async function withSandboxFallback<T>(launch: () => Promise<T>): Promise<T> {
+export async function withSandboxFallback<T>(launch: () => Promise<T>, { quiet = false } = {}): Promise<T> {
   try {
     return await launch();
   } catch (err) {
     if (sandboxRefused || !SANDBOX_REFUSED.test(err instanceof Error ? err.message : String(err))) throw err;
     sandboxRefused = true;
-    log(
-      "Chromium's sandbox cannot start on this host (no usable user namespaces: disabled, or this process " +
-        'is in a chroot such as cPanel jailshell), so browser_* runs WITHOUT it. Pages you open are rendered unsandboxed.',
-    );
+    if (!quiet)
+      log(
+        "Chromium's sandbox cannot start on this host (no usable user namespaces: disabled, or this process " +
+          'is in a chroot such as cPanel jailshell), so browser_* runs WITHOUT it. Pages you open are rendered unsandboxed.',
+      );
     return launch();
   }
 }

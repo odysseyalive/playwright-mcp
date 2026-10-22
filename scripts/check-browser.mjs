@@ -55,7 +55,7 @@ async function launchOnce(opts) {
 }
 try {
   await launchOnce(() => ({ headless: true, ...STEALTH_LAUNCH }));
-  await withSandboxFallback(() => launchOnce(() => upstreamLaunch().launchOptions));
+  await withSandboxFallback(() => launchOnce(() => upstreamLaunch().launchOptions), { quiet: true });
   console.log(`Browser OK: ${which}, version ${version}.`);
   // Said on success too, for the same reason as the private-glibc notice above.
   if (sandboxUnavailable())

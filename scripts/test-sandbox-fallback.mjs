@@ -51,12 +51,21 @@ test('both of Chromium\'s refusal messages are recognised, and nothing broader',
 
 test('"No usable sandbox": one retry, and that retry is unsandboxed', async () => {
   const seen = [];
-  const title = await withSandboxFallback(async () => {
-    const { chromiumSandbox } = upstreamLaunch().launchOptions;
-    seen.push(chromiumSandbox);
-    if (seen.length === 1) throw new Error(NO_USABLE);
-    return 'Example Domain';
-  });
+  const said = [];
+  const error = console.error;
+  console.error = (...args) => said.push(args.join(' '));
+  let title;
+  try {
+    title = await withSandboxFallback(async () => {
+      const { chromiumSandbox } = upstreamLaunch().launchOptions;
+      seen.push(chromiumSandbox);
+      if (seen.length === 1) throw new Error(NO_USABLE);
+      return 'Example Domain';
+    });
+  } finally {
+    console.error = error;
+  }
+  assert.equal(said.filter((l) => /runs WITHOUT it/.test(l)).length, 1, "the server's launch says it on stderr, once");
   assert.equal(title, 'Example Domain');
   assert.deepEqual(seen, [SANDBOXED_BY_DEFAULT, false], 'the retry re-reads the gate, which is now off');
   assert.equal(sandboxUnavailable(), true);
@@ -99,5 +108,5 @@ test('real Chromium with user namespaces denied: the check passes and says the s
   assert.equal(res.status, 0, `check-browser failed:\n${res.stdout}\n${res.stderr}`);
   assert.match(res.stdout, /Browser OK/);
   assert.match(res.stdout, /WITHOUT the sandbox/, 'the success path states it');
-  assert.match(res.stderr, /runs WITHOUT it/, 'the launch path states it too');
+  assert.doesNotMatch(res.stderr, /runs WITHOUT it/, 'said once, not twice: the check quiets the launch notice');
 });
