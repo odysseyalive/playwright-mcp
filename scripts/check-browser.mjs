@@ -16,7 +16,7 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 
 import { BROWSER_CHANNEL, STEALTH_LAUNCH, glibcDir, legacyGlibc } from '../dist/stealth.js';
-import { upstreamLaunch } from '../dist/upstream.js';
+import { sandboxUnavailable, upstreamLaunch, withSandboxFallback } from '../dist/upstream.js';
 
 const which = BROWSER_CHANNEL
   ? 'Google Chrome'
@@ -41,18 +41,30 @@ if (legacyGlibc()) {
 }
 
 // Both launch shapes the server uses: web_fetch/session (STEALTH_LAUNCH) and
-// browser_* (upstreamLaunch, which carries the sandbox decision).
+// browser_* (upstreamLaunch, which carries the sandbox decision). The browser_*
+// one goes through the same sandbox fallback the server's launch does, so a host
+// where Chromium refuses the sandbox passes here exactly when browser_* will work.
 let browser;
 let version;
+async function launchOnce(opts) {
+  browser = await chromium.launch({ ...opts(), timeout: 60_000 });
+  const page = await browser.newPage();
+  await page.goto('about:blank');
+  version = browser.version();
+  await browser.close();
+}
 try {
-  for (const opts of [{ headless: true, ...STEALTH_LAUNCH }, upstreamLaunch().launchOptions]) {
-    browser = await chromium.launch({ ...opts, timeout: 60_000 });
-    const page = await browser.newPage();
-    await page.goto('about:blank');
-    version = browser.version();
-    await browser.close();
-  }
+  await launchOnce(() => ({ headless: true, ...STEALTH_LAUNCH }));
+  await withSandboxFallback(() => launchOnce(() => upstreamLaunch().launchOptions));
   console.log(`Browser OK: ${which}, version ${version}.`);
+  // Said on success too, for the same reason as the private-glibc notice above.
+  if (sandboxUnavailable())
+    console.log(
+      "  Chromium's sandbox cannot start on this host: unprivileged user namespaces are unavailable to\n" +
+        '  this account (disabled by sysctl or AppArmor, or this shell runs in a chroot such as cPanel\n' +
+        '  jailshell, where the kernel refuses them). browser_* will run WITHOUT the sandbox, so pages\n' +
+        '  you open are rendered unsandboxed. See "Hosts without Chromium\'s sandbox" in README.md.',
+    );
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`The browser failed to launch: ${which}.\n${msg}`);
@@ -72,9 +84,9 @@ try {
       legacyGlibc()
         ? "Chromium's sandbox is already off on this host, because its browsers run on the private glibc " +
             `in ${glibcDir()} — so a sandbox error here is not the usual disabled-user-namespaces one.`
-        : "browser_* runs Chromium's sandbox — it is off only as root, or on a host whose browsers were " +
-            'patched onto a private glibc — and the sandbox needs unprivileged user namespaces; this ' +
-            'host appears to have them disabled.',
+        : "browser_* runs Chromium's sandbox when it can, and falls back to running without it when " +
+            'Chromium reports that no sandbox can start here — so this sandbox error is a different one, not missing ' +
+            'user namespaces.',
     );
   process.exitCode = 1;
 } finally {

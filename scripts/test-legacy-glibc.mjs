@@ -277,6 +277,7 @@ test('src/ decides chromiumSandbox in exactly ONE place, and it carries the lega
   assert.equal(sites[0][0], 'src/upstream.ts');
   assert.match(sites[0][1], /!legacyGlibc\(\)/, 'the one decision site must consult the legacy gate');
   assert.match(sites[0][1], /getuid/, 'and keep the root case it already had (commit b98cb63)');
+  assert.match(sites[0][1], /!sandboxRefused/, 'and the learned no-usable-sandbox case (test-sandbox-fallback.mjs)');
 });
 
 test('STEALTH_LAUNCH carries no sandbox opinion, and its env appears exactly when legacy', () => {

@@ -122,13 +122,60 @@ function stealthInitFile(): string {
  *     deliberately (security review C-3; ledger DEC), not proven host by host.
  * Such a host also needs the private glibc on the browser's library path, which
  * is what `env` carries — undefined, i.e. absent, on every other host.
+ *
+ * A third case is learned rather than read off the host: Chromium itself saying
+ * "No usable sandbox!" at launch. That is a host where unprivileged user
+ * namespaces are unavailable to this process — disabled by sysctl or AppArmor, or
+ * refused because the process is inside a chroot, which the kernel never lets
+ * create a user namespace (cPanel's jailshell is one; measured on an EL9 shared
+ * host, 2026-10-22, with max_user_namespaces > 0). There the sandboxed launch
+ * cannot succeed at all, so withSandboxFallback() records the refusal and the
+ * gate below turns the sandbox off for the rest of this process. Only that
+ * refusal flips it (SANDBOX_REFUSED): any other launch error is rethrown with the
+ * sandbox still on.
  */
+let sandboxRefused = false;
+
+/**
+ * Chromium's two words for "no sandbox can start here". Without user namespaces
+ * it falls back to the SUID helper: with no helper on disk it says "No usable
+ * sandbox!" (bundled Chromium); with Google Chrome's helper present but unusable,
+ * as on a nosuid mount, it says the helper "is not configured correctly". Both
+ * measured under bwrap --disable-userns, 2026-10-22.
+ */
+export const SANDBOX_REFUSED = /No usable sandbox|SUID sandbox helper binary was found, but is not configured correctly/;
+
+/** True once Chromium has refused to start sandboxed in this process. */
+export function sandboxUnavailable(): boolean {
+  return sandboxRefused;
+}
+
+/**
+ * Run a browser_* launch; if Chromium refuses it with "No usable sandbox!", say
+ * so ONCE on stderr (the C-2 rule: an unsandboxed browser is never discoverable
+ * only from the source) and run it again, now unsandboxed. `launch` must read
+ * upstreamLaunch() itself, so the retry picks up the changed gate.
+ */
+export async function withSandboxFallback<T>(launch: () => Promise<T>): Promise<T> {
+  try {
+    return await launch();
+  } catch (err) {
+    if (sandboxRefused || !SANDBOX_REFUSED.test(err instanceof Error ? err.message : String(err))) throw err;
+    sandboxRefused = true;
+    log(
+      "Chromium's sandbox cannot start on this host (no usable user namespaces: disabled, or this process " +
+        'is in a chroot such as cPanel jailshell), so browser_* runs WITHOUT it. Pages you open are rendered unsandboxed.',
+    );
+    return launch();
+  }
+}
+
 export function upstreamLaunch(storageState?: string) {
   const launchOptions: LaunchOptions = {
     headless: true,
     channel: BROWSER_CHANNEL,
     args: STEALTH_ARGS,
-    chromiumSandbox: process.getuid?.() !== 0 && !legacyGlibc(),
+    chromiumSandbox: process.getuid?.() !== 0 && !legacyGlibc() && !sandboxRefused,
     env: browserGlibcEnv(),
     ignoreDefaultArgs: ['--disable-extensions'],
   };
@@ -216,7 +263,11 @@ export async function launchBrowser(storageState?: string): Promise<BrowserConte
   return context;
 }
 
-async function openBrowser(storageState?: string): Promise<BrowserContext> {
+function openBrowser(storageState?: string): Promise<BrowserContext> {
+  return withSandboxFallback(() => openBrowserOnce(storageState));
+}
+
+async function openBrowserOnce(storageState?: string): Promise<BrowserContext> {
   const { launchOptions, contextOptions } = upstreamLaunch(storageState);
   if (!storageState) {
     const { context, dir } = await launchOnPool(BROWSER_POOL, (d) =>

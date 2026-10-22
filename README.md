@@ -70,13 +70,21 @@ All of it lands under `~/.cache/playwright-mcp/`, in `node/`, `glibc/`, `el8/`, 
 
 **On a host that needed that private runtime, Chromium runs with `--no-sandbox`, and it runs against frozen libraries.** Two trade-offs, and both are the reason to read this section before installing on such a host. The browser renders pages nobody vetted, and for the `browser_*` tools the sandbox is the layer that normally keeps a compromised renderer away from the rest of the account it runs as. That layer is not attempted here. Nobody measured whether the sandbox would have worked on any particular old host either, and the rule covers every host below 2.25, so the whole class is accepted rather than each machine checked. The other half is the runtime itself. AlmaLinux 8.9 is a closed minor, pinned exactly so its checksums cannot move, which also means those libraries never receive a security update. The only thing that changes them is a code change here.
 
-Nothing about the sandbox changed anywhere else. The browser behind the `browser_*` tools keeps it on every other host, the long-standing exception being a root uid, where Chromium refuses the sandbox itself.
+Nothing about the sandbox changed anywhere else. The browser behind the `browser_*` tools keeps it on every other host, with two exceptions. One is a root uid, where Chromium refuses the sandbox itself. The other is a host where the sandbox cannot start at all, covered in [Hosts without Chromium's sandbox](#hosts-without-chromiums-sandbox).
 
 arm64 hosts with old glibc are not supported. There is no glibc-2.17 Node build for arm64 to fetch, so the installer stops there with a message naming that as the reason instead of failing further along. That message comes from reading `install.sh`. No arm64 host was run.
 
 The old-glibc path needs to reach `unofficial-builds.nodejs.org`, `vault.almalinux.org`, `github.com`, and `cdn.playwright.dev`. A host firewalled off from any of them fails at that fetch with the URL in the error.
 
 This was all measured in exactly one place, and only one. A clean-cache `./install.sh`, then `browser_navigate` plus a snapshot, then a `web_fetch`, on CentOS 7 x86_64 as a non-root uid, inside a container. No real old-glibc machine has been tested yet, and neither has that network reach from behind a firewall that blocks any of those four hosts.
+
+### Hosts without Chromium's sandbox
+
+Chromium's sandbox needs unprivileged user namespaces. Some hosts don't give them to an ordinary account. A sysctl or AppArmor policy can switch them off, and a chroot always loses them, because the kernel refuses to create a user namespace for any process inside one, whatever `max_user_namespaces` says. cPanel shared hosting is the common case. Its default login shell, jailshell, is a chroot, so every install there lands on this path. `unshare -U -r true` failing with "Operation not permitted" is the quick way to tell.
+
+On such a host Chromium won't launch sandboxed. It stops with "No usable sandbox!", or, when Google Chrome is installed, with a complaint that its SUID sandbox helper "is not configured correctly". The server watches for exactly those two refusals. When one comes back, it launches `browser_*` again with `--no-sandbox` and keeps it off for as long as the server runs. The installer's browser check goes through the same retry, and when the retry was needed it says so after "Browser OK". The server prints the same thing on stderr the first time it happens. Any other launch error is reported as it is, with the sandbox still on.
+
+That is a real trade-off, and it happens without asking. Pages the `browser_*` tools open are rendered with no sandbox between a compromised renderer and the rest of the account. `web_fetch` and `session_login` were never sandboxed on any host, so nothing changes for them. This was measured under `bwrap --disable-userns` on Arch, with both bundled Chromium and Google Chrome, and reported from a cPanel jailshell account on EL9 before the fix. The fix itself has not yet been run on that account.
 
 ## Install
 
@@ -172,7 +180,7 @@ Beyond the basic scaffold, three `suite_*` tools carry a full, project-agnostic 
 
 Every page this server fetches is controlled by somebody else. A page carrying instructions aimed at the model reading it is indirect prompt injection, and no known mitigation fully prevents it. What follows is what this server does about it, and what it does not fix.
 
-One piece of the exposure story lives up in the install notes rather than here, because it depends on your host. On a Linux host old enough to need the private glibc runtime, Chromium runs with `--no-sandbox`, against a frozen set of AlmaLinux 8.9 libraries that get no security updates. See [Older Linux hosts](#older-linux-hosts-glibc-older-than-228).
+One piece of the exposure story lives up in the install notes rather than here, because it depends on your host. On a Linux host old enough to need the private glibc runtime, Chromium runs with `--no-sandbox`, against a frozen set of AlmaLinux 8.9 libraries that get no security updates. See [Older Linux hosts](#older-linux-hosts-glibc-older-than-228). The same flag goes on for `browser_*` on any host where the sandbox can't start, cPanel jailshell among them. See [Hosts without Chromium's sandbox](#hosts-without-chromiums-sandbox).
 
 The technique is called spotlighting (Hines et al., Microsoft Research, arXiv:2403.14720). This server uses its delimiting mode, which fences untrusted content inside explicit delimiters with a warning in the opening tag. The project's internal name for the control is provenance framing. The paper's other two modes were considered and rejected. Datamarking was dropped for token cost on large documents and because it mangles code blocks and the quoted citation text `web_fetch` exists to produce. Encoding was not implemented.
 
