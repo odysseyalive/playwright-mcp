@@ -2409,23 +2409,44 @@ async function solveChallengeHandler(
   args: Record<string, unknown>,
   ctx?: ToolContext,
 ): Promise<CallToolResult> {
-  const timeoutMs = args.timeoutMs != null ? Number(args.timeoutMs) : undefined;
   return bindAndReport(
-    await runCapture(
-      {
-        name: String(args.name ?? ''),
-        loginUrl: String(args.url ?? ''),
-        challenge: true,
-        attach: true,
-        profile:
-          args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
-        timeoutMs,
-        // Always human-present: the whole point is a person clearing the wall by hand.
-        wait: resolveHumanWait(timeoutMs, ctx?.trust ?? 'local'),
-      },
+    await solveChallenge(
+      String(args.name ?? ''),
+      String(args.url ?? ''),
       ctx,
-      true,
+      args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
+      args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
     ),
+  );
+}
+
+/**
+ * The capture behind session_solve_challenge, without the bind. web_fetch calls it
+ * directly when it lands on a wall, so the human gets the same window and the same
+ * patience whether an agent asked for the solve or a fetch ran into the wall.
+ * web_fetch does not bind: swapping the browser under someone's open browser_* pages
+ * is not something a fetch should do as a side effect.
+ */
+export function solveChallenge(
+  name: string,
+  url: string,
+  ctx?: ToolContext,
+  profile?: LoginOptions['profile'],
+  timeoutMs?: number,
+): Promise<LoginResult> {
+  return runCapture(
+    {
+      name,
+      loginUrl: url,
+      challenge: true,
+      attach: true,
+      profile,
+      timeoutMs,
+      // Always human-present: the whole point is a person clearing the wall by hand.
+      wait: resolveHumanWait(timeoutMs, ctx?.trust ?? 'local'),
+    },
+    ctx,
+    true,
   );
 }
 

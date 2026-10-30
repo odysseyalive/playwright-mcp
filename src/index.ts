@@ -111,7 +111,9 @@ function buildInstructions(
         (noTimeLimit ? 'with no time limit, ' : 'within this surface\'s bounded 300000ms default, ') +
         'then saves the cleared session AND binds it ' +
         'exactly as session_login does. browser_* and web_fetch({url, session}) both get past the ' +
-        'wall afterwards. Short-lived (minutes); re-solve when it lapses.',
+        'wall afterwards. Short-lived (minutes); re-solve when it lapses. web_fetch does this on its ' +
+        'own: a fetch that lands on a wall opens that window, and the clearance is saved as ' +
+        'wall-<host> and reused by later fetches to that host until it lapses.',
     );
   }
   if (names.has('session_scaffold_tests')) {

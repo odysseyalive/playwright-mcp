@@ -14,6 +14,7 @@ import {
   detectCms,
   harvestLinks,
   extractPdfText,
+  wallVendor,
 } from '../dist/extract.js';
 
 const FX = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'web-fetch');
@@ -66,6 +67,38 @@ test('fetchStatus: LiteSpeed "Bot Verification" hCaptcha interstitial is blocked
   const h = html('bot-verification-lsrecap.html');
   const { text } = extractReadable(h, 'https://www.afcinema.com/a.html');
   assert.equal(classifyHealth(h, 200, text), 'blocked');
+});
+
+test('fetchStatus: F5 BIG-IP "Your support ID is" challenge is blocked and named', () => {
+  // egov.sos.state.or.us, 2026-10-30: came back ok with only this sentence as the body.
+  // The fixture is rebuilt from the extracted text; the raw challenge markup was not captured.
+  const h = html('f5-bot-defense.html');
+  const { text } = extractReadable(h, 'https://egov.sos.state.or.us/br/x');
+  assert.equal(classifyHealth(h, 200, text), 'blocked');
+  assert.equal(wallVendor(h), 'F5 BIG-IP bot defense');
+});
+
+test('wallVendor: names LiteSpeed, and stays quiet on an unknown wall', () => {
+  assert.equal(wallVendor(html('bot-verification-lsrecap.html')), 'LiteSpeed reCAPTCHA');
+  assert.equal(wallVendor(html('blocked.html')), undefined);
+});
+
+test('readable: a results table whose rows all link out is kept, one row per line', () => {
+  // egov.sos.state.or.us search, 2026-10-30: Readability kept the header table and
+  // dropped the results, so `text` was "Business Entity Names returned for: ..." only.
+  const { text, tableRows } = extractReadable(html('registry-results-table.html'), 'https://egov.sos.state.or.us/br/x');
+  assert.equal(tableRows, 3, 'header + two results; web_fetch skips the index rescue on this');
+  assert.match(text, /Business Entity Names returned for/);
+  assert.match(text, /Record No \| Entity Type \| Entity Status \| Registry Number \| Name Status \| Name \| Assoc Search/);
+  assert.match(text, /1 \| DBC \| ACT \| 091944-81 \| CUR \| PICTURE THIS PRODUCTION SERVICES, INC\./);
+  assert.match(text, /2 \| DBC \| ACT \| 091944-81 \| PRE \| PICTURE THIS PRODUCTIONS, INC\./);
+  assert.doesNotMatch(text, /Help \| Contact/, 'a one-row layout table is not data');
+});
+
+test('readable: an article is left as Readability returned it', () => {
+  const h = html('article-jsonld.html');
+  const { text } = extractReadable(h, 'https://coastalreview.test/tides');
+  assert.doesNotMatch(text, / \| /);
 });
 
 test('fetchStatus: a bot check is blocked even without the word captcha', () => {

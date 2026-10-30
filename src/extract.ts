@@ -33,7 +33,24 @@ export interface Citation {
 // ── Page health ────────────────────────────────────────────────────────────
 
 const BLOCK_TELL =
-  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify you are human|access denied|cf-error-details/i;
+  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify you are human|access denied|cf-error-details|your support id is/i;
+/**
+ * Who served the wall, when the markup says so. Only signatures seen on a real
+ * fetch are listed; an unrecognised wall is still 'blocked', just unnamed.
+ */
+const WALL_VENDORS: [RegExp, string][] = [
+  // egov.sos.state.or.us, 2026-10-30: "Please enable JavaScript to view the
+  // page content. Your support ID is: <digits>." (F5 ASM / Advanced WAF).
+  [/your support id is/i, 'F5 BIG-IP bot defense'],
+  [/\.lsrecap\/recaptcha/i, 'LiteSpeed reCAPTCHA'],
+  [/cf-error-details|cf-chl-/i, 'Cloudflare'],
+];
+
+/** Name the bot wall's vendor from its markup, or undefined when unknown. */
+export function wallVendor(html: string): string | undefined {
+  const head = html.slice(0, 60_000);
+  return WALL_VENDORS.find(([tell]) => tell.test(head))?.[1];
+}
 const LOGIN_TELL = /sign in to continue|log ?in to continue|please sign in|you must be logged in/i;
 const PAYWALL_TELL = /subscribe to (read|continue)|subscribers only|this article is for subscribers|create a free account to (read|continue)|metered/i;
 const NOTFOUND_TELL = /\b(404|page not found|page can.?t be found|no longer exists|content (is )?unavailable)\b/i;
@@ -93,6 +110,8 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
 export interface Readable {
   title: string;
   text: string;
+  /** Data-table rows put back under a short Readability result (see dataTableRows). */
+  tableRows?: number;
 }
 
 /** Run Mozilla Readability over the rendered DOM; fall back to body text. */
@@ -103,13 +122,46 @@ export function extractReadable(html: string, url: string): Readable {
   try {
     const article = new Readability(doc.cloneNode(true) as Document).parse();
     if (article && article.textContent && article.textContent.trim().length > 0) {
-      return { title: article.title || title, text: article.textContent.trim() };
+      const text = article.textContent.trim();
+      // A short result on a page with data tables is a header Readability kept in
+      // place of the table it dropped; put the table back under it.
+      if (text.length < 600) {
+        const rows = dataTableRows(doc).filter((r) => !text.includes(r.split(' | ').pop() ?? r));
+        if (rows.length) {
+          return { title: article.title || title, text: `${text}\n\n${rows.join('\n')}`, tableRows: rows.length };
+        }
+      }
+      return { title: article.title || title, text };
     }
   } catch {
     /* fall through to body text */
   }
   const text = (doc.body?.textContent ?? '').replace(/\s+\n/g, '\n').replace(/[ \t]{2,}/g, ' ').trim();
   return { title, text };
+}
+
+/**
+ * Rows of the page's data tables, one "cell | cell" line each. Readability scores
+ * link-dense blocks as navigation, so a results table whose every row links to a
+ * detail page (a registry search, a listing) is dropped whole. Innermost tables
+ * only, and only rows of three or more filled cells, in tables with at least two
+ * such rows: layout tables nest, or hold a cell or two a row, and fail both tests.
+ */
+function dataTableRows(doc: Document): string[] {
+  const rows: string[] = [];
+  for (const table of doc.querySelectorAll('table')) {
+    if (table.querySelector('table')) continue;
+    const lines = [...table.querySelectorAll('tr')]
+      .map((tr) =>
+        [...tr.querySelectorAll('th, td')]
+          .map((c) => (c.textContent ?? '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean),
+      )
+      .filter((cells) => cells.length >= 3)
+      .map((cells) => cells.join(' | '));
+    if (lines.length >= 2) rows.push(...lines);
+  }
+  return rows;
 }
 
 // ── Citation (CSL-JSON), priority chain ──────────────────────────────────────

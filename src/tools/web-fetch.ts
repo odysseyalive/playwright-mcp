@@ -27,6 +27,10 @@ import { guardOutbound, sessionAllowsUrl, wrapUntrusted } from '../exfil.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
 import { sessionFilePath, secretInventory, reassertOwnerOnly } from '../secrets.js';
 import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
+import type { ToolContext } from '../tools.js';
+import { solveChallenge, type LoginResult } from './session.js';
+
+const log = (...args: unknown[]) => console.error('[playwright-mcp:web_fetch]', ...args);
 import {
   classifyHealth,
   extractReadable,
@@ -35,6 +39,7 @@ import {
   harvestLinks,
   extractLinkIndex,
   extractPdfText,
+  wallVendor,
   type Citation,
   type FetchStatus,
   type ContentType,
@@ -94,10 +99,87 @@ export interface FetchOptions {
 }
 
 /**
- * Mechanical render + extract. Never throws into the caller — failures come back
- * as a FetchResult with an error and a best-effort fetchStatus.
+ * Render + extract, getting past a bot wall with the human's help. Never throws
+ * into the caller — failures come back as a FetchResult with an error and a
+ * best-effort fetchStatus.
+ *
+ * A wall is handled the way session_solve_challenge handles it, without anyone
+ * having to ask: the clearance a human produced for a host is saved as
+ * `wall-<host>` and replayed by every later fetch there; when there is none, or it
+ * has lapsed, the same real Chrome window opens on the walled page for the human to
+ * clear, and the fetch retries once it is. Only where session_solve_challenge
+ * itself is allowed (stdio and the local surface, never cloud), and never for a
+ * caller that named its own session. A direct caller with no ctx is an unknown
+ * surface and gets the plain render.
  */
-export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
+export async function fetchUrl(opts: FetchOptions, ctx?: ToolContext): Promise<FetchResult> {
+  const trusted = ctx?.trust === 'stdio' || ctx?.trust === 'local';
+  const wall = wallSessionName(opts.url);
+  if (!trusted || opts.session || !wall) return fetchOnce(opts);
+
+  const saved = fs.existsSync(sessionFilePath(wall));
+  const first = await fetchOnce(saved ? { ...opts, session: wall } : opts);
+  if (!walled.has(first)) return saved ? withNote(first, `read with the saved bot-wall clearance "${wall}"`) : first;
+  if (!canShowWindow()) {
+    return {
+      ...first,
+      error:
+        'a bot check was returned instead of page content, and there is no display here to open the ' +
+        'window a human clears it in. Clear it from a machine with a screen using session_solve_challenge.',
+    };
+  }
+
+  const solved = await solveOnce(wall, opts.url, ctx);
+  if (!solved.ok) {
+    return {
+      ...first,
+      error:
+        `a bot check was returned instead of page content; a window opened for the human to clear it, ` +
+        `and it ${solved.cancelled ? 'was closed before the wall cleared' : 'ended without clearing it'}. ` +
+        'Retry web_fetch to open it again.',
+    };
+  }
+  const retry = await fetchOnce({ ...opts, session: wall });
+  return walled.has(retry) ? retry : withNote(retry, `bot wall cleared by the human; saved as "${wall}" for later fetches`);
+}
+
+/** Results that rendered a bot wall. A set, not a field: it never reaches the model. */
+const walled = new WeakSet<FetchResult>();
+
+/** One window per host: concurrent fetches that hit the same wall share the solve. */
+const solving = new Map<string, Promise<LoginResult>>();
+
+function solveOnce(wall: string, url: string, ctx: ToolContext): Promise<LoginResult> {
+  let p = solving.get(wall);
+  if (!p) {
+    log(`${wall}: bot wall on ${url}; opening a window for the human to clear it`);
+    p = solveChallenge(wall, url, ctx).finally(() => solving.delete(wall));
+    solving.set(wall, p);
+  }
+  return p;
+}
+
+/** The saved clearance for a host's wall. Per host, since that is what a clearance cookie covers. */
+export function wallSessionName(url: string): string | undefined {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host ? `wall-${host}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A headed window needs a display; on Linux that is X or Wayland, elsewhere there always is one. */
+function canShowWindow(): boolean {
+  return process.platform !== 'linux' || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+function withNote(r: FetchResult, note: string): FetchResult {
+  return { ...r, note: r.note ? `${r.note}; ${note}` : note };
+}
+
+/** One render + extract, no wall handling. */
+async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
   const url = canonicalUrl(opts.url);
   const linkScope: LinkScope = opts.linkScope ?? 'outbound';
   const cacheKey = `${url}|links=${opts.links ? 1 : 0}|scope=${linkScope}|session=${opts.session ?? ''}`;
@@ -268,7 +350,9 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
       // Never rescue a wall the classifier already named: a bot-check page with
       // a link-dense footer would otherwise come back 'ok' with no content.
       let note: string | undefined;
-      if (fetchStatus === 'consent-wall' || (fetchStatus === 'ok' && readable.text.length < 600)) {
+      // Nor replace a results table already recovered from the page: its rows carry
+      // the columns a link list would drop.
+      if (fetchStatus === 'consent-wall' || (fetchStatus === 'ok' && readable.text.length < 600 && !readable.tableRows)) {
         const index = extractLinkIndex(html, finalUrl);
         if (index.split('\n').length >= 10) {
           readable = { title: readable.title, text: index };
@@ -291,10 +375,15 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
           'a cookie-consent notice was returned instead of page content and could not be dismissed; ' +
           'the real content may still be in the DOM. Retry, or add an accept selector to ACCEPT_SELECTORS in src/consent.ts';
       }
-      if (fetchStatus === 'blocked' && !opts.session) {
+      if (fetchStatus === 'blocked') {
+        walled.add(result);
+        const vendor = wallVendor(html);
         result.error =
-          'a bot check or CAPTCHA was returned instead of page content. Have the human clear it once with ' +
-          'session_solve_challenge({name, url}), then retry with web_fetch({url, session: name})';
+          `a bot check or CAPTCHA${vendor ? ` (${vendor})` : ''} was returned instead of page content. ` +
+          (opts.session
+            ? `Session "${opts.session}" did not get past it; its clearance may have lapsed.`
+            : 'Have the human clear it once with ' +
+              'session_solve_challenge({name, url}), then retry with web_fetch({url, session: name})');
       }
       if (opts.links) {
         const leads = harvestLinks(html, finalUrl, linkScope);
@@ -304,7 +393,8 @@ export async function fetchUrl(opts: FetchOptions): Promise<FetchResult> {
     }
 
     if (opts.quality === 'research') result.appraisalRequested = true;
-    cache.set(cacheKey, result);
+    // A wall is not cached: the next fetch, or the retry after a solve, must see the page again.
+    if (!walled.has(result)) cache.set(cacheKey, result);
     return result;
   } catch (err) {
     // A refused redirect hop reaches here as a bare chromium error code, so the
@@ -376,7 +466,10 @@ const definition: Tool = {
     '(archives, indexes, tables of contents). quality:"research" flags the result for source appraisal. ' +
     'Pass session:"name" to read paywalled content behind a session_login capture (local only). ' +
     'Cookie-consent banners are dismissed automatically; a notice that survives returns ' +
-    'fetchStatus:"consent-wall" rather than being handed back as page content.',
+    'fetchStatus:"consent-wall" rather than being handed back as page content. ' +
+    'On a CAPTCHA / bot wall (local only) a real Chrome window opens for the human to clear it, then ' +
+    'the fetch retries; the clearance is saved as "wall-<host>" and reused by later fetches there. ' +
+    'A wall that is still up returns fetchStatus:"blocked".',
   inputSchema: {
     type: 'object',
     properties: {
@@ -467,7 +560,7 @@ export function frameFetchResult(result: FetchResult): string {
   );
 }
 
-async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
+async function handler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
   const url = String(args.url ?? '');
   if (!url) {
     return { content: [{ type: 'text', text: 'Error: url is required' }], isError: true };
@@ -479,7 +572,7 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
     quality: args.quality === 'research' ? 'research' : 'fast',
     session: args.session ? String(args.session) : undefined,
     linkScope: scope === 'same-origin' || scope === 'all' ? scope : 'outbound',
-  });
+  }, ctx);
   // Provenance framing (DEC-2026-07-29): every page-derived field is quarantined
   // with its warning in the opening delimiter, adjacent to the content it is
   // warning about. Applied at the MCP boundary — fetchUrl's structured result is
