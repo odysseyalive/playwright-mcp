@@ -32,6 +32,15 @@ test('wallSessionName: one clearance per host', () => {
   assert.equal(wallSessionName('not a url'), undefined);
 });
 
+test('wall- names are reserved: a login saved as one would be replayed unasked', async () => {
+  const { sessionLoginTool, sessionSolveChallengeTool } = await import('../dist/tools/session.js');
+  for (const tool of [sessionLoginTool, sessionSolveChallengeTool]) {
+    const r = await tool.handler({ name: 'wall-example.test', url: 'https://example.test', loginUrl: 'https://example.test' });
+    assert.equal(r.isError, true, tool.definition.name);
+    assert.match(r.content[0].text, /reserved/);
+  }
+});
+
 test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TEST_BROWSER=1' }, async (t) => {
   const server = http.createServer((req, res) => {
     res.setHeader('content-type', 'text/html');

@@ -28,7 +28,7 @@ import { TtlCache, canonicalUrl } from '../cache.js';
 import { sessionFilePath, secretInventory, reassertOwnerOnly } from '../secrets.js';
 import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 import type { ToolContext } from '../tools.js';
-import { solveChallenge, type LoginResult } from './session.js';
+import { solveChallenge, WALL_SESSION_PREFIX, type LoginResult } from './session.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:web_fetch]', ...args);
 import {
@@ -152,7 +152,8 @@ const solving = new Map<string, Promise<LoginResult>>();
 function solveOnce(wall: string, url: string, ctx: ToolContext): Promise<LoginResult> {
   let p = solving.get(wall);
   if (!p) {
-    log(`${wall}: bot wall on ${url}; opening a window for the human to clear it`);
+    // The name, not the url: a query string can carry a token, and stderr is a log.
+    log(`${wall}: bot wall; opening a window for the human to clear it`);
     p = solveChallenge(wall, url, ctx).finally(() => solving.delete(wall));
     solving.set(wall, p);
   }
@@ -163,7 +164,7 @@ function solveOnce(wall: string, url: string, ctx: ToolContext): Promise<LoginRe
 export function wallSessionName(url: string): string | undefined {
   try {
     const host = new URL(url).hostname.toLowerCase();
-    return host ? `wall-${host}` : undefined;
+    return host ? `${WALL_SESSION_PREFIX}${host}` : undefined;
   } catch {
     return undefined;
   }

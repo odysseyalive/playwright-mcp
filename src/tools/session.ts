@@ -1459,7 +1459,10 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     let state = (await ctx.storageState()) as StorageState;
     // A real/shared profile carries the user's whole cookie jar — persist ONLY the
     // login site's cookies. A throwaway temp profile only ever holds the target site.
-    if (prof.scope) state = scopeStorageState(state, siteDomain(opts.loginUrl));
+    // A cleared wall is only worth the walled site's cookies, whatever the profile:
+    // anything else the human did in that window (another site, a login elsewhere)
+    // must not ride along into a clearance web_fetch replays on its own.
+    if (prof.scope || opts.challenge) state = scopeStorageState(state, siteDomain(opts.loginUrl));
 
     // Same invariant sessionLogin() enforces, adapted: attach connects AFTER the
     // human is done, so there is no before/after delta to take. What holds for both
@@ -1482,7 +1485,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     const restriction = restrictCapturedArtifact(out);
     const kind = opts.challenge ? 'challenge' : 'attach';
     log(
-      `saved session "${opts.name}" → ${out} (${restriction}, ${kind}${prof.scope ? ', domain-scoped' : ''}, ` +
+      `saved session "${opts.name}" → ${out} (${restriction}, ${kind}${prof.scope || opts.challenge ? ', domain-scoped' : ''}, ` +
         `${state.cookies?.length ?? 0} cookies)`,
     );
     // Only challenge captures get clearance telemetry — for a login the meaningful
@@ -2159,7 +2162,31 @@ const loginDefinition: Tool = {
   },
 };
 
+/**
+ * Names web_fetch saves its own bot-wall clearances under, and replays on every
+ * fetch to that host without being asked. Reserved: a login saved under one would
+ * be replayed the same way, which is exactly what naming a session is meant to gate.
+ */
+export const WALL_SESSION_PREFIX = 'wall-';
+
+function reservedName(name: string): CallToolResult | undefined {
+  if (!name.startsWith(WALL_SESSION_PREFIX)) return undefined;
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `Error: "${WALL_SESSION_PREFIX}" names are reserved for the bot-wall clearances web_fetch saves ` +
+          'and replays on its own. Pick another name.',
+      },
+    ],
+    isError: true,
+  };
+}
+
 async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
+  const refused = reservedName(String(args.name ?? ''));
+  if (refused) return refused;
   const opts: LoginOptions = {
     name: String(args.name ?? ''),
     loginUrl: String(args.loginUrl ?? ''),
@@ -2409,6 +2436,8 @@ async function solveChallengeHandler(
   args: Record<string, unknown>,
   ctx?: ToolContext,
 ): Promise<CallToolResult> {
+  const refused = reservedName(String(args.name ?? ''));
+  if (refused) return refused;
   return bindAndReport(
     await solveChallenge(
       String(args.name ?? ''),
