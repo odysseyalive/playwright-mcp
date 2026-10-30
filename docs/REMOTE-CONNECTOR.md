@@ -42,8 +42,8 @@ The remote surface deliberately differs from the local one:
   machine still has every tool, `browser_evaluate` included.
   **Timeout difference by surface.** On the stdio surface (Claude Code),
   `session_login` and `session_solve_challenge` wait with no deadline when a
-  human is logging in. The wait ends when the person finishes or closes the
-  window. On the local no-auth HTTP surface, where those two tools are
+  human is logging in. A login ends when the person presses "I'm signed in,
+  save it" on the window's second tab, and closing the window cancels. On the local no-auth HTTP surface, where those two tools are
   allowed, they keep a bounded 300-second default because the headed window
   would open on the server host where nobody is sitting. (On the cloud
   surface both tools are denied outright, so the timeout never applies there.)

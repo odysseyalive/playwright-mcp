@@ -29,6 +29,7 @@ import { sessionFilePath, secretInventory, reassertOwnerOnly } from '../secrets.
 import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
 import type { ToolContext } from '../tools.js';
 import { solveChallenge, WALL_SESSION_PREFIX, type LoginResult } from './session.js';
+import { looksLikeSignIn } from '../login-done.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:web_fetch]', ...args);
 import {
@@ -274,7 +275,7 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
         // never overwrite the (possibly recoverable) captured one.
         try {
           const landed = page.url();
-          if (!/\/(login|signin|sign-in|auth)(\b|\/|\?)/i.test(landed)) {
+          if (!looksLikeSignIn(landed)) {
             await context.storageState({ path: file });
             reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
           }
@@ -342,6 +343,11 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
       const html = await page.content();
       let readable = extractReadable(html, finalUrl);
       let fetchStatus = classifyHealth(html, status, readable.text);
+      // Sent somewhere that reads as a sign-in step: the page needs a login, or the
+      // session's has lapsed. Checked before the wall test, since a login page that
+      // carries a captcha widget is still a login page and must never open the
+      // bot-wall window. Only a REDIRECT counts: fetching /login itself is fine.
+      if (finalUrl !== url && looksLikeSignIn(finalUrl) && !looksLikeSignIn(url)) fetchStatus = 'login-wall';
       const citation = extractCitation(html, finalUrl);
       if (!citation.title) citation.title = readable.title || finalUrl;
 
@@ -371,6 +377,13 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
         citation,
       };
       if (note) result.note = note;
+      if (fetchStatus === 'login-wall') {
+        result.error = opts.session
+          ? `session "${opts.session}" is not logged in: the site sent this request to its sign-in page. ` +
+            'Capture it again with session_login.'
+          : 'this page needs a login: the site sent this request to its sign-in page. Capture one with ' +
+            'session_login, then retry with web_fetch({url, session: name}).';
+      }
       if (fetchStatus === 'consent-wall') {
         result.error =
           'a cookie-consent notice was returned instead of page content and could not be dismissed; ' +

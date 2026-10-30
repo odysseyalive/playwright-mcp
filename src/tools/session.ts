@@ -42,6 +42,7 @@ import {
   OwnerOnlyError,
 } from '../secrets.js';
 import { storageStateDomains, wrapUntrusted } from '../exfil.js';
+import { startDoneButton, type DoneButton } from '../login-done.js';
 import { bindSession } from '../upstream.js';
 import {
   STEALTH_LAUNCH,
@@ -387,6 +388,67 @@ function restrictCapturedArtifact(out: string): string {
 }
 
 /**
+ * How long Chrome gets to put a page on screen. This bounds the BROWSER, never the
+ * human: until a page exists there is no window for anyone to close, so the
+ * close-to-cancel signal cannot fire and an unbounded wait would never end. Same
+ * job as the startup bound on attach mode's DevTools port.
+ */
+const WINDOW_STARTUP_MS = 20_000;
+
+async function windowStartup<T>(open: () => Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      open(),
+      new Promise<never>((_, rj) => {
+        timer = setTimeout(
+          () =>
+            rj(
+              new Error(
+                `the login window did not open: Chrome started but showed no page within ` +
+                  `${WINDOW_STARTUP_MS / 1000}s. Nothing was saved; retry the login.`,
+              ),
+            ),
+          WINDOW_STARTUP_MS,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Wait for the human's "I'm signed in" button (login-done.ts), or the window to
+ * go. A capped budget (an HTTP surface, or a direct caller) still applies there.
+ */
+async function waitForButton(button: DoneButton, cancel: CaptureCancel, wait: WaitBudget): Promise<void> {
+  const arms: Promise<void>[] = [button.pressed, cancel.promise];
+  let timer: NodeJS.Timeout | undefined;
+  if (wait.deadline !== 'none') {
+    arms.push(
+      new Promise<never>((_, rj) => {
+        timer = setTimeout(
+          () =>
+            rj(
+              new Error(
+                `login not saved: "I'm signed in, save it" was not pressed within ${Math.round(wait.ms / 1000)}s ` +
+                  'on this surface. Nothing was saved.',
+              ),
+            ),
+          wait.ms,
+        );
+      }),
+    );
+  }
+  try {
+    await Promise.race(arms);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Wire the driven browser's own events to makeWindowClosedWatch.
  *
  * Kept apart from the watch so the DECISION ("is anything left to log in with?")
@@ -416,14 +478,19 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   const mode: 'headless' | 'headed' = opts.headed ? 'headed' : 'headless';
   const out = sessionFilePath(opts.name);
   let browser: Browser | undefined;
+  let button: DoneButton | undefined;
   try {
     browser = await chromium.launch({ headless: !opts.headed, ...STEALTH_LAUNCH });
     // Disguise the capture context (own cookie jar — never the web_fetch profile)
     // so bot-protected login pages don't flag the headless browser and fail the
     // capture. Identity stays isolated; only the anti-detection technique is shared.
-    const context = await browser.newContext({ ...stealthContextOptions, ignoreHTTPSErrors: true });
-    await context.addInitScript(STEALTH_INIT);
-    const page = await context.newPage();
+    // Bounded: until a page exists there is no window to close, so a Chrome that
+    // starts and never shows one would otherwise wait forever (2026-10-30, LinkedIn).
+    const { context, page } = await windowStartup(async () => {
+      const context = await browser!.newContext({ ...stealthContextOptions, ignoreHTTPSErrors: true });
+      await context.addInitScript(STEALTH_INIT);
+      return { context, page: await context.newPage() };
+    });
     await page.goto(opts.loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
     // An app URL usually REDIRECTS to the identity provider (apps.docusign.com/send
@@ -447,22 +514,28 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     const authGained = makeAuthCookieProbe(() => context.cookies(), before, loginUrl);
 
     if (opts.headed) {
-      // Human completes the challenge in the SEPARATE automation window this
-      // launched (not their everyday browser). We auto-detect completion when
-      // they move past the login page; an explicit successSignal, if given,
-      // also resolves. NO deadline on the stdio surface — a person typing a
-      // password, waiting for an SMS code and clicking through two SSO hops takes
-      // however long it takes. The wait ends when they finish or when the window
-      // is gone (cancel), never on a clock somebody guessed.
+      // The human logs in in the SEPARATE automation window this launched (not
+      // their everyday browser), and says when it is done with the button tab.
+      // Nothing here guesses: see login-done.ts for why. NO deadline on the stdio
+      // surface — a person typing a password, waiting for an SMS code and clicking
+      // through two SSO hops takes however long it takes. The wait ends when they
+      // press the button or when the window is gone (cancel).
       //
       // An absent `wait` is a DIRECT caller, not a surface: capped, never unbounded.
       const wait = opts.wait ?? resolveHumanWait(opts.timeoutMs, 'local');
+      button = await startDoneButton(opts.name, async () =>
+        context.pages().filter((p) => !p.isClosed()).map((p) => p.url()),
+      );
+      const tab = await windowStartup(() => context.newPage());
+      await tab.goto(button.url, { waitUntil: 'domcontentloaded', timeout: 10_000 });
+      await page.bringToFront();
       log(
-        `headed login for "${opts.name}" — a SEPARATE automation window opened; complete the login in THAT window` +
+        `headed login for "${opts.name}" — a SEPARATE automation window opened; log in there, then press ` +
+          `"I'm signed in, save it" on its second tab` +
           (wait.deadline === 'none' ? ' (no time limit; closing the window cancels)' : ''),
       );
       const cancel = watchDrivenWindow(browser, context, page, CANCELLED_DRIVEN);
-      await waitForLogin(page, loginUrl, opts.successSignal, wait, authGained, cancel);
+      await waitForButton(button, cancel, wait);
     } else {
       const sel = { ...DEFAULT_SELECTORS, ...opts.selectors };
       const lookup = { envFile: opts.envFile };
@@ -501,8 +574,11 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       throw new CapturedTextError(
         `no session was captured — the browser gained no new cookies, so the login did not complete. ` +
           `Nothing was saved. The final URL is quarantined below. ` +
-          `If the site uses a multi-step login (email first, password/2FA after), pass a successSignal ` +
-          `naming something only visible AFTER login — e.g. a post-login URL fragment or on-page text.`,
+          (opts.headed
+            ? `"I'm signed in, save it" was pressed before the login finished; retry and press it once ` +
+              `the site's own pages are on screen.`
+            : `If the site uses a multi-step login (email first, password/2FA after), pass a successSignal ` +
+              `naming something only visible AFTER login — e.g. a post-login URL fragment or on-page text.`),
         `final URL: ${page.url()}`,
         page.url(),
       );
@@ -520,7 +596,10 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     // itself: it must carry a strong auth cookie for the login site, or the login had not
     // finalized. (URL-change and marker completions never reach this branch, so no
     // ordinary login is affected.)
-    if (!opts.successSignal?.trim() && samePath(page.url(), loginUrl)) {
+    // Only on the unattended credentials path: a human who pressed "saved" has
+    // already said the login finished, and many sites' login cookie is not
+    // auth-named (LinkedIn's li_at), so this gate would only refuse real logins.
+    if (!opts.headed && !opts.successSignal?.trim() && samePath(page.url(), loginUrl)) {
       const saved = JSON.parse(fs.readFileSync(out, 'utf8')) as StorageState;
       if (!artifactHasSiteAuthCookie(saved, loginUrl)) {
         fs.rmSync(out, { force: true }); // never leave a logged-out artifact behind
@@ -541,6 +620,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
 
     const hosts = [...new Set(gained.map((c) => (c.domain ?? '').replace(/^\./, '')))].filter(Boolean);
     log(`saved session "${opts.name}" → ${out} (${restriction}; ${gained.length} new cookies on ${hosts.join(', ')})`);
+    button?.finish(true);
     return {
       name: opts.name,
       path: out,
@@ -569,6 +649,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
       ...(captured ? { capturedDetail: captured.captured, capturedSource: captured.source } : {}),
     };
   } finally {
+    button?.close(); // answers an unanswered press "not saved"
     await browser?.close().catch(() => {});
   }
 }
@@ -630,7 +711,7 @@ function freePort(): Promise<number> {
 }
 
 /** Chrome launch arguments for an attach capture. Exported so the port rule is testable. */
-export function attachChromeArgs(profileDir: string, port: number, url: string): string[] {
+export function attachChromeArgs(profileDir: string, port: number, url: string, ...also: string[]): string[] {
   if (!(Number.isInteger(port) && port > 0))
     throw new Error(`attach: refusing debugging port ${port} — port 0 marks every page navigator.webdriver=true`);
   return [
@@ -640,6 +721,7 @@ export function attachChromeArgs(profileDir: string, port: number, url: string):
     '--no-default-browser-check',
     '--new-window',
     url,
+    ...also,
   ];
 }
 
@@ -838,200 +920,6 @@ async function pollAttached(
     await sleep(1000);
   }
   throw new Error(timeoutMessage);
-}
-
-/**
- * "Has the human finished logging in", for attach mode.
- *
- * Two traps, both of which challengeCleared() already avoids and this did not:
- *
- *  1. The caller's URL is usually an APP url that redirects to the identity
- *     provider. leftLoginPage()'s host rule then fires on the redirect INTO the
- *     login screen — the redirect that STARTS an SSO login reads as finishing
- *     one. So latch the first page actually observed as the real login page,
- *     the same settled-URL baseline sessionLogin() takes.
- *  2. A page whose title has not rendered yet is not evidence of anything;
- *     judging it races the browser. challengeCleared() guards this explicitly.
- *
- * Exported as a factory because the latch is per-capture state: each call gets
- * its own baseline, and tests can drive the sequence directly.
- */
-export function makeAttachLoginCheck(): (p: { url: string; title: string }) => boolean {
-  let baseline: string | undefined;
-  return (p) => {
-    if (!p.title.trim()) return false; // shell before the document rendered
-    if (!baseline) {
-      baseline = p.url; // first real page = where the login actually lives
-      return false;
-    }
-    return leftLoginPage(p.url, baseline) && !wallUp(p.url, p.title);
-  };
-}
-
-const safeHostname = (u: string): string => {
-  try {
-    return new URL(u).hostname;
-  } catch {
-    return '';
-  }
-};
-
-/**
- * Wait for the human to finish logging in, using the AUTH-COOKIE signal rather than
- * a URL change. A same-origin SPA login — and any multi-step / SSO login — can finish
- * without the pathname ever leaving the login page, so the URL heuristic
- * (makeAttachLoginCheck / leftLoginPage) times out on it while the login has plainly
- * succeeded. The cookie gate is the completion authority the driven path already
- * trusts (newCookies: "a real login always issues at least one new cookie").
- *
- * CDP-safety: cookies are read only via a passive connectOverCDP, and only once a
- * login-host page is showing a NON-wall document — never while a managed challenge is
- * still up, because reading during the solve is what makes a Cloudflare wall loop.
- * wallUp() is the same shared predicate both capture modes compose.
- *
- * The CDP connection is NEVER held. MEASURED 2026-09-14 on chatgpt.com: with a
- * connection held open (the previous shape — connect once, keep it for the whole
- * wait), the human's sign-in on auth.openai.com turned into "Oops, an error occurred!"
- * and Cloudflare looped; the same sign-in with nothing connected reached the password
- * page normally. So each read is connect → cookies → close, gated by
- * attachCookieReadDecision.
- */
-async function pollAttachedLogin(port: number, loginUrl: string, w: AttachWait): Promise<void> {
-  const reg = siteDomain(loginUrl);
-  const onSite = (host: string) => {
-    const h = host.replace(/^\./, '').toLowerCase();
-    return h === reg || h.endsWith('.' + reg);
-  };
-  const nameKey = (c: { domain?: string; name?: string }) =>
-    `${(c.domain ?? '').replace(/^\./, '').toLowerCase()}|${c.name ?? ''}`;
-  const valKey = (c: { domain?: string; name?: string; value?: string }) => `${nameKey(c)}|${c.value ?? ''}`;
-  const urlCheck = makeAttachLoginCheck(); // URL arm — latches the login page, fires once it is left
-  let baseNames: Set<string> | null = null;
-  let baseVals: Set<string> | null = null;
-  let lastReadKey = '';
-  let lastReadAt = 0;
-  let lastDone = false; // the verdict of the most recent read, carried across skipped polls
-  const start = Date.now();
-  const deadline = deadlineOf(w.wait);
-  const endpoint = makeEndpointWatch();
-  let stableSince = 0;
-  while (Date.now() < deadline) {
-    let pages: Array<{ type?: string; url?: string; title?: string }> = [];
-    try {
-      pages = (await devtoolsJson(port, '/json/list')) as typeof pages;
-      endpoint.alive();
-    } catch (err) {
-      // Same split as pollAttached: a hiccup keeps waiting, a GONE endpoint cancels.
-      // Without this the "CDP hiccup" catch below would keep an unbounded wait alive
-      // forever after the human closed Chrome.
-      if (endpoint.failed(err, w.chromeExited())) throw new LoginCancelledError(CANCELLED_ATTACH);
-    }
-    if (endpoint.targets(pages.filter((p) => p.type === 'page').length))
-      throw new LoginCancelledError(CANCELLED_ATTACH);
-    // The login-host page, if its document has rendered. The URL arm observes it
-    // every poll (latching the login page, firing when the human leaves it) — that is
-    // HTTP only and touches no page. The cookie arms need CDP, so they run only when
-    // attachCookieReadDecision says a brief connection is safe.
-    const sitePage = pages.find(
-      (p) => p.type === 'page' && typeof p.url === 'string' && onSite(safeHostname(p.url)) && (p.title ?? '').trim() !== '',
-    );
-    const urlLeft = sitePage ? urlCheck({ url: sitePage.url ?? '', title: sitePage.title ?? '' }) : false;
-    const readKey = sitePage ? `${sitePage.url}|${sitePage.title}` : '';
-    const decision = attachCookieReadDecision(pages, onSite, readKey, lastReadKey, Date.now() - lastReadAt);
-    if (decision === 'read') {
-      lastReadKey = readKey;
-      lastReadAt = Date.now();
-      lastDone = false;
-      let cdp: Browser | undefined;
-      try {
-        cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-        const ctx = cdp.contexts()[0];
-        const cookies = (ctx ? await ctx.cookies() : []).filter((c) => onSite(c.domain ?? ''));
-        const names = new Set(cookies.map(nameKey));
-        // value-keyed, infra excluded — catches a session cookie ROTATED in place
-        // (same name, new value on login) that a name-only delta would miss.
-        const vals = new Set(cookies.filter((c) => !isInfraCookieName(c.name ?? '')).map(valKey));
-        if (baseNames === null) {
-          baseNames = names;
-          baseVals = vals; // first clean read = the pre-login cookie floor
-        } else {
-          lastDone = attachLoginDone(baseNames, names, baseVals!, vals, urlLeft, Date.now() - start > 15_000);
-        }
-      } catch {
-        /* CDP hiccup — keep waiting */
-      } finally {
-        await cdp?.close().catch(() => {}); // never held past the read
-      }
-    } else if (decision === 'blocked') {
-      lastDone = false;
-    }
-    const done = decision !== 'blocked' && lastDone;
-    if (done) {
-      if (!stableSince) stableSince = Date.now();
-      else if (Date.now() - stableSince >= 2000) return; // held 2s → real
-    } else {
-      stableSince = 0;
-    }
-    await sleep(1000);
-  }
-  throw new Error(
-    'attach: login was not completed before the timeout — solve any challenge and finish logging in ' +
-      'in the Chrome window that opened, then it captures automatically',
-  );
-}
-
-/**
- * attach-mode completion verdict for one cookie read.
- *
- *  • A STRONG auth-named cookie (isAuthCookieName) proves login on its own — the
- *    same-origin SPA case, where the URL never moves.
- *  • Anything weaker — the post-settle opaque-cookie fallback, or a jar change —
- *    counts ONLY once the URL has left the login page. MEASURED 2026-09-14 on
- *    chatgpt.com: with the fallback un-gated, `oai-asli` / `precise_location_permission`
- *    appeared on the still-logged-out login page past the 15s settle window and the
- *    capture saved a logged-out session reported ok:true, while the human was still
- *    on auth.openai.com. Requiring the URL arm keeps a multi-step login's email screen
- *    and a pre-login analytics drop from completing early.
- */
-export function attachLoginDone(
-  baseNames: Set<string>,
-  names: Set<string>,
-  baseVals: Set<string>,
-  vals: Set<string>,
-  urlLeft: boolean,
-  settled: boolean,
-): boolean {
-  if (gainedAuthCookie(baseNames, names, false) !== null) return true; // strong names only
-  if (!urlLeft) return false;
-  const jarChanged = [...vals].some((k) => !baseVals.has(k)); // added or rotated
-  return jarChanged || gainedAuthCookie(baseNames, names, settled) !== null;
-}
-
-/** How often attach re-reads cookies while the login-site page is unchanged. */
-const ATTACH_READ_EVERY_MS = 5000;
-
-/**
- * May attach mode briefly connect over CDP to read cookies on this poll?
- *
- *   'blocked' — no rendered login-site page, OR any http(s) tab is on a bot wall, OR
- *               any tab is off the login site (an identity provider mid-sign-in, e.g.
- *               auth.openai.com). A connection then is what breaks the sign-in.
- *   'read'    — safe, and the login-site page changed or the last read is stale.
- *   'reuse'   — safe, but nothing changed since the last read: keep its verdict.
- *
- * Pure, so the gate is testable without a browser.
- */
-export function attachCookieReadDecision(
-  pages: Array<{ type?: string; url?: string; title?: string }>,
-  onSite: (host: string) => boolean,
-  key: string,
-  lastKey: string,
-  sinceLastReadMs: number,
-): 'read' | 'reuse' | 'blocked' {
-  if (!key) return 'blocked';
-  const tabs = pages.filter((p) => p.type === 'page' && typeof p.url === 'string' && /^https?:/i.test(p.url));
-  if (tabs.some((p) => wallUp(p.url ?? '', p.title ?? '') || !onSite(safeHostname(p.url ?? '')))) return 'blocked';
-  return key !== lastKey || sinceLastReadMs >= ATTACH_READ_EVERY_MS ? 'read' : 'reuse';
 }
 
 /** Wait for the human to clear the wall only — no login expected, same url throughout. */
@@ -1411,6 +1299,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   const chromePath = resolveChromePath();
   let child: ReturnType<typeof spawn> | undefined;
   let cdp: Browser | undefined;
+  let button: DoneButton | undefined;
   try {
     if (prof.guardDir && profileInUse(prof.guardDir))
       throw new Error(
@@ -1422,7 +1311,16 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     if (prof.copyFrom) copyProfileEssentials(prof.copyFrom, prof.dir);
 
     const port = await freePort(); // never 0 — see freePort()
-    const args = attachChromeArgs(prof.dir, port, opts.loginUrl);
+    // A login opens with the "I'm signed in" tab beside the site (login-done.ts); a
+    // challenge does not, since a cleared wall is something this server can see.
+    if (!opts.challenge) {
+      button = await startDoneButton(opts.name, async () =>
+        ((await devtoolsJson(port, '/json/list')) as Array<{ type?: string; url?: string }>)
+          .filter((p) => p.type === 'page')
+          .map((p) => p.url ?? ''),
+      );
+    }
+    const args = attachChromeArgs(prof.dir, port, opts.loginUrl, ...(button ? [button.url] : []));
     child = spawn(chromePath, args, { stdio: 'ignore', detached: true }); // own process group → clean tree-kill
     child.on('error', (e) => log(`attach: chrome spawn error: ${e.message}`));
     // The end signal for the unbounded wait, HINT half: the Chrome we spawned is
@@ -1437,7 +1335,8 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     log(
       opts.challenge
         ? `attach challenge for "${opts.name}" — a real Chrome window opened; solve the CAPTCHA there and stay on the page`
-        : `attach login for "${opts.name}" — a real Chrome window opened; solve the challenge and log in there`,
+        : `attach login for "${opts.name}" — a real Chrome window opened; log in there, then press ` +
+            `"I'm signed in, save it" on its second tab`,
     );
 
     await waitForDevtools(port, 20_000); // startup, not a human wait — still bounded
@@ -1450,7 +1349,19 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     };
     if (w.wait.deadline === 'none') log('attach: no time limit — closing the Chrome window cancels the capture');
     if (opts.challenge) await pollAttachedChallenge(port, opts.loginUrl, w);
-    else await pollAttachedLogin(port, opts.loginUrl, w);
+    else {
+      // The press itself ends the wait, so a human who presses and closes the window
+      // at once still saves; the window watch only ever ends it as a cancel.
+      const watching = pollAttached(
+        port,
+        () => button!.isPressed(),
+        w,
+        `attach: login not saved — "I'm signed in, save it" was not pressed before the timeout. Nothing was saved.`,
+        CANCELLED_ATTACH,
+      );
+      watching.catch(() => {}); // outlived by a press: its later cancel is nobody's error
+      await Promise.race([button!.pressed, watching]);
+    }
 
     // Challenge cleared + logged in. Attach passively and read the session out.
     cdp = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
@@ -1496,6 +1407,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     // belong to. Attach has no before/after delta, so this is the site's whole jar.
     const saved = siteCookies(state, siteDomain(opts.loginUrl));
     const hosts = [...new Set(saved.map((c) => (c.domain ?? '').replace(/^\./, '')))].filter(Boolean);
+    button?.finish(true);
     return {
       name: opts.name,
       path: out,
@@ -1522,6 +1434,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       killGroup(child.pid); // kill the Chrome WE spawned (its own process group)
       unregisterAttachRecord(child.pid);
     }
+    button?.close();
     if (prof.cleanup) fs.rmSync(prof.dir, { recursive: true, force: true }); // NEVER delete a real profile
   }
 }
@@ -2081,9 +1994,11 @@ const loginDefinition: Tool = {
     'For ANY login, use headed:true. A SEPARATE automation window opens and the human completes ' +
     'every step (password, 2FA, SSO, CAPTCHA) at their own pace. Do NOT probe the login form with ' +
     'browser_* tools to work out what kind of login it is. Just call session_login({headed:true}) ' +
-    'and let the person handle it. On the stdio surface there is no time limit; the wait ends when ' +
-    'the human finishes or closes the window. successSignal is OPTIONAL (headed logins auto-detect ' +
-    'completion, including single-page apps like iCloud, via the auth cookie). ' +
+    'and let the person handle it. The window opens with a second tab holding an "I\'m signed in, ' +
+    'save it" button: the human logs in however the site needs (other sites, email links, 2FA) and ' +
+    'presses it, and the session is saved then. Nothing guesses when a login is done. On the stdio ' +
+    'surface there is no time limit; closing the window cancels. successSignal applies only to the ' +
+    'unattended credKeys login. ' +
     "Credentials are looked up by credKeys name in the project's ./.env (or envFile), then the " +
     'user-scoped secrets.env, then process.env. Tokens are never echoed back. ' +
     'For a site fronted by Cloudflare/Turnstile or a similar human check, including one embedded in ' +
@@ -2103,10 +2018,10 @@ const loginDefinition: Tool = {
       successSignal: {
         type: 'string',
         description:
-          'OPTIONAL confirmation marker: a CSS/XPath selector, the visible text of a post-login ' +
-          'element (e.g. "Sign out"), or a substring of the post-login URL. Omit in headed mode to ' +
-          'auto-detect login by leaving the login page. Whatever form you give, all three ' +
-          'interpretations are tried.',
+          'OPTIONAL, unattended credKeys login only: a CSS/XPath selector, the visible text of a ' +
+          'post-login element (e.g. "Sign out"), or a substring of the post-login URL. Whatever form ' +
+          'you give, all three interpretations are tried. Ignored when headed or attach: there the ' +
+          'human presses "I\'m signed in, save it".',
       },
       headed: {
         type: 'boolean',
@@ -2119,8 +2034,9 @@ const loginDefinition: Tool = {
         description:
           'Capture by attaching to a plain, human-solved real Chrome (connectOverCDP) instead of a ' +
           'Playwright-driven browser. Use for Cloudflare/Turnstile-gated sites whose challenge loops ' +
-          'under automation. A real Chrome window opens; the human clears the challenge and logs in, ' +
-          'then the authenticated session is read out passively. Ignores successSignal/credKeys.',
+          'under automation. A real Chrome window opens; the human clears the challenge, logs in and ' +
+          'presses "I\'m signed in, save it" on its second tab, then the session is read out ' +
+          'passively. Ignores successSignal/credKeys.',
       },
       profile: {
         type: 'string',

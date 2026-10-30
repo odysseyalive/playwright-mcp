@@ -88,7 +88,8 @@ function buildInstructions(
         'login form or work out whether it needs a password, 2FA, SSO, or a CAPTCHA. The human ' +
         'does every step, at their own pace, ' +
         (noTimeLimit
-          ? 'with no time limit. The wait ends when they finish or close the window. '
+          ? 'with no time limit, and presses "I\'m signed in, save it" on the window\'s second tab ' +
+            'when done; closing the window cancels. '
           : 'up to this surface\'s bounded 300000ms default (pass timeoutMs to change it). ') +
         'Credentials never pass through ' +
         'the model. Point loginUrl at the app page you want; redirects to the identity provider ' +

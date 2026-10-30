@@ -46,7 +46,15 @@ test('wall- names are reserved: a login saved as one would be replayed unasked',
 
 test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TEST_BROWSER=1' }, async (t) => {
   const server = http.createServer((req, res) => {
+    if (req.url === '/private') {
+      res.writeHead(302, { location: '/uas/login?session_redirect=%2Fprivate' }).end();
+      return;
+    }
     res.setHeader('content-type', 'text/html');
+    if (req.url?.startsWith('/uas/login')) {
+      res.end('<html><head><title>Sign in</title></head><body><form><input type="password"></form><div class="g-recaptcha"></div></body></html>');
+      return;
+    }
     res.end(/(^|;\s*)cleared=1/.test(req.headers.cookie ?? '') ? PAGE : WALL);
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -85,6 +93,15 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     assert.equal(r.fetchStatus, 'ok');
     assert.match(r.text, /PICTURE THIS PRODUCTION/);
     assert.match(r.note, /saved bot-wall clearance/);
+  });
+
+  await t.test('a redirect to a sign-in page is a login wall, never a bot wall', async () => {
+    // LinkedIn, 2026-10-30: a lapsed session landed on /uas/login and was reported as
+    // "a bot check or CAPTCHA". It is a login, and no wall window may open for it.
+    const r = await fetchUrl({ url: `${base}/private` }, { trust: 'stdio' });
+    assert.equal(r.fetchStatus, 'login-wall');
+    assert.match(r.error, /sign-in page/);
+    assert.doesNotMatch(r.error, /CAPTCHA/);
   });
 
   await t.test('no ctx is an unknown surface: no reuse', async () => {

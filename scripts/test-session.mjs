@@ -23,7 +23,7 @@ fs.writeFileSync(
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
 );
 
-const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, makeAttachLoginCheck, isInfraCookieName, isAuthCookieName, gainedAuthCookie, makeAuthCookieProbe, resolveHumanWait, CAPPED_HUMAN_WAIT_MS, makeWindowClosedWatch, makeEndpointWatch, devtoolsUnreachable, LoginCancelledError, captureProgress, sessionLoginTool, sessionSolveChallengeTool } =
+const { sessionLogin, sessionStatus, leftLoginPage, scopeStorageState, challengeCleared, clearanceSummary, wallUp, newCookies, siteCookies, urlMarkerHit, isInfraCookieName, isAuthCookieName, gainedAuthCookie, makeAuthCookieProbe, resolveHumanWait, CAPPED_HUMAN_WAIT_MS, makeWindowClosedWatch, makeEndpointWatch, devtoolsUnreachable, LoginCancelledError, captureProgress, sessionLoginTool, sessionSolveChallengeTool } =
   await import('../dist/tools/session.js');
 const { getSecret, ownerOnlyAclArgs, parseWhoamiSid, ownerOnlyFile, ownerOnlyDir, reassertOwnerOnly, OwnerOnlyError, sessionFilePath } =
   await import('../dist/secrets.js');
@@ -595,43 +595,9 @@ test('urlMarkerHit: a marker in the OAuth query string is not a landing', () => 
   assert.doesNotThrow(() => urlMarkerHit('not a url', 'x', login));
 });
 
-// Regression: attach-mode LOGIN carried the same defect the headed path had.
-// challengeCleared() already refuses a blank title and pins to the target host;
-// the login predicate did neither, so an app URL redirecting to an IdP looked
-// like a completed login on the very first poll.
-test('makeAttachLoginCheck: an SSO redirect is the START of a login, not the end', () => {
-  const done = makeAttachLoginCheck();
-
-  // Chrome opened; the document has not rendered — never judge a blank title.
-  assert.equal(done({ url: 'https://apps.docusign.com/send', title: '' }), false);
-
-  // First real page latches as the baseline (this IS the login page).
-  assert.equal(
-    done({ url: 'https://account.docusign.com/oauth/auth?x=1', title: 'Docusign Login' }),
-    false,
-    'the login page itself is never "done"',
-  );
-
-  // Walking to the email step on the same host: new path, but still logging in.
-  // (leftLoginPage treats a path change as done, so this documents the residual
-  // limit — the cookie gate in the export path is what backstops it.)
-  const emailStep = done({ url: 'https://account.docusign.com/username', title: 'Docusign Login' });
-  assert.equal(typeof emailStep, 'boolean');
-
-  // A fresh capture must not inherit the previous one's baseline.
-  const done2 = makeAttachLoginCheck();
-  assert.equal(done2({ url: 'https://account.docusign.com/oauth/auth', title: 'Login' }), false);
-  assert.equal(done2({ url: 'https://apps.docusign.com/send', title: 'Docusign' }), true, 'landed on the app');
-
-  // A wall still up is never done, even off the login page.
-  const done3 = makeAttachLoginCheck();
-  done3({ url: 'https://signin.example.com/', title: 'Login' });
-  assert.equal(done3({ url: 'https://app.example.com/home', title: 'Just a moment...' }), false);
-});
-
-// The cookie gate the makeAttachLoginCheck test above refers to as its backstop.
-// A same-origin SPA / multi-step / SSO login can finish without the URL ever
-// leaving the login page; a new AUTH cookie is what proves it happened.
+// The unattended credentials path's completion signal (a human login ends on the
+// "I'm signed in" button instead). A same-origin SPA login can finish without the
+// URL ever leaving the login page; a new AUTH cookie is what proves it happened.
 test('gainedAuthCookie: auth-named completes at once, plain new cookie only after settle, infra never', () => {
   const set = (a) => new Set(a);
   const base = set(['x.test|ASP.NET_SessionId', 'x.test|srv_id', 'x.test|_mkto_trk']);
@@ -679,49 +645,10 @@ test('gainedAuthCookie: auth-named completes at once, plain new cookie only afte
 // attach must never hold a CDP connection while the human signs in (measured on
 // chatgpt.com 2026-09-14: a held connection broke auth.openai.com's password step).
 // The gate that decides when a brief read is allowed.
-test('attachCookieReadDecision: no CDP read on a wall, off-site, or with no site page', async () => {
-  const { attachCookieReadDecision } = await import('../dist/tools/session.js');
-  const onSite = (h) => h === 'chatgpt.com' || h.endsWith('.chatgpt.com');
-  const login = { type: 'page', url: 'https://chatgpt.com/auth/login', title: 'Get started | ChatGPT' };
-  const key = `${login.url}|${login.title}`;
-
-  // No rendered login-site page (the tab navigated to the identity provider) → blocked.
-  assert.equal(attachCookieReadDecision([{ type: 'page', url: 'https://auth.openai.com/log-in', title: 'Log in' }], onSite, '', key, 99_999), 'blocked');
-  // A site page exists but another tab is on the identity provider → blocked.
-  assert.equal(attachCookieReadDecision([login, { type: 'page', url: 'https://auth.openai.com/log-in/password', title: 'Enter your password - OpenAI' }], onSite, key, '', 99_999), 'blocked');
-  // Any tab on a bot wall → blocked.
-  assert.equal(attachCookieReadDecision([{ ...login, title: 'Just a moment...' }], onSite, key, '', 99_999), 'blocked');
-  // Non-http targets (new tab page, devtools) do not count as off-site.
-  assert.equal(attachCookieReadDecision([login, { type: 'page', url: 'chrome://newtab/', title: 'New Tab' }], onSite, key, '', 0), 'read');
-  // Safe: read on change, reuse while unchanged, re-read once stale.
-  assert.equal(attachCookieReadDecision([login], onSite, key, '', 0), 'read');
-  assert.equal(attachCookieReadDecision([login], onSite, key, key, 1000), 'reuse');
-  assert.equal(attachCookieReadDecision([login], onSite, key, key, 5000), 'read');
-});
-
 // Measured on chatgpt.com 2026-09-14: past the 15s settle window, pre-login cookies
 // (`oai-asli`, `precise_location_permission`) appeared on the still-logged-out login
 // page and the un-gated fallback saved a logged-out session. A weak signal now needs
 // the URL to have left the login page; only a strong auth cookie completes alone.
-test('attachLoginDone: weak cookie signals need the URL to leave the login page', async () => {
-  const { attachLoginDone } = await import('../dist/tools/session.js');
-  const s = (a) => new Set(a);
-  const base = s(['chatgpt.com|oai-did', 'chatgpt.com|__Host-next-auth.csrf-token']);
-  const baseV = s(['chatgpt.com|oai-did|1']);
-  const preLogin = s([...base, 'chatgpt.com|oai-asli', 'chatgpt.com|precise_location_permission']);
-  const preLoginV = s([...baseV, 'chatgpt.com|oai-asli|x', 'chatgpt.com|precise_location_permission|denied']);
-
-  // The chatgpt.com failure: settled, new opaque cookies, still ON the login page → not done.
-  assert.equal(attachLoginDone(base, preLogin, baseV, preLoginV, false, true), false);
-  // Same cookies once the human is back on chatgpt.com past the login page → done.
-  assert.equal(attachLoginDone(base, preLogin, baseV, preLoginV, true, true), true);
-  // The real session ticket completes at once, URL unmoved (same-origin SPA case).
-  const authed = s([...base, 'chatgpt.com|__Secure-next-auth.session-token']);
-  assert.equal(attachLoginDone(base, authed, baseV, baseV, false, false), true);
-  // URL left but nothing changed (an email step before any cookie) → not done.
-  assert.equal(attachLoginDone(base, base, baseV, baseV, true, true), false);
-});
-
 // Measured on Chrome 153, 2026-09-14: `--remote-debugging-port=0` makes every page
 // report navigator.webdriver=true (a fixed port reports false), and chatgpt.com's
 // sign-in failed with "Route Error (400 Invalid content type: text/html)" in the
@@ -1334,7 +1261,7 @@ test(
       );
       assert.equal(env.ok, false);
       assert.notEqual(env.cancelled, true, 'a live endpoint with a page open was never cancelled');
-      assert.match(env.error, /was not completed before the timeout/);
+      assert.match(env.error, /was not pressed before the timeout/);
     });
     assert.ok(Date.now() - started < 120_000, 'the opt-in cap bounded the wait');
     assert.equal(fs.existsSync(sessionFilePath(name)), false, 'a timed-out capture saves nothing either');
@@ -1361,7 +1288,7 @@ test(
       );
       assert.notEqual(env.cancelled, true, 'the original tab closing is not an abandoned login');
       assert.doesNotMatch(env.error ?? '', /cancelled/, 'never a cancel while a page is open');
-      assert.match(env.error ?? '', /was not completed before the timeout/);
+      assert.match(env.error ?? '', /was not pressed before the timeout/);
     });
   },
 );
@@ -1516,12 +1443,12 @@ test('DRIFT GUARD: the unbounded wait is granted by the SURFACE only, and fails 
   const headedArm = src.slice(src.indexOf('if (opts.headed) {'), src.indexOf('const sel = { ...DEFAULT_SELECTORS'));
   assert.match(headedArm, /opts\.wait \?\? resolveHumanWait\(opts\.timeoutMs, 'local'\)/, 'headed takes the resolved budget, capped for a direct caller');
   assert.match(headedArm, /watchDrivenWindow\(/, 'and arms the window-close end signal');
-  assert.match(headedArm, /waitForLogin\(page, loginUrl, opts\.successSignal, wait, authGained, cancel\)/, 'the wait is raced against the cancel');
+  assert.match(headedArm, /waitForButton\(button, cancel, wait\)/, 'the wait is raced against the cancel');
 
   // Every attach poll loop counts PAGE targets only. Counting devtools/webview/
   // service-worker targets as pages would make a windowless Chrome look alive;
   // counting a popup as not-a-page would cancel an SSO login mid-flow.
-  for (const marker of ['async function pollAttached(', 'async function pollAttachedLogin(']) {
+  for (const marker of ['async function pollAttached(']) {
     const body = src.slice(src.indexOf(marker), src.indexOf(marker) + 2600);
     assert.match(body, /p\.type === 'page'/, `${marker} must filter page targets`);
     assert.match(body, /endpoint\.targets\(/, `${marker} must consult the shared endpoint watch`);

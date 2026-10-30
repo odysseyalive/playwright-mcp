@@ -31,9 +31,8 @@ if (!Number.isInteger(port) || port <= 0) {
 
 const mode = process.env.PWMCP_FAKE_CHROME_MODE ?? 'alive';
 
-// Deliberately OFF-SITE relative to the tests' loginUrl (app.fake.test): with no
-// rendered login-site page attachCookieReadDecision returns 'blocked', so the
-// poll loop never tries a CDP connection this fixture could not honour. The page
+// The attach wait never connects over CDP before the "I'm signed in" button is
+// pressed, and these tests never press it, so this fixture needs no CDP. The page
 // COUNT is what the cancel logic reads, and it stays >= 1 in alive/popup.
 const ORIGINAL = { type: 'page', url: 'https://idp.fake.test/login', title: 'IdP Login' };
 const POPUP = { type: 'page', url: 'https://idp.fake.test/consent?popup=1', title: 'Approve sign-in' };
