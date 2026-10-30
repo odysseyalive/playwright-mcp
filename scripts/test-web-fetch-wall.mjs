@@ -34,10 +34,13 @@ test('wallSessionName: one clearance per host', () => {
 
 test('wall- names are reserved: a login saved as one would be replayed unasked', async () => {
   const { sessionLoginTool, sessionSolveChallengeTool } = await import('../dist/tools/session.js');
+  // Any case: macOS and Windows filesystems fold it, so "WALL-x" is the same file.
   for (const tool of [sessionLoginTool, sessionSolveChallengeTool]) {
-    const r = await tool.handler({ name: 'wall-example.test', url: 'https://example.test', loginUrl: 'https://example.test' });
-    assert.equal(r.isError, true, tool.definition.name);
-    assert.match(r.content[0].text, /reserved/);
+    for (const name of ['wall-example.test', 'WALL-example.test']) {
+      const r = await tool.handler({ name, url: 'https://example.test', loginUrl: 'https://example.test' });
+      assert.equal(r.isError, true, `${tool.definition.name} ${name}`);
+      assert.match(r.content[0].text, /reserved/);
+    }
   }
 });
 

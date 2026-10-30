@@ -2170,7 +2170,8 @@ const loginDefinition: Tool = {
 export const WALL_SESSION_PREFIX = 'wall-';
 
 function reservedName(name: string): CallToolResult | undefined {
-  if (!name.startsWith(WALL_SESSION_PREFIX)) return undefined;
+  // Case-folded: on macOS and Windows "Wall-x" and "wall-x" are the same file.
+  if (!name.toLowerCase().startsWith(WALL_SESSION_PREFIX)) return undefined;
   return {
     content: [
       {
