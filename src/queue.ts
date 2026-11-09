@@ -123,16 +123,22 @@ const ENDED_MEMORY = 64;
 const UNKNOWN_TOKEN =
   'browser queue: unknown lease token — it was never issued by this server (a server restart forgets every lease).';
 
-/** Longest holder name kept. It is echoed to other callers, so it stays short and printable. */
-const HOLDER_MAX = 64;
+/** Longest holder name kept. It is echoed to other callers, so it stays a short slug. */
+const HOLDER_MAX = 32;
 
 export const secs = (ms: number) => `${Math.round(ms / 1000)}s`;
 
-/** A short, printable holder name, or a default built from the token. */
-function cleanHolder(raw: string | undefined, token: string): string {
-  // Printable ASCII minus markup and quote characters: it lands in other callers'
-  // results unmarked, so it must not be able to open a tag or close a quote there.
-  const cleaned = (raw ?? '').replace(/[^\x20-\x7e]|[<>"`\\]/g, '').trim().slice(0, HOLDER_MAX);
+/** A short slug for the holder, or a default built from the token. */
+export function cleanHolder(raw: string | undefined, token: string): string {
+  // A slug, not prose: it lands in other callers' results unmarked, so it must not
+  // be able to carry a sentence, an instruction, a tag or a closing quote there.
+  // Anything outside [A-Za-z0-9._-] becomes a hyphen, so "LinkedIn scout" reads
+  // as "LinkedIn-scout" rather than vanishing.
+  const cleaned = (raw ?? '')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, HOLDER_MAX)
+    .replace(/[-.]+$/, '');
   return cleaned || `lease …${token.slice(-4)}`;
 }
 

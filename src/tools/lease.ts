@@ -42,8 +42,9 @@ const acquireDefinition: Tool = {
       holder: {
         type: 'string',
         description:
-          'Optional short name for who is holding the browser (e.g. "linkedin-scout"). Other callers ' +
-          'see it while they wait, and in the error if they give up.',
+          'Optional short name for who is holding the browser (e.g. "linkedin-scout"). Kept as a slug ' +
+          'of letters, digits, ".", "_" and "-", at most 32 characters; anything else becomes "-". ' +
+          'Other callers see it while they wait, and in the error if they give up.',
       },
     },
   },
