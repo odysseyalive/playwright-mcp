@@ -68,12 +68,43 @@ const WALL_VENDORS: [RegExp, string][] = [
  * wall says what it is there).
  */
 function visibleText(html: string): string {
-  return html
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/\s+/g, ' ');
+  // One forward pass with indexOf, never a lazy regex: `<script[\s\S]*?</script>`
+  // rescans to the end for every unclosed opener, so a hostile page of bare
+  // `<script` tags made this quadratic. An opener with no closer ends the scan,
+  // because everything after it is markup, not prose.
+  const lower = html.toLowerCase();
+  const parts: string[] = [];
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    if (lt < 0) {
+      parts.push(html.slice(i));
+      break;
+    }
+    parts.push(html.slice(i, lt), ' ');
+    let end: number;
+    if (lower.startsWith('<!--', lt)) {
+      end = lower.indexOf('-->', lt + 4);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+    const raw = RAW_TEXT_ELEMENTS.find(
+      (name) => lower.startsWith(`<${name}`, lt) && !/[a-z0-9_-]/.test(lower.charAt(lt + name.length + 1)),
+    );
+    if (raw) {
+      const close = lower.indexOf(`</${raw}`, lt + raw.length + 1);
+      if (close < 0) break;
+      end = lower.indexOf('>', close);
+    } else {
+      end = lower.indexOf('>', lt + 1);
+    }
+    if (end < 0) break;
+    i = end + 1;
+  }
+  return parts.join('').replace(/\s+/g, ' ');
 }
+const RAW_TEXT_ELEMENTS = ['script', 'style', 'template'];
 
 /** Name the bot wall's vendor from its markup, or undefined when unknown. */
 export function wallVendor(html: string): string | undefined {

@@ -123,6 +123,20 @@ test('fetchStatus: a short shop page with "captcha" only in scripts and JSON is 
   assert.equal(classifyHealth(h, 200, text), 'ok');
 });
 
+test('fetchStatus: unclosed tags cannot make the wall check quadratic', () => {
+  // A lazy `<script[\s\S]*?</script>` rescanned to the end for every unclosed
+  // opener; 2 MB of bare `<script` and `<` took minutes. A linear pass is instant.
+  for (const unit of ['<script ', '<style>', '<!--x', '<a ']) {
+    const h = `<title>t</title><p>short</p>${unit.repeat(2_000_000 / unit.length)}`;
+    const t0 = Date.now();
+    classifyHealth(h, 200, 'short');
+    assert.ok(Date.now() - t0 < 2000, `${JSON.stringify(unit)} took ${Date.now() - t0} ms`);
+  }
+  // Text after a closed script still counts, and an unclosed script hides the rest.
+  assert.equal(classifyHealth('<script>x</script><p>Are you a robot?</p>', 200, ''), 'blocked');
+  assert.equal(classifyHealth('<p>hi</p><script>var s="are you a robot"', 200, ''), 'ok');
+});
+
 test('fetchStatus: Cloudflare "Just a moment" challenge is blocked and named', () => {
   const h =
     '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>' +
