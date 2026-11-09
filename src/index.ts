@@ -31,8 +31,10 @@ import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
 import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser } from './upstream.js';
+import { browserQueue, leaseArg, LEASE_PROPERTY } from './queue.js';
+import { queueTurn } from './tools/session.js';
 
-const VERSION = '0.3.2';
+const VERSION = '0.4.0';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -80,6 +82,13 @@ function buildInstructions(
     'Browse/debug workflow: browser_navigate → browser_snapshot (accessibility tree; prefer over screenshots) → interact by ref (browser_click, browser_type, …) → verify.',
     'Debugging: browser_console_messages, browser_network_requests. Screenshots: browser_take_screenshot.',
   );
+  if (names.has('browser_lease_acquire')) {
+    lines.push(
+      'SHARED BROWSER, QUEUED: every browser_* call and session rebind waits its turn, one at a time. For a ' +
+        'multi-step turn no other agent may interleave, browser_lease_acquire → pass `lease` on each call → ' +
+        'browser_lease_release. web_fetch is NOT queued (its own browser; each fetch gets its own page).',
+    );
+  }
   if (names.has('session_login')) {
     lines.push(
       '',
@@ -345,6 +354,14 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
   suite_methodology:
     'methodologyHandler (src/tools/suite.ts) returns this server’s shipped playbook files, selected ' +
     'by the fixed TOPIC_FILES map under SUITE_TEMPLATE_DIR — no caller-supplied path, no page.',
+  browser_lease_acquire:
+    'acquireHandler (src/tools/lease.ts) returns the LeaseGrant BrowserQueue.grant builds (src/queue.ts): ' +
+    'a random token, two limits, a fixed note, and the `holder` label. The label is model-written text ' +
+    'echoed to other callers, never page content; cleanHolder keeps it to 64 printable characters. ' +
+    'Errors are the queue’s own sentences built from labels this server chose and that same holder.',
+  browser_lease_release:
+    'releaseHandler (src/tools/lease.ts) returns BrowserQueue.release’s fixed notes (src/queue.ts) ' +
+    'about the caller’s own token. No browser is touched.',
 };
 
 /**
@@ -436,6 +453,11 @@ function outboundUrlArg(args: Record<string, unknown> | undefined): string | und
   return /^https?:\/\//i.test(raw) ? raw : undefined;
 }
 
+/** Appended to every upstream tool's description: the queue is not upstream's, so its text cannot say so. */
+const QUEUED_NOTE =
+  '(playwright-mcp: queued — waits its turn on the shared browser, one call at a time; pass `lease` from ' +
+  'browser_lease_acquire to keep a multi-step turn.)';
+
 /** Just the notification shape this server sends — narrower than the SDK union on purpose. */
 type ProgressSend = (notification: {
   method: 'notifications/progress';
@@ -487,16 +509,19 @@ export function callContext(
   signal: AbortSignal,
   send: ProgressSend,
 ): ToolContext {
-  if (token === undefined) return { trust };
+  if (token === undefined) return { trust, signal };
   let live = true;
-  // extra.signal is read for HEARTBEAT HYGIENE ONLY. The capture deliberately keeps
-  // going when the client abandons the call — that is what makes a long human login
-  // recoverable through session_status instead of lost. All this stops is speaking
-  // to a token nobody is listening for, once per heartbeat interval, for hours.
+  // Here extra.signal is read for HEARTBEAT HYGIENE ONLY. The capture deliberately
+  // keeps going when the client abandons the call — that is what makes a long human
+  // login recoverable through session_status instead of lost. All this stops is
+  // speaking to a token nobody is listening for, once per heartbeat interval, for
+  // hours. (`signal` is also handed on as ctx.signal so a call still WAITING in the
+  // browser queue leaves it — src/queue.ts; nothing running is interrupted.)
   signal.addEventListener('abort', () => (live = false), { once: true });
   let sent = 0;
   return {
     trust,
+    signal,
     progress: (message: string) => {
       if (!live) return;
       sent += 1;
@@ -549,7 +574,19 @@ export function createOutwardServer(
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const { tools } = await upstreamOf().listTools();
-    return { tools: [...tools.filter((t) => allow(t.name)), ...visibleCustom] };
+    // Not queued, deliberately: tools/list is read-only, it is what a client asks at
+    // connect time, and a client must never have to wait out a lease just to learn
+    // the tool names. A rebind swaps `current` to the new client BEFORE closing the
+    // old one, so upstreamOf() always resolves a live connection here.
+    // Every upstream tool takes the optional `lease` (src/queue.ts); it is stripped
+    // again before the call is forwarded. Copied, never edited in place: the list
+    // belongs to the upstream client.
+    const leased = tools.filter((t) => allow(t.name)).map((t) => ({
+      ...t,
+      description: `${t.description ?? ''} ${QUEUED_NOTE}`.trim(),
+      inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, lease: LEASE_PROPERTY } },
+    }));
+    return { tools: [...leased, ...visibleCustom] };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -562,6 +599,7 @@ export function createOutwardServer(
         isError: true,
       };
     }
+    const ctx = callContext(trust, request.params._meta?.progressToken, extra.signal, extra.sendNotification);
     try {
       // Custom tools skip the SESSION BANNER: web_fetch takes an explicit
       // `session` argument and runs the outbound guard itself, and the session_*
@@ -574,11 +612,7 @@ export function createOutwardServer(
       // catch below, which is server prose and is not marked.
       if (isCustomTool(name))
         return withUntrustedNotice(
-          await callCustomTool(
-            name,
-            args ?? {},
-            callContext(trust, request.params._meta?.progressToken, extra.signal, extra.sendNotification),
-          ),
+          await callCustomTool(name, args ?? {}, ctx),
           name,
         );
 
@@ -595,9 +629,16 @@ export function createOutwardServer(
         }
       }
 
-      const result = await upstreamOf().callTool({ name, arguments: args ?? {} });
-      // Upstream's browser_close drops its hold on the browser but not the browser.
-      if (name === 'browser_close') await releaseBrowser();
+      // One caller at a time on the one upstream connection (src/queue.ts). The
+      // client is resolved INSIDE the turn: a rebind may have swapped it while this
+      // call waited. `lease` is ours, so upstream never sees it.
+      const { lease: _lease, ...forward } = args ?? {};
+      const result = await browserQueue.run(async () => {
+        const out = await upstreamOf().callTool({ name, arguments: forward });
+        // Upstream's browser_close drops its hold on the browser but not the browser.
+        if (name === 'browser_close') await releaseBrowser();
+        return out;
+      }, queueTurn(ctx, name, leaseArg(args ?? {})));
       return withUntrustedNotice(withSessionBanner(result, boundSession(), remote), name);
     } catch (err) {
       return {

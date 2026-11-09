@@ -44,6 +44,7 @@ import {
 import { storageStateDomains, wrapUntrusted } from '../exfil.js';
 import { startDoneButton, type DoneButton } from '../login-done.js';
 import { bindSession } from '../upstream.js';
+import { browserQueue, leaseArg, LEASE_PROPERTY, type RunOptions } from '../queue.js';
 import {
   STEALTH_LAUNCH,
   STEALTH_INIT,
@@ -1850,6 +1851,25 @@ export function startHeartbeat(
   return () => clearInterval(timer);
 }
 
+/**
+ * How a call waits its turn in the browser queue (src/queue.ts): carrying the
+ * caller's lease if it has one, leaving the queue if its request is aborted, and
+ * heartbeating ONLY while it waits, with a line saying who holds the browser. The
+ * default heartbeatMessage would say "waiting for the human… No deadline", which
+ * is false twice over here.
+ *
+ * Lives beside startHeartbeat because every queued call site needs both: the
+ * browser_* proxy in src/index.ts, the rebinds below, and the lease tools.
+ */
+export function queueTurn(ctx: ToolContext | undefined, label: string, lease?: string): RunOptions {
+  return {
+    label,
+    lease,
+    signal: ctx?.signal,
+    onWait: () => startHeartbeat(ctx, label, (what, ms) => browserQueue.waitMessage(what, ms)),
+  };
+}
+
 // ── session_status ────────────────────────────────────────────────────────────
 
 export interface StatusOptions {
@@ -2113,6 +2133,7 @@ const loginDefinition: Tool = {
         description: 'Optional field selectors {user,pass,submit} if the defaults do not match.',
         properties: { user: { type: 'string' }, pass: { type: 'string' }, submit: { type: 'string' } },
       },
+      lease: LEASE_PROPERTY,
     },
     required: ['name', 'loginUrl'],
   },
@@ -2142,7 +2163,7 @@ function reservedName(name: string): CallToolResult | undefined {
 }
 
 async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
-  const refused = reservedName(String(args.name ?? ''));
+  const refused = refusal(args);
   if (refused) return refused;
   const opts: LoginOptions = {
     name: String(args.name ?? ''),
@@ -2160,7 +2181,7 @@ async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): P
   // wait; a missing ctx is an unknown surface, and an unknown surface is capped.
   const human = opts.headed === true || opts.attach === true;
   if (human) opts.wait = resolveHumanWait(opts.timeoutMs, ctx?.trust ?? 'local');
-  return bindAndReport(await runCapture(opts, ctx, human));
+  return bindAndReport(await runCapture(opts, ctx, human), ctx, args);
 }
 
 /**
@@ -2197,6 +2218,24 @@ async function runCapture(
 }
 
 /**
+ * Refuse a capture up front: a reserved name (reservedName), or a `lease` that is not one: a malformed, never-issued
+ * or already-ended token is the caller believing it holds a turn it does not, and
+ * that is worth saying BEFORE a human spends minutes in a login window. A lease
+ * that is live here may still lapse during the wait; bindAndReport handles that.
+ */
+function refusal(args: Record<string, unknown>): CallToolResult | undefined {
+  const reserved = reservedName(String(args.name ?? ''));
+  if (reserved) return reserved;
+  try {
+    const lease = leaseArg(args);
+    if (lease !== undefined) browserQueue.assertLive(lease);
+    return undefined;
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+  }
+}
+
+/**
  * Point the browser_* tools at a capture that just succeeded, then report it.
  *
  * Shared by session_login AND session_solve_challenge on purpose: both write the
@@ -2216,12 +2255,28 @@ async function runCapture(
  * fenced, which is worse than either alone. On the success path there is no
  * detail and the result is a single JSON document exactly as before.
  */
-async function bindAndReport(result: LoginResult): Promise<CallToolResult> {
+async function bindAndReport(
+  result: LoginResult,
+  ctx: ToolContext | undefined,
+  args: Record<string, unknown>,
+): Promise<CallToolResult> {
   let boundTo: string | undefined;
   let bindError: string | undefined;
+  // Read here, not before the capture: whether the lease is still live is a
+  // question about NOW. refusal() already turned away a malformed one.
+  const lease = leaseArg(args);
   if (result.ok) {
     try {
-      await bindSession(result.name);
+      // The bind queues like any rebind; the capture before it never did, so a
+      // human login of any length holds nobody up. Two things are deliberately
+      // dropped from the turn. The lease, if it lapsed during the human wait: the
+      // bind then just waits its turn, which is what a lapsed turn means. And the
+      // abort signal: a login finishes and saves after the client gave up on the
+      // call (session_status recovers it), and it must still bind then.
+      await bindSession(result.name, {
+        ...queueTurn(ctx, `rebind to "${result.name}"`, browserQueue.isLive(lease) ? lease : undefined),
+        signal: undefined,
+      });
       boundTo = result.name;
     } catch (err) {
       bindError = err instanceof Error ? err.message : String(err);
@@ -2249,7 +2304,9 @@ const attachDefinition: Tool = {
     'authenticated — the way to reuse a session in a LATER run without logging in again. ' +
     'session_login already does this for the session it captures; use this to switch between saved ' +
     'sessions, or to re-bind after a server restart. Pass name:null to drop back to the anonymous profile. ' +
-    'Rebinding swaps the browser underneath any open page, so re-navigate afterwards.',
+    'Rebinding swaps the browser underneath any open page, so re-navigate afterwards. ' +
+    'The rebind waits its turn in the browser queue, so it never lands in the middle of another ' +
+    "caller's browser_* call or leased turn; pass your own lease to rebind inside your turn.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -2257,15 +2314,16 @@ const attachDefinition: Tool = {
         type: ['string', 'null'],
         description: 'Saved session name to bind, or null to unbind and browse anonymously.',
       },
+      lease: LEASE_PROPERTY,
     },
     required: ['name'],
   },
 };
 
-async function attachHandler(args: Record<string, unknown>): Promise<CallToolResult> {
+async function attachHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
   const name = args.name == null ? null : String(args.name);
   try {
-    const { session } = await bindSession(name);
+    const { session } = await bindSession(name, queueTurn(ctx, 'session_attach rebind', leaseArg(args)));
     return {
       content: [
         {
@@ -2374,6 +2432,7 @@ const solveChallengeDefinition: Tool = {
           'Optional timeout cap in ms. On the stdio surface the default is no limit (the human takes ' +
           'as long as they need to clear the challenge). On HTTP surfaces the default is 300000.',
       },
+      lease: LEASE_PROPERTY,
     },
     required: ['name', 'url'],
   },
@@ -2393,7 +2452,7 @@ async function solveChallengeHandler(
   args: Record<string, unknown>,
   ctx?: ToolContext,
 ): Promise<CallToolResult> {
-  const refused = reservedName(String(args.name ?? ''));
+  const refused = refusal(args);
   if (refused) return refused;
   return bindAndReport(
     await solveChallenge(
@@ -2402,8 +2461,7 @@ async function solveChallengeHandler(
       ctx,
       args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
       args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
-    ),
-  );
+    ), ctx, args);
 }
 
 /**

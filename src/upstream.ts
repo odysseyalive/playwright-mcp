@@ -67,6 +67,7 @@ import {
   stealthContextOptions,
 } from './stealth.js';
 import { egressRestricted, installContextEgressGuard, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
+import { browserQueue, type RunOptions } from './queue.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -321,7 +322,7 @@ async function connect(session: string | null, storageState?: string): Promise<B
   const server = await createConnection(upstreamConfig(), getContext);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
-  const client = new Client({ name: 'playwright-mcp-proxy', version: '0.3.2' });
+  const client = new Client({ name: 'playwright-mcp-proxy', version: '0.4.0' });
   await client.connect(clientTransport);
   return { server, client, session, closeBrowser };
 }
@@ -350,8 +351,22 @@ export function boundSession(): string | null {
  * Point the browser_* tools at a captured login (or, with null, back at the
  * default anonymous profile). Tears the old browser down first: two chromiums
  * holding the same artifact is a leak, not a feature.
+ *
+ * A rebind replaces the connection every browser_* call runs on, so it takes its
+ * turn in the browser queue (src/queue.ts) like any of them: it never lands in the
+ * middle of another caller's call, nor inside another caller's leased turn. The
+ * queueing is HERE rather than at each call site so no caller can forget it.
+ * `turn` carries the caller's lease (its own rebind runs inside its turn), abort
+ * signal and heartbeat; without one the rebind still queues, just silently.
  */
-export async function bindSession(name: string | null): Promise<{ session: string | null }> {
+export function bindSession(
+  name: string | null,
+  turn: RunOptions = { label: 'session rebind' },
+): Promise<{ session: string | null }> {
+  return browserQueue.run(() => rebind(name), turn);
+}
+
+async function rebind(name: string | null): Promise<{ session: string | null }> {
   let storageState: string | undefined;
   if (name) {
     const file = sessionFilePath(name);
@@ -374,13 +389,17 @@ export async function bindSession(name: string | null): Promise<{ session: strin
 /**
  * browser_close leaves upstream with no tool state and the chrome still running
  * (see the header). Close it now rather than at the next browser_* call, so the
- * idle browser does not hold its profile slot in the meantime.
+ * idle browser does not hold its profile slot in the meantime. Called INSIDE
+ * browser_close's turn in the browser queue (src/index.ts), never on its own.
  */
 export async function releaseBrowser(): Promise<void> {
   await current?.closeBrowser();
 }
 
-/** Shut the upstream browser down (process exit). */
+/**
+ * Shut the upstream browser down (process exit). Deliberately NOT queued: the
+ * process is going away, and a shutdown that waited behind a lease could hang.
+ */
 export async function closeUpstream(): Promise<void> {
   const c = current;
   current = undefined;

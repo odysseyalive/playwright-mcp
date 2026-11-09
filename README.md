@@ -4,7 +4,7 @@ One install, every Claude Code project gets a real browser. Page fetching with c
 
 ## What it is
 
-An MCP server that wraps `@playwright/mcp` and adds nine tools of its own for page fetching, authenticated sessions, and test suites. The installer points Claude at it: page fetches go to `web_fetch` instead of the built-in WebFetch, and browser work goes to the `browser_*` tools instead of the claude-in-chrome extension. The extra features just come along for free.
+An MCP server that wraps `@playwright/mcp` and adds eleven tools of its own for page fetching, authenticated sessions, test suites, and sharing the browser between agents. The installer points Claude at it: page fetches go to `web_fetch` instead of the built-in WebFetch, and browser work goes to the `browser_*` tools instead of the claude-in-chrome extension. The extra features just come along for free.
 
 ### How it layers in
 
@@ -18,12 +18,39 @@ This server has nothing to do with web search. Claude runs its own native WebSea
 
 ### The tools
 
-Thirty-two total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The nine custom ones:
+Thirty-four total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The eleven custom ones:
 
 - **`web_fetch`** stealth-renders a URL (HTML or PDF), returns readable text plus the citation and health data described above. When a page comes back as a CAPTCHA or bot wall, it opens the same window `session_solve_challenge` does, sends a desktop notification on Linux, and waits up to 90 seconds for you to clear it, then retries. If you're not there, the fetch comes back blocked with a note that a window is waiting for you at that host. The window stays open for up to 30 minutes, and once you solve it the next fetch goes straight through. The clearance is saved as `wall-<host>` and every later fetch to that host reuses it until it lapses, so you only see the window again when the site asks again. That happens on stdio and the local surface, never on the cloud one.
 - **`session_login`**, **`session_status`**, **`session_solve_challenge`**, and **`session_attach`** handle authenticated sessions across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. `session_solve_challenge` clears CAPTCHAs and bot walls the same way. `session_attach` binds a captured session to the `browser_*` tools so interactive browsing is authenticated too. For any login, call `session_login({headed:true})` and let the human handle the whole thing in the headed window. Password, 2FA, SSO, CAPTCHA, whatever the site throws. The window opens with a second tab holding an "I'm signed in, save it" button. Log in however the site needs, including hops to other sites, email links and 2FA, then press it. Nothing tries to guess when a login is finished, because every site does it differently. There is no time limit on the stdio surface, and closing the window cancels.
 - **`session_scaffold_tests`** generates a deterministic Playwright E2E test suite into any project, wired to reuse a session captured by `session_login`. No model in the loop. Just `npx playwright test`.
 - **`suite_scaffold`**, **`suite_audit`**, and **`suite_methodology`** carry a full e2e test-suite methodology. Scaffold the complete pack into any project, audit results with per-failure dossiers, or pull the playbook on demand. More in the Test-suite builder section below.
+- **`browser_lease_acquire`** and **`browser_lease_release`** hold the shared browser for a multi-step turn. See the next section.
+
+### One browser, many agents: the queue
+
+There's one `browser_*` browser per server: one current tab, one bound session. In a Claude Code session the main agent and every subagent share one connection to this server, so the server can't tell them apart. So it queues them.
+
+Every `browser_*` call waits its turn, first come first served, and only one runs at a time. A rebind waits too: `session_attach`, and the bind step at the end of `session_login` and `session_solve_challenge`. It never lands in the middle of somebody else's call. The human part of a login or challenge doesn't hold the queue. Only the quick bind at the end does.
+
+One call at a time still lets another agent slip in *between* your calls. If you need navigate, snapshot, click with nobody in between, take a lease:
+
+```text
+browser_lease_acquire({ holder: "linkedin-scout" })   → { lease: "<token>", ... }
+browser_navigate({ url: "...", lease: "<token>" })
+browser_snapshot({ lease: "<token>" })
+browser_click({ ref: "e12", lease: "<token>" })
+browser_lease_release({ lease: "<token>" })
+```
+
+While a lease is held, only calls carrying its token run. Everyone else waits, including other acquires and other agents' rebinds. Your own `session_attach({name, lease})` runs inside your turn. Nobody waits forever:
+
+- A lease ends on its own after 90 seconds with no call carrying it (the clock pauses while one of its calls is running) and after 10 minutes no matter what. A crashed agent can't hold the browser hostage.
+- A waiter sends progress heartbeats so Claude Code doesn't time it out. After 10 minutes it gives up with an error that says who holds the browser and for how long. Nothing ran, so it's safe to retry.
+- A cancelled call leaves the queue. Releasing twice is fine. A token the server never issued, or one that already ended, gets a clear error telling you to acquire again or call without one.
+
+Leases don't nest. Release before you acquire again. A server restart forgets every lease. The three limits are environment variables, listed in `.env.example`.
+
+**`web_fetch` is not queued.** It renders on its own stealth browser, separate from the `browser_*` one, and it never rebinds anything. Concurrent fetches don't wait on each other or on `browser_*` calls. Each plain fetch opens its own page (tab) in the one shared stealth context, so they share that profile's cookies but never a tab. Each `web_fetch({session})` launches its own browser and context seeded from the saved session and closes it afterwards. So a job that only needs `web_fetch` never needs to stay out of the browser's way.
 
 ## Requirements
 

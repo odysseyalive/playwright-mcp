@@ -21,12 +21,15 @@ console.log(instructionsOk ? 'instructions: capability map present (+ replaces-n
 
 const { tools } = await client.listTools();
 const names = new Set(tools.map((t) => t.name));
-const expectedCustom = ['web_fetch', 'session_login', 'session_status', 'session_scaffold_tests', 'suite_scaffold', 'suite_audit', 'suite_methodology'];
+const expectedCustom = ['web_fetch', 'session_login', 'session_status', 'session_scaffold_tests', 'suite_scaffold', 'suite_audit', 'suite_methodology', 'browser_lease_acquire', 'browser_lease_release'];
 const removed = ['web_search', 'deep_research'];
 const missing = expectedCustom.filter((n) => !names.has(n));
 const resurrected = removed.filter((n) => names.has(n));
 if (resurrected.length) console.log(`FAIL: removed tools still present: ${resurrected.join(', ')}`);
-const toolsOk = names.has('browser_navigate') && missing.length === 0 && resurrected.length === 0;
+// The browser queue's lease reaches the wrapped tools' schemas (src/queue.ts).
+const leaseOk = tools.find((t) => t.name === 'browser_navigate')?.inputSchema?.properties?.lease?.type === 'string';
+if (!leaseOk) console.log('FAIL: browser_navigate does not advertise the optional lease argument');
+const toolsOk = names.has('browser_navigate') && missing.length === 0 && resurrected.length === 0 && leaseOk;
 console.log(toolsOk ? `tools: ${tools.length} present (custom: ${expectedCustom.join(', ')})` : `FAIL: missing tools: ${missing.join(', ')}`);
 for (const t of tools) console.log(`  - ${t.name}`);
 

@@ -34,6 +34,11 @@ import type { SurfaceTrust } from './index.js';
 export interface ToolContext {
   trust: SurfaceTrust;
   progress?: (message: string) => void;
+  /**
+   * The request's abort signal. A call waiting in the browser queue (src/queue.ts)
+   * leaves it when this fires, rather than taking a turn nobody is waiting for.
+   */
+  signal?: AbortSignal;
 }
 
 type ToolHandler = (args: Record<string, unknown>, ctx?: ToolContext) => Promise<CallToolResult>;
@@ -52,6 +57,7 @@ import {
 } from './tools/session.js';
 import { sessionScaffoldTool } from './tools/scaffold.js';
 import { suiteScaffoldTool, suiteAuditTool, suiteMethodologyTool } from './tools/suite.js';
+import { leaseAcquireTool, leaseReleaseTool } from './tools/lease.js';
 
 const registry: CustomTool[] = [
   webFetch,
@@ -63,6 +69,8 @@ const registry: CustomTool[] = [
   suiteScaffoldTool,
   suiteAuditTool,
   suiteMethodologyTool,
+  leaseAcquireTool,
+  leaseReleaseTool,
 ];
 
 export const customTools: Tool[] = registry.map((t) => t.definition);
