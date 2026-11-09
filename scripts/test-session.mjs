@@ -745,6 +745,14 @@ test('challenge: cleared only when the markers vanish on the SAME url (a solve n
   assert.equal(challengeCleared(walled, walled, 'Getting Started — Example Docs'), true);
   // Query/fragment churn on the same page still counts as cleared.
   assert.equal(challengeCleared(walled + '?ref=1', walled, 'Getting Started'), true);
+  // A clear that lands one redirect away on the same site still counts (atergolupi.com,
+  // 2026-11-08: the apex redirects to www, and the exact-host test never cleared).
+  assert.equal(challengeCleared('https://www.atergolupi.com/', 'https://atergolupi.com/', 'Ater Go Lupi'), true);
+  assert.equal(challengeCleared('https://atergolupi.com/', 'https://www.atergolupi.com/', 'Ater Go Lupi'), true);
+  // ...but a different site, or a lookalike that merely ends in the same letters, does not.
+  assert.equal(challengeCleared('https://www.example.org/', 'https://atergolupi.com/', 'Example'), false);
+  assert.equal(challengeCleared('https://notatergolupi.com/', 'https://atergolupi.com/', 'Lookalike'), false);
+  assert.equal(challengeCleared('http://127.0.0.1:9/x', 'http://127.0.0.1:8/x', 'Other port'), false);
   // Garbage in never reads as success.
   assert.equal(challengeCleared('not a url', walled, 'Guide'), false);
 });

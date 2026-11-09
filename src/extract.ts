@@ -32,19 +32,48 @@ export interface Citation {
 
 // ── Page health ────────────────────────────────────────────────────────────
 
+/**
+ * Bot-wall prose. Matched against what a person would SEE — the title plus the
+ * page's visible text (see visibleText) — never the raw HTML: a shop page carries
+ * "captcha" in its scripts and JSON config (a consent manager's `_grecaptcha`,
+ * WooCommerce's `"recaptcha":{"i18n":...}`) with no wall anywhere, and
+ * atergolupi.com, 2026-11-08, was walled on exactly that and opened a window
+ * nobody needed. Markup-only signatures belong in WALL_VENDORS, not here.
+ */
 const BLOCK_TELL =
-  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify you are human|access denied|cf-error-details|your support id is/i;
+  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify(ing)? (that )?you are (a )?human|checking your browser|access denied|your support id is/i;
 /**
  * Who served the wall, when the markup says so. Only signatures seen on a real
- * fetch are listed; an unrecognised wall is still 'blocked', just unnamed.
+ * fetch are listed; an unrecognised wall is still 'blocked', just unnamed. A
+ * match is also evidence of a wall on its own (classifyHealth), so each one has
+ * to be a mark of the challenge page, never of a site the vendor merely protects.
  */
 const WALL_VENDORS: [RegExp, string][] = [
   // egov.sos.state.or.us, 2026-10-30: "Please enable JavaScript to view the
   // page content. Your support ID is: <digits>." (F5 ASM / Advanced WAF).
   [/your support id is/i, 'F5 BIG-IP bot defense'],
   [/\.lsrecap\/recaptcha/i, 'LiteSpeed reCAPTCHA'],
-  [/cf-error-details|cf-chl-/i, 'Cloudflare'],
+  // Not `cf-chl-widget`: that is a Turnstile box embedded in an ordinary form.
+  [/cf-error-details|cf-chl-(?!widget)|_cf_chl_opt/i, 'Cloudflare'],
+  // DataDome serves its interstitial from this host, and only the interstitial does.
+  // Listed when the raw-HTML "captcha" match that used to catch it went away.
+  [/captcha-delivery\.com/i, 'DataDome'],
 ];
+
+/**
+ * The text a person would see: the title and the body, with scripts, styles,
+ * templates, comments and attribute values gone. Regex rather than a DOM because
+ * classifyHealth stays a cheap pure function over a string; a stray `<` in text
+ * costs at most a few characters, and `<noscript>` text is kept on purpose (an F5
+ * wall says what it is there).
+ */
+function visibleText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ');
+}
 
 /** Name the bot wall's vendor from its markup, or undefined when unknown. */
 export function wallVendor(html: string): string | undefined {
@@ -88,7 +117,9 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
   const substantial = body.length >= 1500;
 
   const head = html.slice(0, 60_000);
-  if (BLOCK_TELL.test(head) && !substantial) return 'blocked';
+  // Two kinds of evidence: wall prose a person would read, or a vendor's
+  // challenge markup (wallVendor) for walls that show no prose at all.
+  if (!substantial && (BLOCK_TELL.test(visibleText(html).slice(0, 60_000)) || wallVendor(html))) return 'blocked';
   if (PARKED_TELL.test(head)) return 'parked';
 
   const title = /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1] ?? '';

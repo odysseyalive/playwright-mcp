@@ -19,7 +19,9 @@ const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const sessions = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-wall-'));
 process.env.PLAYWRIGHT_MCP_SESSIONS = sessions;
 
-const { fetchUrl, wallSessionName } = await import('../dist/tools/web-fetch.js');
+const { fetchUrl, wallSessionName, awaitWallSolve, notifyWallWindow, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
+  '../dist/tools/web-fetch.js'
+);
 const { closeBrowser } = await import('../dist/browser.js');
 
 const WALL = '<html><body>Please enable JavaScript to view the page content.Your support ID is: 1.</body></html>';
@@ -42,6 +44,87 @@ test('wall- names are reserved: a login saved as one would be replayed unasked',
       assert.match(r.content[0].text, /reserved/);
     }
   }
+});
+
+/** A solve the test finishes by hand. */
+function deferredSolve() {
+  let finish;
+  const promise = new Promise((r) => (finish = r));
+  return { promise, finish: (ok) => finish({ name: 'wall-x', path: '', capturedAt: '', mode: 'challenge', ok }) };
+}
+
+test('wall wait: bounded, the window outlives it, and a second fetch never joins it', async () => {
+  // atergolupi.com, 2026-11-08: an unattended fetch waited 3.5 hours on its window.
+  assert.equal(WALL_WAIT_MS, 90_000);
+  assert.equal(WALL_WINDOW_MS, 30 * 60_000);
+  const solve = deferredSolve();
+  let opened = 0;
+  const open = () => {
+    opened += 1;
+    return solve.promise;
+  };
+  const first = await awaitWallSolve('wall-bound.test', open, 20);
+  assert.deepEqual(first, { state: 'waiting' }, 'returns after the bound, not when the human finishes');
+  // Still open in the background: the next fetch is told so at once, and opens nothing.
+  const t0 = Date.now();
+  assert.deepEqual(await awaitWallSolve('wall-bound.test', open, 60_000), { state: 'busy' });
+  assert.ok(Date.now() - t0 < 1000, 'busy answers immediately instead of blocking on the solve');
+  assert.equal(opened, 1);
+  // The human clears it later; the slot frees, and the next wall opens a fresh window.
+  solve.finish(true);
+  await solve.promise;
+  await new Promise((r) => setImmediate(r));
+  const again = deferredSolve();
+  again.finish(true);
+  const r = await awaitWallSolve('wall-bound.test', () => again.promise, 60_000);
+  assert.equal(r.state, 'done');
+  assert.equal(r.result.ok, true);
+});
+
+test('wall wait: a solve that throws comes back as a failed result, never a rejection', async () => {
+  const r = await awaitWallSolve('wall-throws.test', () => Promise.reject(new Error('chrome not found')), 60_000);
+  assert.equal(r.state, 'done');
+  assert.equal(r.result.ok, false);
+  assert.match(r.result.error, /chrome not found/);
+  // ...and one that throws after the bound does not surface as an unhandledRejection.
+  let fail;
+  const late = await awaitWallSolve('wall-late.test', () => new Promise((_, rj) => (fail = rj)), 10);
+  assert.deepEqual(late, { state: 'waiting' });
+  fail(new Error('late'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(await awaitWallSolve('wall-late.test', () => Promise.resolve({ ok: true }), 60_000), {
+    state: 'done',
+    result: { ok: true },
+  });
+});
+
+test('notify: argv only, host as its own argument, skipped without a display, never throws', () => {
+  const calls = [];
+  const fake = (file, args, opts, done) => {
+    calls.push({ file, args, opts });
+    done(new Error('spawn notify-send ENOENT')); // missing binary: swallowed
+    return { on() {}, unref() {} };
+  };
+  notifyWallWindow('www.kvraudio.com', { execFile: fake, env: { WAYLAND_DISPLAY: 'wayland-1' }, platform: 'linux' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, 'notify-send');
+  assert.ok(Array.isArray(calls[0].args));
+  assert.ok(calls[0].args.some((a) => a.includes('www.kvraudio.com')));
+  assert.ok(calls[0].opts.timeout > 0);
+  // No display, or not Linux: nothing is spawned.
+  notifyWallWindow('x.test', { execFile: fake, env: {}, platform: 'linux' });
+  notifyWallWindow('x.test', { execFile: fake, env: { DISPLAY: ':0' }, platform: 'darwin' });
+  assert.equal(calls.length, 1);
+  // A spawn that throws synchronously is not the fetch's problem.
+  assert.doesNotThrow(() =>
+    notifyWallWindow('x.test', {
+      execFile: () => {
+        throw new Error('EAGAIN');
+      },
+      env: { DISPLAY: ':0' },
+      platform: 'linux',
+    }),
+  );
 });
 
 test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TEST_BROWSER=1' }, async (t) => {

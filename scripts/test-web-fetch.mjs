@@ -106,6 +106,49 @@ test('fetchStatus: a bot check is blocked even without the word captcha', () => 
   assert.equal(classifyHealth(wall, 200, 'Verifying that you are not a robot...'), 'blocked');
 });
 
+test('fetchStatus: a short shop page with "captcha" only in scripts and JSON is not blocked', () => {
+  // atergolupi.com, 2026-11-08: 577 visible characters, and "captcha" only in a consent
+  // manager's config and WooCommerce's reCAPTCHA i18n. Marked walled, it opened a
+  // window that sat unattended for 3.5 hours.
+  const h =
+    '<html><head><title>Ater Go Lupi — Shop</title>' +
+    '<script>window.cmplz={"blocked":["_grecaptcha","recaptcha"]};</script>' +
+    '<script type="application/json" id="wc-settings">{"recaptcha":{"i18n":{"error":"reCAPTCHA error"}}}</script>' +
+    '<style>.g-recaptcha{display:none}</style></head><body>' +
+    '<!-- captcha placeholder --><div class="grecaptcha-badge" data-captcha="1"></div>' +
+    `<h1>Ater Go Lupi</h1><p>${'Handmade goods from a small workshop. '.repeat(12)}</p>` +
+    '<a href="/cart">Cart</a></body></html>';
+  const { text } = extractReadable(h, 'https://www.atergolupi.com/');
+  assert.ok(text.length < 1500, 'short enough that the size guard does not save it');
+  assert.equal(classifyHealth(h, 200, text), 'ok');
+});
+
+test('fetchStatus: Cloudflare "Just a moment" challenge is blocked and named', () => {
+  const h =
+    '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>' +
+    '<div class="main-wrapper"><h1>www.example.test</h1><p>Verifying you are human. This may take a few seconds.</p></div>' +
+    '<noscript>Enable JavaScript and cookies to continue</noscript>' +
+    '<script>window._cf_chl_opt={cvId:"3",cType:"managed"};</script></body></html>';
+  assert.equal(classifyHealth(h, 200, ''), 'blocked');
+  assert.equal(wallVendor(h), 'Cloudflare');
+});
+
+test('fetchStatus: a challenge with no wall prose is still blocked on its vendor markup', () => {
+  // DataDome's interstitial is an iframe and little else; the markup is the only tell.
+  const h = '<html><head><title>example.test</title></head><body><iframe src="https://geo.captcha-delivery.com/captcha/?initialCid=x"></iframe></body></html>';
+  assert.equal(classifyHealth(h, 200, ''), 'blocked');
+  assert.equal(wallVendor(h), 'DataDome');
+});
+
+test('fetchStatus: a Turnstile box in an ordinary short form is not a wall', () => {
+  const h = '<html><head><title>Contact</title></head><body><form><input name="email"><div id="cf-chl-widget-abc12" class="cf-turnstile"></div><button>Send</button></form></body></html>';
+  assert.equal(classifyHealth(h, 200, 'Contact Send'), 'ok');
+});
+
+test('fetchStatus: 403 is a hard block whatever the page says', () => {
+  assert.equal(classifyHealth('<html><head><title>News</title></head><body>An ordinary page.</body></html>', 403), 'blocked');
+});
+
 test('citation: JSON-LD yields author + dateConfidence high', () => {
   const c = extractCitation(html('article-jsonld.html'), 'https://coastalreview.test/tides');
   assert.ok(c.author.length >= 1, 'has an author');

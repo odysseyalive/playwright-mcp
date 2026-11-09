@@ -794,6 +794,11 @@ export function wallUp(currentUrl: string, title: string): boolean {
  * Deliberately conservative: an empty title is the challenge shell mid-load, and a
  * foreign host is some other tab the human opened — neither is evidence of success.
  * A false negative costs a longer wait; a false positive saves a worthless artifact.
+ *
+ * "The target host" includes its parent and child hosts on the same site, because a
+ * cleared wall often lands one redirect away: atergolupi.com, 2026-11-08, sends the
+ * apex to www, and an exact-host test could never see that page clear. A sibling
+ * (mail. beside docs.) is still another tab.
  */
 export function challengeCleared(currentUrl: string, targetUrl: string, title: string): boolean {
   let cur: URL;
@@ -804,9 +809,17 @@ export function challengeCleared(currentUrl: string, targetUrl: string, title: s
   } catch {
     return false;
   }
-  if (cur.host !== tgt.host) return false; // another tab says nothing about our wall
+  // another tab says nothing about our wall
+  if (cur.port !== tgt.port || !sameSiteLine(cur.hostname, tgt.hostname)) return false;
   if (!title.trim()) return false; // the challenge shell before the real document
   return !wallUp(currentUrl, title);
+}
+
+/** One host is the other, or a subdomain of it, on the same registrable domain (www ↔ apex). */
+function sameSiteLine(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (siteDomain(`http://${a}`) !== siteDomain(`http://${b}`)) return false;
+  return a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
 }
 
 /**
@@ -1230,6 +1243,13 @@ interface AttachRec {
   pid: number;
   profile: string;
   startedAt: string;
+  /**
+   * The server process that spawned it. A Chrome whose owner is still running is
+   * not an orphan: web_fetch leaves its wall window open in the background after
+   * the fetch returns, and the next attach (any host, any server) must not kill it.
+   * Absent on records written before this field existed; those are reaped as before.
+   */
+  owner?: number;
 }
 const registryPath = () => path.join(sessionsDir(), '.attach-chromes.json');
 function readRegistry(): AttachRec[] {
@@ -1280,8 +1300,13 @@ function killGroup(pid: number): void {
 function reapOrphans(): void {
   const recs = readRegistry();
   if (!recs.length) return;
+  const kept: AttachRec[] = [];
   for (const r of recs) {
     if (!r.profile.includes(TEMP_PROFILE_MARK)) continue; // only temp spawns are auto-reaped
+    if (r.owner !== undefined && processAlive(r.owner)) {
+      kept.push(r); // its server is alive and will close it itself
+      continue;
+    }
     if (cmdlineMatches(r.pid, r.profile)) killGroup(r.pid);
     try {
       fs.rmSync(r.profile, { recursive: true, force: true });
@@ -1289,7 +1314,16 @@ function reapOrphans(): void {
       /* ignore */
     }
   }
-  writeRegistry([]);
+  writeRegistry(kept);
+}
+/** Signal 0 checks existence only. EPERM means it exists under another user. */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
@@ -1441,7 +1475,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
 
 function registerAttachRecord(pid: number, profile: string): void {
   const recs = readRegistry();
-  recs.push({ pid, profile, startedAt: new Date().toISOString() });
+  recs.push({ pid, profile, startedAt: new Date().toISOString(), owner: process.pid });
   writeRegistry(recs);
 }
 function unregisterAttachRecord(pid: number): void {
@@ -1703,8 +1737,10 @@ export interface CaptureProgress {
 
 const NOTES: Record<CaptureState, string> = {
   waiting:
-    'a capture is IN PROGRESS: a window is open and the human is logging in. It has no deadline — poll ' +
-    'this tool again rather than starting a second login, and never tell the user it failed.',
+    'a capture is IN PROGRESS: a window is open and the human is logging in. A session_login or ' +
+    'session_solve_challenge window has no deadline; a bot-wall window web_fetch opened on its own ' +
+    'closes itself after 30 minutes. Poll this tool again rather than starting a second login, and ' +
+    'never tell the user it failed.',
   saved: 'the capture COMPLETED and the session was saved, even if the tool call that started it was abandoned.',
   cancelled: 'the human closed the window before the login finished. Nothing was saved; start a new capture.',
   failed: 'the capture failed. Read the session_login result for the diagnosis.',
@@ -1801,11 +1837,15 @@ export function heartbeatMessage(what: string, elapsedMs: number): string {
  * undefined then, and a progress notification for a token the client never issued
  * makes it complain about an unknown token. The guard is not optional.
  */
-function startHeartbeat(ctx: ToolContext | undefined, what: string): () => void {
+export function startHeartbeat(
+  ctx: ToolContext | undefined,
+  what: string,
+  say: (what: string, elapsedMs: number) => string = heartbeatMessage,
+): () => void {
   const progress = ctx?.progress;
   if (!progress) return () => {};
   const started = Date.now();
-  const timer = setInterval(() => progress(heartbeatMessage(what, Date.now() - started)), HEARTBEAT_EVERY_MS);
+  const timer = setInterval(() => progress(say(what, Date.now() - started)), HEARTBEAT_EVERY_MS);
   timer.unref(); // a heartbeat must never be the reason this process stays alive
   return () => clearInterval(timer);
 }
@@ -2368,10 +2408,12 @@ async function solveChallengeHandler(
 
 /**
  * The capture behind session_solve_challenge, without the bind. web_fetch calls it
- * directly when it lands on a wall, so the human gets the same window and the same
- * patience whether an agent asked for the solve or a fetch ran into the wall.
- * web_fetch does not bind: swapping the browser under someone's open browser_* pages
- * is not something a fetch should do as a side effect.
+ * directly when it lands on a wall, so the human gets the same window whether an
+ * agent asked for the solve or a fetch ran into the wall. The patience differs:
+ * web_fetch passes its own `timeoutMs` and no `progress`, because nobody asked it
+ * to wait for a person (see fetchUrl). web_fetch does not bind: swapping the
+ * browser under someone's open browser_* pages is not something a fetch should do
+ * as a side effect.
  */
 export function solveChallenge(
   name: string,

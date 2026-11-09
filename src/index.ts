@@ -32,7 +32,7 @@ import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
 import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser } from './upstream.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -113,8 +113,10 @@ function buildInstructions(
         'then saves the cleared session AND binds it ' +
         'exactly as session_login does. browser_* and web_fetch({url, session}) both get past the ' +
         'wall afterwards. Short-lived (minutes); re-solve when it lapses. web_fetch does this on its ' +
-        'own: a fetch that lands on a wall opens that window, and the clearance is saved as ' +
-        'wall-<host> and reused by later fetches to that host until it lapses.',
+        'own: a fetch that lands on a wall opens that window and waits up to 90s; if the wall is still ' +
+        'up it returns blocked, saying a window is waiting at that host. Ask the human to solve it, ' +
+        'then retry. The clearance is saved as wall-<host> and reused by later fetches to that host ' +
+        'until it lapses.',
     );
   }
   if (names.has('session_scaffold_tests')) {
