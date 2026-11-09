@@ -123,6 +123,50 @@ test('fetchStatus: a short shop page with "captcha" only in scripts and JSON is 
   assert.equal(classifyHealth(h, 200, text), 'ok');
 });
 
+test('fetchStatus: the atergolupi Italian cookie banner returned as the body is a consent-wall', () => {
+  // atergolupi.com, 2026-11-08: Real Cookie Banner's notice came back as the whole
+  // text with fetchStatus "ok", because the consent tell only knew English.
+  const banner =
+    'Utilizziamo cookie e tecnologie simili sul nostro sito Web ed elaboriamo dati personali su di te, come il tuo ' +
+    'indirizzo IP. Condividiamo questi dati anche con terze parti. Il trattamento dei dati può essere effettuato con ' +
+    'il tuo consenso o sulla base di un interesse legittimo, al quale puoi opporti nelle singole impostazioni sulla ' +
+    'privacy. Hai il diritto di prestare il consenso solo ai servizi essenziali e di modificare o revocare il tuo ' +
+    'consenso in un secondo momento nella privacy policy. Alcuni servizi elaborano i dati personali in paesi terzi ' +
+    "non sicuri. Acconsentendo all'utilizzo di questi servizi, lei acconsente anche al trattamento dei suoi dati in " +
+    'questi paesi terzi non sicuri, ai sensi del Reg. UE 2016/679. Ciò comporta il rischio che i suoi dati vengano ' +
+    'trattati dalle autorità a fini di controllo e monitoraggio, eventualmente senza possibilità di ricorso legale. ' +
+    'Preferenze sulla privacy Accetta tutti Continua senza consenso Preferenze sulla privacy individuali ' +
+    'Dettagli sui cookie Privacy policy Note legali Essenziali Statistiche Marketing Servizi funzionali';
+  assert.ok(banner.length > 1000 && banner.length < 1500, `banner is ${banner.length} chars`);
+  const h = `<html><head><title>Ater Go Lupi</title></head><body><p>${banner}</p></body></html>`;
+  assert.equal(classifyHealth(h, 200, banner), 'consent-wall');
+});
+
+test('fetchStatus: German, French and Spanish banners are consent-walls', () => {
+  for (const banner of [
+    'Wir verwenden Cookies und ähnliche Technologien, um Inhalte zu personalisieren und Zugriffe zu analysieren. ' +
+      'Alle akzeptieren Alle ablehnen Einstellungen',
+    'Nous utilisons des cookies pour améliorer votre expérience et mesurer l’audience de notre site. ' +
+      'Tout accepter Tout refuser Personnaliser',
+    'Este sitio web utiliza cookies propias y de terceros para analizar el tráfico y mostrarle publicidad. ' +
+      'Aceptar todas Rechazar Configurar',
+  ]) {
+    assert.equal(classifyHealth(`<html><body><p>${banner}</p></body></html>`, 200, banner), 'consent-wall', banner);
+  }
+});
+
+test('fetchStatus: an Italian article that mentions cookies only past its opening stays ok', () => {
+  const article =
+    'La bottega di Ater Go Lupi lavora la lana cotta da tre generazioni, in un piccolo laboratorio sulle colline ' +
+    'marchigiane dove ogni pezzo viene tagliato e cucito a mano. In questo articolo raccontiamo come nasce una ' +
+    'borsa, dalla scelta del filato alla tintura naturale, e perché i tempi di consegna sono più lunghi di quelli ' +
+    'di un negozio qualunque. Una nota tecnica per chi ci scrive: utilizziamo i cookie solo per il carrello, e ' +
+    'non vendiamo dati a nessuno. Torniamo al lavoro: la tintura richiede due giorni, la cucitura uno.';
+  assert.ok(article.indexOf('cookie') > 300, 'the phrase sits past the 300-char window');
+  assert.ok(article.length < 1500, 'short enough that the size guard does not save it');
+  assert.equal(classifyHealth(`<html><body><p>${article}</p></body></html>`, 200, article), 'ok');
+});
+
 test('fetchStatus: unclosed tags cannot make the wall check quadratic', () => {
   // A lazy `<script[\s\S]*?</script>` rescanned to the end for every unclosed
   // opener; 2 MB of bare `<script` and `<` took minutes. A linear pass is instant.

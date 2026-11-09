@@ -116,6 +116,24 @@ const PAYWALL_TELL = /subscribe to (read|continue)|subscribers only|this article
 const NOTFOUND_TELL = /\b(404|page not found|page can.?t be found|no longer exists|content (is )?unavailable)\b/i;
 const PARKED_TELL = /domain (is )?for sale|buy this domain|parked (free|domain)|courtesy of (godaddy|sedo)/i;
 /**
+ * The opening line of a consent banner, in the languages consent law most often
+ * puts it in front of a reader: English, Italian, German, French, Spanish,
+ * Dutch, Portuguese. Phrase-shaped on purpose ("we use cookies", not "cookie"),
+ * so prose that merely mentions cookies does not match. Shared with consent.ts,
+ * which uses it to recognise a banner it has never seen the vendor of.
+ */
+export const CONSENT_PROSE = new RegExp(
+  [
+    'we use cookies|cookies and similar technologies|this (site|website) uses cookies',
+    'utilizziamo (i )?cookie|usiamo (i )?cookie|questo sito( web)? (utilizza|usa) (i )?cookie',
+    'wir (verwenden|nutzen) cookies|diese (website|webseite|seite) (verwendet|nutzt) cookies',
+    'nous utilisons des cookies|ce site( web)? utilise des cookies',
+    'utilizamos cookies|usamos cookies|este sitio( web)? (utiliza|usa) cookies|este site (utiliza|usa) cookies',
+    'wij gebruiken cookies|we gebruiken cookies|deze (website|site) gebruikt cookies',
+  ].join('|'),
+  'i',
+);
+/**
  * Consent-notice prose. Matched against the START of the extracted body, never
  * the raw HTML: nearly every site embeds a cookie banner somewhere, so a markup
  * match proves nothing. What matters is whether the banner is what Readability
@@ -123,8 +141,10 @@ const PARKED_TELL = /domain (is )?for sale|buy this domain|parked (free|domain)|
  * substantial prose block. Scoped this way it will not fire on an article that
  * merely discusses cookies.
  */
-const CONSENT_TELL =
-  /privacy settings|we use cookies|cookies and similar technologies|this (site|website) uses cookies|manage (your )?cookie|accept all cookies/i;
+const CONSENT_TELL = new RegExp(
+  `privacy settings|manage (your )?cookie|accept all cookies|${CONSENT_PROSE.source}`,
+  'i',
+);
 
 /**
  * Classify page health from the rendered HTML + HTTP status. Callers branch on

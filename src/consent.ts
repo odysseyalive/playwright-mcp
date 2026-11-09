@@ -25,6 +25,7 @@
  */
 
 import type { BrowserContext, Page } from 'playwright';
+import { CONSENT_PROSE } from './extract.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:consent]', ...args);
 
@@ -59,26 +60,51 @@ export async function seedConsent(context: BrowserContext): Promise<void> {
  * Accept-control selectors for the common consent frameworks, plus per-site
  * entries for custom implementations. Ordered most-specific first.
  */
-const ACCEPT_SELECTORS = [
+export const ACCEPT_SELECTORS = [
   '#onetrust-accept-btn-handler', // OneTrust
   '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll', // Cookiebot (granular)
   '#CybotCookiebotDialogBodyButtonAccept', // Cookiebot (simple)
   '.truste-button1', // TrustArc
   '#didomi-notice-agree-button', // Didomi
   'button[data-testid="uc-accept-all-button"]', // Usercentrics
+  'a.rcb-btn-accept-all', // Real Cookie Banner (WordPress); only with its anti-ad-blocker off
+  '.cmplz-accept', // Complianz (WordPress)
+  '.iubenda-cs-accept-btn', // iubenda
+  '.cky-btn-accept', // CookieYes
   'button.lnc-accept', // jw.org / wol.jw.org
   '.lnc-button--primary', // jw.org fallback (Accept is the primary control)
 ];
 
-/** Button text that means "accept", for the framework-agnostic fallback. */
-const ACCEPT_TEXT = /^\s*(accept|accept all|agree|i agree|allow all|allow cookies|got it|ok)\s*$/i;
+/**
+ * Button text that means "accept", for the framework-agnostic fallback. The
+ * whole label must match, so "Rifiuta", "Alle ablehnen" and "Continua senza
+ * consenso" never do: the fallback always accepts, never declines.
+ */
+export const ACCEPT_TEXT = new RegExp(
+  '^\\s*(' +
+    [
+      'accept|accept all|agree|i agree|allow all|allow cookies|got it|ok',
+      'accetta|accetta tutti|accetta tutto|accetto|accetta tutti i cookie',
+      'akzeptieren|alle akzeptieren|alle cookies akzeptieren|alle zulassen|zustimmen|einverstanden',
+      "accepter|tout accepter|accepter tout|j[’']accepte|accepter et fermer",
+      'aceptar|aceptar todo|aceptar todas|aceptar todas las cookies|acepto',
+      'accepteren|alles accepteren|alle cookies accepteren',
+      'aceitar|aceitar todos|aceitar tudo|aceito',
+    ].join('|') +
+    ')\\s*$',
+  'i',
+);
 
 /**
  * Markup that indicates a consent UI is present. Cheap gate: when this does not
  * match, dismissal is skipped entirely and no selector work happens.
  */
-const CONSENT_MARKUP =
-  /privacy settings|cookie (consent|banner|notice|policy)|we use cookies|cookies and similar technologies|onetrust|cybotcookiebot|truste|didomi|usercentrics|lnc-accept/i;
+export const CONSENT_MARKUP = new RegExp(
+  'privacy settings|cookie[- ](consent|banner|notice|policy)|onetrust|cybotcookiebot|truste|didomi|usercentrics|' +
+    'lnc-accept|real-cookie-banner|consent-skip-blocker|cmplz|complianz|iubenda|cky-(btn|consent)|cookieyes|' +
+    CONSENT_PROSE.source,
+  'i',
+);
 
 /**
  * Dismiss a cookie-consent banner if one is present. Returns true when a control
@@ -87,6 +113,9 @@ const CONSENT_MARKUP =
  *
  * The text fallback only considers controls sitting inside a consent-ish
  * container, so an ordinary "OK" button elsewhere on the page is never clicked.
+ * A container is consent-ish by its id/class, or, for banners whose classes are
+ * hashed (Real Cookie Banner), by being a dialog whose own text reads as a
+ * consent notice.
  */
 export async function dismissConsent(page: Page): Promise<boolean> {
   try {
@@ -109,8 +138,9 @@ export async function dismissConsent(page: Page): Promise<boolean> {
 
     // Framework-agnostic fallback, scoped to a consent container.
     const clicked = await page
-      .evaluate((pattern: string) => {
+      .evaluate(([pattern, prosePattern]: [string, string]) => {
         const accept = new RegExp(pattern, 'i');
+        const prose = new RegExp(prosePattern, 'i');
         const inConsentContainer = (el: Element): boolean => {
           let node: Element | null = el;
           for (let depth = 0; node && depth < 6; depth++) {
@@ -119,7 +149,9 @@ export async function dismissConsent(page: Page): Promise<boolean> {
             if (/cookie|consent|privacy|gdpr|banner/i.test(`${id} ${cls}`)) return true;
             node = node.parentElement;
           }
-          return false;
+          // Hashed class names: accept a dialog only when its text is a consent notice.
+          const dialog = el.closest('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]');
+          return !!dialog && prose.test(dialog.textContent || '');
         };
         const controls = [...document.querySelectorAll('button, a[role="button"], input[type="button"]')];
         for (const control of controls) {
@@ -130,7 +162,7 @@ export async function dismissConsent(page: Page): Promise<boolean> {
           return true;
         }
         return false;
-      }, ACCEPT_TEXT.source)
+      }, [ACCEPT_TEXT.source, CONSENT_PROSE.source] as [string, string])
       .catch(() => false);
 
     if (clicked) {

@@ -32,7 +32,7 @@ import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
 import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser } from './upstream.js';
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
