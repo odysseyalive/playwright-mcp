@@ -23,6 +23,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 
 import { customTools, callCustomTool, isCustomTool, type ToolContext } from './tools.js';
 import { guardOutbound, UNTRUSTED_NOTICE, UNTRUSTED_IMAGE_NOTICE } from './exfil.js';
@@ -34,7 +35,10 @@ import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser 
 import { browserQueue, leaseArg, LEASE_PROPERTY } from './queue.js';
 import { queueTurn } from './tools/session.js';
 
-const VERSION = '0.4.0';
+// package.json is the one place the version lives. dist/index.js and
+// src/index.ts both sit one level below it, so the same relative path serves
+// the built server and the tests that import the source.
+const VERSION: string = createRequire(import.meta.url)('../package.json').version;
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -736,6 +740,10 @@ async function main() {
 // Run only when invoked as the entry point — importing this module (e.g. tests
 // using createOutwardServer) must not boot the server.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.argv[2] === '--version') {
+    process.stdout.write(`${VERSION}\n`);
+    process.exit(0);
+  }
   main().catch((err) => {
     log('fatal:', err);
     process.exit(1);

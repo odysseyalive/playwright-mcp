@@ -115,21 +115,37 @@ That is a real trade-off, and it happens without asking. Pages the `browser_*` t
 
 ## Install
 
-The bundled installer handles the whole thing. Checks Node (fetching a current one if needed), installs dependencies, builds, downloads Chromium and checks it launches, registers the server at user scope. It prints a diff of what it changes to global config so you can see exactly what happened.
+One line does the whole thing. It checks Node (fetching a current one if needed), downloads the source, installs dependencies, builds, downloads Chromium and checks it launches, then registers the server at user scope. It prints a diff of what it changes to global config so you can see exactly what happened.
 
 **Linux / macOS**
 
 ```bash
-./install.sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/odysseyalive/playwright-mcp/main/install.sh)"
 ```
 
 **Windows PowerShell**
 
 ```powershell
+irm https://raw.githubusercontent.com/odysseyalive/playwright-mcp/main/install.ps1 | iex
+```
+
+On Linux and macOS the server goes in `~/.local/share/playwright-mcp`, or `$XDG_DATA_HOME/playwright-mcp` if you set that. On Windows it goes in `%LOCALAPPDATA%\playwright-mcp`. Set `PLAYWRIGHT_MCP_HOME` to an absolute path to put it somewhere else. The new copy is built and checked in a folder right next to that one, and it only replaces the old one after the browser launches. A run that fails partway leaves your existing install as it was. On Linux and macOS it needs curl or wget, plus tar.
+
+The installer adds two entries to `permissions.deny` in `~/.claude/settings.json`: `WebFetch` and `mcp__claude-in-chrome`. They take the built-in fetcher and the Chrome extension out of Claude's way, so page fetches go to `web_fetch` and browser work goes to the `browser_*` tools. They don't block anything this server provides, and native WebSearch stays on. Everything else in the file is left alone, and re-running the installer changes nothing. It also adds a steering note to `~/.claude/CLAUDE.md` that tells Claude the same thing.
+
+### Installing from a clone
+
+Working on playwright-mcp itself? Run the installer inside your checkout. It builds and registers that checkout in place and doesn't download anything from GitHub.
+
+```bash
+./install.sh
+```
+
+```powershell
 .\install.ps1
 ```
 
-The installer adds two entries to `permissions.deny` in `~/.claude/settings.json`: `WebFetch` and `mcp__claude-in-chrome`. They take the built-in fetcher and the Chrome extension out of Claude's way, so page fetches go to `web_fetch` and browser work goes to the `browser_*` tools. They don't block anything this server provides, and native WebSearch stays on. Everything else in the file is left alone, and re-running the installer changes nothing. It also adds a steering note to `~/.claude/CLAUDE.md` that tells Claude the same thing.
+Already installed from a clone and switching to the one-liner? It makes its own copy and points the registration at that copy. The clone isn't touched, so keep it or delete it.
 
 ### Registering by hand
 
@@ -153,7 +169,39 @@ claude mcp add --scope user playwright-mcp -- node /ABSOLUTE/PATH/dist/index.js
 
 ### Updating
 
-Pull the latest changes and run the same installer again. It rebuilds, re-downloads Chromium if the version changed, and re-registers the server. Safe to re-run any time.
+Run the same one-liner again. It downloads the latest `main`, rebuilds, re-downloads Chromium if the version changed, and re-registers the server. Near the top it prints the version change, like `installed: 0.3.2 -> 0.4.0`, or tells you you're already on that version. Safe to re-run any time.
+
+It won't put an older version over a newer one. To do that on purpose, set `PLAYWRIGHT_MCP_FORCE=1` for the run (the `--force` flag does the same thing when you run `install.sh` as a file).
+
+```bash
+PLAYWRIGHT_MCP_FORCE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/odysseyalive/playwright-mcp/main/install.sh)"
+```
+
+On Windows, set the variable first, then run the one-liner. It stays set until you close that PowerShell window.
+
+```powershell
+$env:PLAYWRIGHT_MCP_FORCE = '1'
+```
+
+From a clone, pull the latest changes and run `./install.sh` again.
+
+### Which version you have
+
+The installer prints the version in its last lines. After that, `.install.json` in the install folder records the version, the commit it came from, where it was downloaded from, and when.
+
+```bash
+cat ~/.local/share/playwright-mcp/.install.json
+```
+
+```powershell
+Get-Content $env:LOCALAPPDATA\playwright-mcp\.install.json
+```
+
+The server answers too. It reports the same version to Claude Code when it connects, and prints it with `--version`.
+
+```bash
+node ~/.local/share/playwright-mcp/dist/index.js --version
+```
 
 ## Verifying
 

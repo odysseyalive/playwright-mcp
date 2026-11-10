@@ -13,7 +13,25 @@
 # Chrome extension out of the way so Claude uses web_fetch and browser_*
 # instead. They never block a playwright-mcp tool, and native WebSearch stays.
 #
+# Two ways to run it, and the script tells them apart on its own:
+#
+#   From a clone:   ./install.sh
+#     Builds and registers the checkout it sits in, in place. This is the
+#     contributor path, and the one that registers a dev clone.
+#
+#   One line, no clone:
+#     bash -c "$(curl -fsSL https://raw.githubusercontent.com/odysseyalive/playwright-mcp/main/install.sh)"
+#     Downloads the source from GitHub into a staging directory next to
+#     ${PLAYWRIGHT_MCP_HOME:-${XDG_DATA_HOME:-~/.local/share}/playwright-mcp},
+#     builds and checks it there, and only then swaps it into place. A failure
+#     before the swap leaves the existing install exactly as it was. The same
+#     command updates; it refuses to replace a newer version with an older one
+#     unless forced. What got installed is recorded in .install.json there.
+#
 # Flags:
+#   --force      allow the one-line install to replace a newer version with an
+#                older one (or set PLAYWRIGHT_MCP_FORCE=1, since the one-liner
+#                cannot easily take flags)
 #   --yes        accepted but no longer needed (back-compat no-op; nothing prompts)
 #
 # No flag switches off any part of the install; the routing and the steering
@@ -23,9 +41,12 @@
 #
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_SLUG=odysseyalive/playwright-mcp
+FORCE=no
+case "${PLAYWRIGHT_MCP_FORCE:-}" in ''|0|no|false) ;; *) FORCE=yes ;; esac
 for arg in "$@"; do
   case "$arg" in
+    --force) FORCE=yes ;;
     --yes) ;;  # back-compat no-op: the installer no longer prompts
     *) echo "ignoring unknown flag: $arg" >&2 ;;
   esac
@@ -41,6 +62,56 @@ if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then ERR_C='\033[1;31m'; ERR_R='\033[0m';
 say()  { printf "${SAY_C}==>${OUT_R} %s\n" "$*"; }
 warn() { printf "${WARN_C}!  ${OUT_R} %s\n" "$*"; }
 die()  { printf "${ERR_C}ERR${ERR_R} %s\n" "$*" >&2; exit 1; }
+
+# ── 0. Clone or one-line install ──────────────────────────────────────────────
+# A checkout of this project, and not an install this script made (those carry
+# .install.json and are updated by download, not rebuilt in place). The package
+# name is part of the test on purpose: the one-liner run from the root of some
+# other Node project must never npm-install into that project.
+is_own_checkout() {
+  [ -f "$1/package.json" ] && [ -d "$1/src" ] && [ ! -f "$1/.install.json" ] &&
+    grep -q '"name": *"@francis/playwright-mcp"' "$1/package.json"
+}
+
+# Is dotted version $1 strictly OLDER than $2? X.Y.Z field by field in base 10
+# (so 0.10.0 is newer than 0.9.0). A missing or non-numeric field counts as 0,
+# and equal versions are not older. Same rule as claude-workforce's installer.
+version_is_older() {
+  local a b x y i
+  a="$1"; b="$2"
+  for i in 1 2 3; do
+    x="${a%%.*}"; y="${b%%.*}"
+    x="$(printf '%s' "$x" | tr -cd '0-9')"; y="$(printf '%s' "$y" | tr -cd '0-9')"
+    x=$((10#0$x)); y=$((10#0$y))
+    if [ "$x" -lt "$y" ]; then return 0; fi
+    if [ "$x" -gt "$y" ]; then return 1; fi
+    case "$a" in *.*) a="${a#*.}" ;; *) a=0 ;; esac
+    case "$b" in *.*) b="${b#*.}" ;; *) b=0 ;; esac
+  done
+  return 1
+}
+
+# Empty under `bash -c "$(curl …)"` and `curl … | bash`: there is no script file,
+# and dirname of nothing is the caller's cwd, which is exactly where this must
+# NOT build. So the clone test needs a real file AND a checkout around it.
+SELF="${BASH_SOURCE[0]:-}"
+SELF_DIR=
+if [ -n "$SELF" ] && [ -f "$SELF" ]; then SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"; fi
+if [ -n "$SELF_DIR" ] && is_own_checkout "$SELF_DIR"; then
+  MODE=clone
+  HERE="$SELF_DIR"
+else
+  MODE=bootstrap
+  HERE=
+  # An install this script made, re-run from inside itself, updates itself.
+  if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/.install.json" ]; then DEFAULT_DIR="$SELF_DIR"
+  else DEFAULT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/playwright-mcp"; fi
+  INSTALL_DIR="${PLAYWRIGHT_MCP_HOME:-$DEFAULT_DIR}"
+  case "$INSTALL_DIR" in /*) ;; *) die "PLAYWRIGHT_MCP_HOME must be an absolute path; got $INSTALL_DIR" ;; esac
+  INSTALL_DIR="${INSTALL_DIR%/}"
+  STAGE="$INSTALL_DIR.new"
+  OLD="$INSTALL_DIR.old"
+fi
 
 # ── 1. Node ≥ 22.13 ───────────────────────────────────────────────────────────
 # jsdom 29 (^20.19.0 || ^22.13.0 || >=24.0.0) and pdfjs-dist 6 (>=22.13.0 || >=24)
@@ -182,6 +253,81 @@ node_ok "$NODE_VER" || die "Node >=22.13.0 required; found $(node -v)."
 command -v claude >/dev/null 2>&1 || warn "Claude Code CLI 'claude' not found on PATH — the registration step will be skipped."
 say "Node $(node -v) OK"
 
+# ── 1b. One-line install: fetch the source into a staging directory ───────────
+# Everything from here to the swap in step 3b happens in $STAGE. The live install
+# is not touched until the new one has built and its browser has launched.
+# Runtime state (sessions, browser profile, caches, the private Node) lives under
+# ~/.config/playwright-mcp and ~/.cache/playwright-mcp, never in the install
+# directory, so replacing the directory loses nothing.
+
+# The commit main points at right now, so .install.json can say exactly what was
+# installed. Optional: when GitHub's API says no (rate limit, firewall), the
+# branch tarball is fetched instead and the commit is recorded as unknown.
+resolve_commit() {
+  local api sha=
+  api="https://api.github.com/repos/$REPO_SLUG/commits/main"
+  if command -v curl >/dev/null 2>&1; then
+    sha="$(curl -fsSL -H 'Accept: application/vnd.github.sha' "$api" 2>/dev/null)" || sha=
+  elif command -v wget >/dev/null 2>&1; then
+    sha="$(wget -qO- --header='Accept: application/vnd.github.sha' "$api" 2>/dev/null)" || sha=
+  fi
+  case "$sha" in *[!0-9a-f]*|'') ;; *) if [ "${#sha}" -eq 40 ]; then printf '%s' "$sha"; fi ;; esac
+}
+
+# The install directory is replaced wholesale, so it has to be one this script
+# owns: absent, empty, or carrying .install.json. Anything else (a clone, a
+# typo'd PLAYWRIGHT_MCP_HOME pointing at $HOME) is refused, never moved aside.
+install_dir_is_ours() {
+  [ ! -e "$1" ] || [ -f "$1/.install.json" ] ||
+    { [ -d "$1" ] && [ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n1)" ]; }
+}
+
+read_version() { node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version || ""' "$1" 2>/dev/null || true; }
+
+# Put the previous install back if the run dies between the two renames, and
+# never leave a half-built staging directory behind.
+cleanup_stage() {
+  if [ -n "${OLD:-}" ] && [ -e "$OLD" ] && [ ! -e "$INSTALL_DIR" ]; then mv "$OLD" "$INSTALL_DIR" || true; fi
+  if [ -n "${STAGE:-}" ]; then rm -rf "$STAGE" "$STAGE.tar.gz"; fi
+}
+
+if [ "$MODE" = bootstrap ]; then
+  command -v tar >/dev/null 2>&1 || die "Need tar to unpack the playwright-mcp source."
+  install_dir_is_ours "$INSTALL_DIR" ||
+    die "$INSTALL_DIR exists and was not made by this installer (no .install.json). Move it, or set PLAYWRIGHT_MCP_HOME to another directory, and re-run. To build a clone in place, run ./install.sh inside it."
+  mkdir -p "$(dirname "$INSTALL_DIR")"
+  rm -rf "$STAGE" "$STAGE.tar.gz" "$OLD"
+  trap cleanup_stage EXIT
+  trap 'exit 130' INT TERM
+
+  COMMIT="$(resolve_commit)"
+  if [ -n "$COMMIT" ]; then SOURCE_URL="https://codeload.github.com/$REPO_SLUG/tar.gz/$COMMIT"
+  else SOURCE_URL="https://codeload.github.com/$REPO_SLUG/tar.gz/refs/heads/main"; fi
+  say "Downloading playwright-mcp (main${COMMIT:+ at ${COMMIT:0:12}}) into $STAGE…"
+  fetch "$SOURCE_URL" > "$STAGE.tar.gz" || die "Download failed: $SOURCE_URL. Nothing was changed."
+  mkdir -p "$STAGE"
+  tar -xzf "$STAGE.tar.gz" -C "$STAGE" --strip-components=1 || die "Could not unpack the download. Nothing was changed."
+  rm -f "$STAGE.tar.gz"
+  is_own_checkout "$STAGE" || die "The download does not look like playwright-mcp. Nothing was changed."
+
+  INCOMING_VERSION="$(read_version "$STAGE/package.json")"
+  INSTALLED_VERSION=
+  if [ -f "$INSTALL_DIR/package.json" ]; then INSTALLED_VERSION="$(read_version "$INSTALL_DIR/package.json")"; fi
+  if [ -z "$INSTALLED_VERSION" ]; then
+    say "fresh install: ${INCOMING_VERSION:-unknown}"
+  elif [ -n "$INCOMING_VERSION" ] && version_is_older "$INCOMING_VERSION" "$INSTALLED_VERSION"; then
+    if [ "$FORCE" != yes ]; then
+      die "Refusing to downgrade: $INSTALL_DIR has $INSTALLED_VERSION and the download is $INCOMING_VERSION. Nothing was changed. Re-run with --force (or PLAYWRIGHT_MCP_FORCE=1) to install the older one anyway."
+    fi
+    warn "installed: $INSTALLED_VERSION -> $INCOMING_VERSION (downgrade, forced)"
+  elif [ "$INCOMING_VERSION" = "$INSTALLED_VERSION" ]; then
+    say "installed: $INSTALLED_VERSION -> $INCOMING_VERSION (already at this version; rebuilding it)"
+  else
+    say "installed: $INSTALLED_VERSION -> $INCOMING_VERSION"
+  fi
+  HERE="$STAGE"
+fi
+
 # ── 2. Install deps + build ───────────────────────────────────────────────────
 say "Installing dependencies…"
 ( cd "$HERE" && { npm ci 2>/dev/null || npm install; } )
@@ -231,6 +377,26 @@ say "Checking Chromium's system libraries…"
 # leaving every browser tool dead (measured 2026-09-26 on no-sudo hosting).
 say "Checking that the browser launches…"
 ( cd "$HERE" && node scripts/check-browser.mjs ) || die "No working browser. See the error above, fix it, and re-run this installer."
+
+# ── 3b. One-line install: record it, then swap it into place ──────────────────
+# Two renames: the old install steps aside, the new one takes its name, and only
+# then is the old one deleted. If the second rename fails the first is undone.
+if [ "$MODE" = bootstrap ]; then
+  node -e '
+    const [file, version, commit, source] = process.argv.slice(1);
+    const record = { version, commit: commit || null, source, installedAt: new Date().toISOString() };
+    require("fs").writeFileSync(file, JSON.stringify(record, null, 2) + "\n");
+  ' "$STAGE/.install.json" "${INCOMING_VERSION:-unknown}" "${COMMIT:-}" "$SOURCE_URL"
+  if [ -e "$INSTALL_DIR" ]; then mv "$INSTALL_DIR" "$OLD" || die "Could not move the previous install aside. Nothing was changed."; fi
+  if ! mv "$STAGE" "$INSTALL_DIR"; then
+    if [ -e "$OLD" ]; then mv "$OLD" "$INSTALL_DIR" || true; fi
+    die "Could not move the new build into $INSTALL_DIR. The previous install was put back."
+  fi
+  rm -rf "$OLD"
+  trap - EXIT INT TERM
+  HERE="$INSTALL_DIR"
+  say "Installed playwright-mcp ${INCOMING_VERSION:-unknown} at $HERE (recorded in $HERE/.install.json)"
+fi
 
 # ── 4. Register at user scope (idempotent) ────────────────────────────────────
 if command -v claude >/dev/null 2>&1; then
@@ -303,4 +469,5 @@ EOF
 }
 steer
 
-say "Done. Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."
+say "Done. playwright-mcp $(read_version "$HERE/package.json") is installed at $HERE."
+say "Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."
