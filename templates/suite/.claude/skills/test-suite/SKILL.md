@@ -9,6 +9,9 @@ Playwright e2e suite built on the playwright-mcp methodology pack: captured-sess
 reuse (`__SESSION_NAME__`), an environment guard on every invocation, report-only
 error capture, and an ENFORCING page-integrity gate.
 
+This skill exists in two copies, `.claude/skills/test-suite/` (Claude Code) and
+`.agents/skills/test-suite/` (Codex; Crush reads either). Any edit to one goes to both.
+
 <!-- origin: playwright-mcp suite_scaffold | modifiable: true -->
 ## Modes
 

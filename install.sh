@@ -3,7 +3,8 @@
 # install.sh — Linux/macOS installer for playwright-mcp.
 #
 # Builds the server, downloads headless Chromium, registers the server at USER
-# scope with Claude Code (so every project gets it), routes Claude's page
+# scope with Claude Code (so every project gets it), with Codex and with Crush
+# when they are installed, routes Claude's page
 # fetching and browser work to it, and appends a steering note to
 # ~/.claude/CLAUDE.md (once — guarded by a marker). Idempotent + non-interactive:
 # safe to re-run, never prompts.
@@ -417,6 +418,30 @@ if command -v codex >/dev/null 2>&1; then
 else
   warn "Skipped Codex registration. Run manually once 'codex' is installed:"
   echo "    codex mcp add playwright-mcp -- \"$NODE_CMD\" \"$HERE/dist/index.js\""
+fi
+
+# Crush has no `mcp add` subcommand, so merge-crush.mjs edits its global config:
+# an existing crush.json entry is updated in place, otherwise a marked block is
+# written to crushrc. A re-run changes nothing unless the install path moved.
+if command -v crush >/dev/null 2>&1; then
+  say "Registering playwright-mcp with Crush…"
+  if CRUSH_PREVIEW="$("$NODE_CMD" "$HERE/scripts/merge-crush.mjs" "$NODE_CMD" "$HERE/dist/index.js" --print)"; then
+    if [ -z "$CRUSH_PREVIEW" ]; then
+      say "Already registered with Crush — nothing to change."
+    else
+      echo "$CRUSH_PREVIEW"
+      if "$NODE_CMD" "$HERE/scripts/merge-crush.mjs" "$NODE_CMD" "$HERE/dist/index.js" --write; then
+        say "Registered with Crush. Restart Crush to load it."
+      else
+        warn "Could not write the Crush config shown above; Crush registration skipped."
+      fi
+    fi
+  else
+    warn "Skipped Crush registration (see the message above)."
+  fi
+else
+  warn "Skipped Crush registration. Once 'crush' is installed, add this line to ~/.config/crush/crushrc:"
+  echo "    mcp add playwright-mcp --type stdio --command '$NODE_CMD' --args '$HERE/dist/index.js' --timeout 300"
 fi
 
 # ── 5. Route fetching + browser work to playwright-mcp ────────────────────────

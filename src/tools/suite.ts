@@ -5,8 +5,10 @@
  * credentials, and env commands stay in the target repo.
  *
  *   suite_scaffold    — write templates/suite/* (methodology pack + a
- *                       project-local .claude/skills/test-suite skill) into a
- *                       target project. Superset of session_scaffold_tests.
+ *                       project-local test-suite skill, in .claude/skills for
+ *                       Claude Code and .agents/skills for Codex; Crush reads
+ *                       either) into a target project. Superset of
+ *                       session_scaffold_tests.
  *   suite_audit       — run a project's Playwright suite (or parse its last
  *                       JSON report) and return per-failure dossiers + the
  *                       TEST-DEFECT vs PRODUCT-BUG adjudication rubric. The
@@ -57,8 +59,9 @@ const scaffoldDefinition: Tool = {
     'Scaffold a full e2e TEST SUITE + methodology pack into a project: Playwright config ' +
     '(captured-session reuse, setup guard), environment guard (project-defined test-mode ' +
     'commands in e2e-suite.config.json), enforcing page-integrity gate, report-only error ' +
-    'capture, session-isolation rules, AND a project-local .claude/skills/test-suite skill ' +
-    'that teaches an AI to run/author/audit the suite. Use when a project needs an e2e ' +
+    'capture, session-isolation rules, AND a project-local test-suite skill that teaches an ' +
+    'AI to run/author/audit the suite, written to both .claude/skills/ (Claude Code) and ' +
+    '.agents/skills/ (Codex; Crush reads either). Use when a project needs an e2e ' +
     'suite built (superset of session_scaffold_tests). Writes only templates — no session ' +
     'data, no credentials; all project specifics stay in the target repo.',
   inputSchema: {
@@ -105,8 +108,10 @@ async function scaffoldHandler(args: Record<string, unknown>): Promise<CallToolR
       `  1. Fill e2e-suite.config.json (env.up/down = what "test mode" means for this app; may stay empty).\n` +
       `  2. Capture the login once: session_login({ name: "${session}", loginUrl: …, successSignal: …, headed: true }).\n` +
       `  3. npm i -D @playwright/test && npx playwright install chromium, then BASE_URL=… npx playwright test.\n` +
-      `  4. The generated .claude/skills/test-suite/ skill documents the run/author/audit discipline —\n` +
-      `     fill its "Project blanks" section with this project's fixtures and conventions.`;
+      `  4. The generated test-suite skill documents the run/author/audit discipline —\n` +
+      `     fill its "Project blanks" section with this project's fixtures and conventions.\n` +
+      `     It is written twice, .claude/skills/test-suite/ (Claude Code) and .agents/skills/test-suite/\n` +
+      `     (Codex); keep the two copies identical when you edit either.`;
     return { content: [{ type: 'text', text }] };
   } catch (err) {
     return {

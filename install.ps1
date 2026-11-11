@@ -1,7 +1,7 @@
 ﻿# install.ps1 — Windows installer for playwright-mcp (PowerShell 5.1+).
 #
 # Builds the server, downloads Chromium, registers it at USER scope with Claude
-# Code and Codex, routes Claude's page fetching and browser work to it, and
+# Code, Codex and Crush, routes Claude's page fetching and browser work to it, and
 # appends a steering note to ~\.claude\CLAUDE.md (once — guarded by a marker).
 # Idempotent + non-interactive: safe to re-run, never prompts.
 #
@@ -156,6 +156,8 @@ $hasClaude = [bool](Get-Command claude -ErrorAction SilentlyContinue)
 if (-not $hasClaude) { Warn "Claude Code CLI 'claude' not found — registration step will be skipped." }
 $hasCodex = [bool](Get-Command codex -ErrorAction SilentlyContinue)
 if (-not $hasCodex) { Warn "Codex CLI 'codex' not found — registration step will be skipped." }
+$hasCrush = [bool](Get-Command crush -ErrorAction SilentlyContinue)
+if (-not $hasCrush) { Warn "Crush CLI 'crush' not found — registration step will be skipped." }
 Say "Node $(node -v) OK"
 
 # ── 1b. One-line install: fetch the source into a staging folder ──────────────
@@ -309,6 +311,28 @@ if ($hasCodex) {
 } else {
   Warn "Skipped Codex registration. Run manually once 'codex' is installed:"
   Write-Host "    codex mcp add playwright-mcp -- node `"$entry`""
+}
+
+# Crush has no `mcp add` subcommand, so merge-crush.mjs edits its global config:
+# an existing crush.json entry is updated in place, otherwise a marked block is
+# written to crushrc. A re-run changes nothing unless the install path moved.
+if ($hasCrush) {
+  Say "Registering playwright-mcp with Crush…"
+  $mergeCrush = Join-Path $Here "scripts\merge-crush.mjs"
+  $crushPreview = node $mergeCrush node "$entry" --print
+  if ($LASTEXITCODE -ne 0) {
+    Warn "Skipped Crush registration (see the message above)."
+  } elseif (-not $crushPreview) {
+    Say "Already registered with Crush — nothing to change."
+  } else {
+    $crushPreview | ForEach-Object { Write-Host $_ }
+    node $mergeCrush node "$entry" --write
+    if ($LASTEXITCODE -eq 0) { Say "Registered with Crush. Restart Crush to load it." }
+    else { Warn "Could not write the Crush config shown above; Crush registration skipped." }
+  }
+} else {
+  Warn "Skipped Crush registration. Once 'crush' is installed, add this line to ~\.config\crush\crushrc:"
+  Write-Host "    mcp add playwright-mcp --type stdio --command node --args '$entry' --timeout 300"
 }
 
 # ── 5. Route fetching + browser work to playwright-mcp ────────────────────────

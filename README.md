@@ -131,6 +131,8 @@ irm https://raw.githubusercontent.com/odysseyalive/playwright-mcp/main/install.p
 
 On Linux and macOS the server goes in `~/.local/share/playwright-mcp`, or `$XDG_DATA_HOME/playwright-mcp` if you set that. On Windows it goes in `%LOCALAPPDATA%\playwright-mcp`. Set `PLAYWRIGHT_MCP_HOME` to an absolute path to put it somewhere else. The new copy is built and checked in a folder right next to that one, and it only replaces the old one after the browser launches. A run that fails partway leaves your existing install as it was. On Linux and macOS it needs curl or wget, plus tar.
 
+It registers the server with every client it finds on your PATH: Claude Code (at user scope), Codex, and Crush. For Crush it updates an existing `playwright-mcp` entry in your global `crush.json` if you already have one, and otherwise adds a marked block to your global `crushrc` with a 300-second timeout (Crush's default is 10). Both files live in `$CRUSH_GLOBAL_CONFIG` if you set it, or `~/.config/crush` otherwise. A client that isn't installed yet is skipped, and the installer prints the command to run later.
+
 The installer adds two entries to `permissions.deny` in `~/.claude/settings.json`: `WebFetch` and `mcp__claude-in-chrome`. They take the built-in fetcher and the Chrome extension out of Claude's way, so page fetches go to `web_fetch` and browser work goes to the `browser_*` tools. They don't block anything this server provides, and native WebSearch stays on. Everything else in the file is left alone, and re-running the installer changes nothing. It also adds a steering note to `~/.claude/CLAUDE.md` that tells Claude the same thing.
 
 ### Installing from a clone
@@ -165,6 +167,18 @@ npx playwright install chromium
 
 ```bash
 claude mcp add --scope user playwright-mcp -- node /ABSOLUTE/PATH/dist/index.js
+```
+
+For Codex:
+
+```bash
+codex mcp add playwright-mcp -- node /ABSOLUTE/PATH/dist/index.js
+```
+
+For Crush, add this line to `~/.config/crush/crushrc` (`%USERPROFILE%\.config\crush\crushrc` on Windows):
+
+```bash
+mcp add playwright-mcp --type stdio --command node --args /ABSOLUTE/PATH/dist/index.js --timeout 300
 ```
 
 ### Updating
@@ -245,7 +259,7 @@ The generated config resolves the storageState from the same path `session_login
 
 Beyond the basic scaffold, three `suite_*` tools carry a full, project-agnostic e2e methodology — distilled from running a large production regression suite — so an AI assistant can build, maintain, and audit test suites the same disciplined way in any project. All project specifics (fixtures, selectors, credentials, what "test mode" means) stay in the target repo; the server ships only templates, playbook text, and a report parser.
 
-- **`suite_scaffold`** — writes the full pack into a project: Playwright config with captured-session reuse, an environment guard driven by `e2e-suite.config.json` (your test-mode up/down commands, with took-effect verification), an ENFORCING page-integrity gate (rendered server errors, leaked template tokens, `undefined`/`NaN` text fail the test), report-only error capture, session-isolation rules — plus a generated `.claude/skills/test-suite/` skill that teaches the AI the run/author/audit discipline for that project.
+- **`suite_scaffold`** — writes the full pack into a project: Playwright config with captured-session reuse, an environment guard driven by `e2e-suite.config.json` (your test-mode up/down commands, with took-effect verification), an ENFORCING page-integrity gate (rendered server errors, leaked template tokens, `undefined`/`NaN` text fail the test), report-only error capture, session-isolation rules — plus a generated `test-suite` skill that teaches the AI the run/author/audit discipline for that project. The skill is written twice, to `.claude/skills/test-suite/` for Claude Code and `.agents/skills/test-suite/` for Codex, because neither reads the other's folder. Crush reads both and lists the skill once. Keep the two copies the same when you edit one.
 - **`suite_audit`** — runs a project's suite (`run: true`) or parses its last JSON report (`reportPath`), and returns per-failure dossiers plus the adjudication rubric: every failure is classified TEST-DEFECT (fix the script) or PRODUCT-BUG (report and hand off — never relax an assertion to go green). The judgment stays with the model; the tool makes the evidence cheap and structured.
 - **`suite_methodology`** — the playbook on demand (`overview` / `methodology` / `authoring` / `audit`), served from the same files the scaffolder installs, so there is exactly one source of truth.
 

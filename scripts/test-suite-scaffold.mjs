@@ -31,6 +31,11 @@ const KEY_FILES = [
   path.join('.claude', 'skills', 'test-suite', 'references', 'methodology.md'),
   path.join('.claude', 'skills', 'test-suite', 'references', 'authoring-workflow.md'),
   path.join('.claude', 'skills', 'test-suite', 'references', 'audit-workflow.md'),
+  // Codex reads project skills only from .agents/skills, so the skill is mirrored there.
+  path.join('.agents', 'skills', 'test-suite', 'SKILL.md'),
+  path.join('.agents', 'skills', 'test-suite', 'references', 'methodology.md'),
+  path.join('.agents', 'skills', 'test-suite', 'references', 'authoring-workflow.md'),
+  path.join('.agents', 'skills', 'test-suite', 'references', 'audit-workflow.md'),
 ];
 
 function withTmp(fn) {
@@ -90,6 +95,33 @@ test('refuses to overwrite an existing scaffold without force', () => {
   withTmp((out) => {
     suiteScaffold({ out });
     assert.throws(() => suiteScaffold({ out }), /refusing to overwrite/);
+  });
+});
+
+test('the .agents/skills mirror is byte-identical to .claude/skills', () => {
+  withTmp((out) => {
+    const written = suiteScaffold({ session: 'acme', project: 'shopfront', out });
+    const claude = written.filter((rel) => rel.startsWith(path.join('.claude', 'skills') + path.sep));
+    assert.ok(claude.length > 0, 'no .claude/skills files written');
+    for (const rel of claude) {
+      const mirror = path.join('.agents', 'skills', rel.slice(path.join('.claude', 'skills').length + 1));
+      assert.ok(written.includes(mirror), `no mirror written for ${rel}`);
+      assert.equal(
+        fs.readFileSync(path.join(out, mirror), 'utf8'),
+        fs.readFileSync(path.join(out, rel), 'utf8'),
+        `mirror differs: ${mirror}`,
+      );
+    }
+  });
+});
+
+test('an existing .agents/skills copy alone blocks the scaffold without force', () => {
+  withTmp((out) => {
+    const lone = path.join(out, '.agents', 'skills', 'test-suite', 'SKILL.md');
+    fs.mkdirSync(path.dirname(lone), { recursive: true });
+    fs.writeFileSync(lone, 'hand-edited');
+    assert.throws(() => suiteScaffold({ out }), /refusing to overwrite[\s\S]*\.agents/);
+    assert.equal(fs.readFileSync(lone, 'utf8'), 'hand-edited');
   });
 });
 

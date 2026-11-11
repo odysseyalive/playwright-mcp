@@ -1,8 +1,10 @@
 # E2E Suite — scaffolded by playwright-mcp `suite_scaffold`
 
 An authenticated Playwright regression suite carrying a battle-tested methodology pack,
-plus a project-local Claude skill (`.claude/skills/test-suite/`) that teaches an AI
-assistant how to run, author, and audit it safely.
+plus a project-local skill that teaches an AI assistant how to run, author, and audit it
+safely. The skill is written twice: `.claude/skills/test-suite/` for Claude Code and
+`.agents/skills/test-suite/` for Codex. Crush reads either. Keep the two copies identical
+when you edit one.
 
 ## What's here
 
@@ -14,7 +16,7 @@ assistant how to run, author, and audit it safely.
 | Session guard | `tests/auth.setup.ts` | fails loudly if the captured session is missing/stale — capture stays with `session_login` |
 | Fixture | `tests/fixture.ts` | import `{ test, expect }` from here: report-only error capture + ENFORCING page-integrity gate |
 | Helpers | `tests/helpers/*` | integrity scanner, error capture, session opt-in rules, config loader |
-| AI skill | `.claude/skills/test-suite/` | run/author/audit discipline for AI-assisted test work (methodology, workflows) |
+| AI skill | `.claude/skills/test-suite/`, `.agents/skills/test-suite/` | run/author/audit discipline for AI-assisted test work (methodology, workflows) |
 
 ## First run
 
@@ -55,4 +57,4 @@ To triage the last run instead, pass `reportPath: "test-results/last-run.json"`.
 
 The rule that keeps the suite honest: failures are classified
 TEST-DEFECT (fix the script) or PRODUCT-BUG (report + hand off — the spec is never
-relaxed to go green). Full workflow: `.claude/skills/test-suite/references/audit-workflow.md`.
+relaxed to go green). Full workflow: `references/audit-workflow.md` in either skill copy.

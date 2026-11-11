@@ -31,6 +31,20 @@ export const SUITE_TEMPLATE_DIR = path.resolve(
 );
 
 /**
+ * Skill folders are written twice. Claude Code reads project skills only from
+ * .claude/skills; Codex reads them only from .agents/skills (the Agent Skills
+ * path). Crush reads both and shows a skill once. So every template file under
+ * the first prefix is also written under the second.
+ */
+const SKILL_DIR = path.join('.claude', 'skills') + path.sep;
+const SKILL_MIRROR = path.join('.agents', 'skills') + path.sep;
+
+/** A template path plus its mirror, when it has one. */
+function destinations(rel: string): string[] {
+  return rel.startsWith(SKILL_DIR) ? [rel, SKILL_MIRROR + rel.slice(SKILL_DIR.length)] : [rel];
+}
+
+/**
  * Substituted values land inside TS string literals AND parsed JSON
  * (e2e-suite.config.json) — restrict to characters that are inert in both.
  */
@@ -83,6 +97,7 @@ export function scaffold({
   const files = walk(templateDir);
 
   const collisions = files
+    .flatMap(destinations)
     .map((rel) => path.join(out, rel))
     .filter((dest) => fs.existsSync(dest));
   if (collisions.length && !force) {
@@ -95,16 +110,18 @@ export function scaffold({
   const written: string[] = [];
   for (const rel of files) {
     const src = path.join(templateDir, rel);
-    const dest = path.join(out, rel);
     const body = fs
       .readFileSync(src, 'utf8')
       .split(PLACEHOLDER)
       .join(session)
       .split(PROJECT_PLACEHOLDER)
       .join(project);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, body);
-    written.push(rel);
+    for (const destRel of destinations(rel)) {
+      const dest = path.join(out, destRel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, body);
+      written.push(destRel);
+    }
   }
   return written;
 }
