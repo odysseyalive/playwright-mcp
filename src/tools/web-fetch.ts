@@ -13,7 +13,7 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 
-import { chromium, type Page } from 'playwright';
+import { chromium, type Page, type Response } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { getStealthContext, pace } from '../browser.js';
@@ -22,6 +22,7 @@ import {
   egressRestricted,
   assertEgressAllowed,
   installEgressGuard,
+  EgressBlockedError,
   type EgressGuardHandle,
 } from '../egress.js';
 import { guardOutbound, sessionAllowsUrl, wrapUntrusted } from '../exfil.js';
@@ -431,19 +432,32 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
   }
   try {
     await pace();
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: FETCH_TIMEOUT_MS });
+    // Wait for the document to COMMIT, then for DOMContentLoaded separately.
+    // DOMContentLoaded waits on every deferred and module script, so one stalled
+    // script (ntrs.nasa.gov serves its Angular bundle as `type=module`) used to
+    // time the whole goto out and throw away a server-rendered page that had
+    // already arrived in full. Same 20s budget; past it, extract what rendered.
+    const deadline = Date.now() + FETCH_TIMEOUT_MS;
+    const resp = await page.goto(url, { waitUntil: 'commit', timeout: FETCH_TIMEOUT_MS });
+    const loaded = await page
+      .waitForLoadState('domcontentloaded', { timeout: Math.max(1, deadline - Date.now()) })
+      .then(() => true, () => false);
     const status = resp?.status() ?? 0;
     const headers = resp?.headers() ?? {};
     const ctHeader = (headers['content-type'] ?? '').toLowerCase();
     const finalUrl = canonicalUrl(page.url());
 
     let result: FetchResult;
-    if (ctHeader.includes('application/pdf') || /\.pdf($|\?)/i.test(url)) {
-      const body = resp ? await resp.body().catch(() => undefined) : undefined;
-      const pdf = body ? await extractPdfText(new Uint8Array(body)) : { title: '', text: '' };
+    // A `.pdf` URL that answered with HTML (an error page, a wall) is a page, and
+    // is classified as one; it used to be fed to the PDF parser and come back
+    // "blocked" with no reason.
+    if (ctHeader.includes('application/pdf') || (/\.pdf($|\?)/i.test(url) && !ctHeader.includes('text/html'))) {
+      const got = resp ? await pdfBytes(page, resp) : 'there was no response to read';
+      const bytes = typeof got === 'string' ? undefined : got;
+      const pdf = bytes ? await extractPdfText(bytes) : { title: '', text: '' };
       result = {
         url: finalUrl,
-        fetchStatus: status === 404 ? '404' : pdf.text ? 'ok' : 'blocked',
+        fetchStatus: status === 404 ? '404' : bytes && status < 400 ? 'ok' : 'blocked',
         contentType: 'pdf',
         cms: 'PDF',
         text: pdf.text,
@@ -455,6 +469,14 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
           dateConfidence: 'low',
         },
       };
+      if (result.fetchStatus === 'blocked') {
+        result.error =
+          status >= 400
+            ? `the site answered HTTP ${status} for this PDF; retry later`
+            : `no PDF text could be read: ${typeof got === 'string' ? got : 'unknown reason'}`;
+      } else if (result.fetchStatus === 'ok' && !pdf.text) {
+        result.note = 'the PDF has no text layer (likely a scanned image); OCR is not done here';
+      }
     } else {
       await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
       // Dismiss any cookie-consent banner BEFORE extracting. On a link-dense
@@ -471,6 +493,12 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
       // carries a captcha widget is still a login page and must never open the
       // bot-wall window. Only a REDIRECT counts: fetching /login itself is fine.
       if (finalUrl !== url && looksLikeSignIn(finalUrl) && !looksLikeSignIn(url)) fetchStatus = 'login-wall';
+      // A server error that is not a wall (nginx's rate-limit 503 on ntrs.nasa.gov)
+      // used to come back 'ok' with the error page's text as the body. A challenge
+      // served with a 5xx (Cloudflare's 503) is already 'blocked' above and stays a
+      // wall; this one opens no window, since there is nothing for a human to solve.
+      const serverError = status >= 500 && fetchStatus !== 'blocked';
+      if (serverError) fetchStatus = 'blocked';
       const citation = extractCitation(html, finalUrl);
       if (!citation.title) citation.title = readable.title || finalUrl;
 
@@ -512,7 +540,9 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
           'a cookie-consent notice was returned instead of page content and could not be dismissed; ' +
           'the real content may still be in the DOM. Retry, or add an accept selector to ACCEPT_SELECTORS in src/consent.ts';
       }
-      if (fetchStatus === 'blocked') {
+      if (serverError) {
+        result.error = `the site answered HTTP ${status} (unavailable or rate-limited); retry shortly`;
+      } else if (fetchStatus === 'blocked') {
         walled.add(result);
         const vendor = wallVendor(html);
         result.error =
@@ -529,9 +559,13 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
       }
     }
 
+    if (!loaded) {
+      result = withNote(result, `the page had not finished loading after ${FETCH_TIMEOUT_MS / 1000}s; this is what had rendered`);
+    }
     if (opts.quality === 'research') result.appraisalRequested = true;
-    // A wall is not cached: the next fetch, or the retry after a solve, must see the page again.
-    if (!walled.has(result)) cache.set(cacheKey, result);
+    // A failure is not cached: a wall must be seen again after a solve, and a
+    // transient one (a 503, a half-loaded page) must not stick for five minutes.
+    if (!walled.has(result) && !result.error && loaded) cache.set(cacheKey, result);
     return result;
   } catch (err) {
     // A refused redirect hop reaches here as a bare chromium error code, so the
@@ -551,6 +585,44 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
         );
   } finally {
     await cleanup?.();
+  }
+}
+
+/** A PDF's header may sit anywhere in its first kilobyte (PDF 1.7, 7.5.2 note). */
+function isPdf(bytes: Uint8Array): boolean {
+  return Buffer.from(bytes.subarray(0, 1024)).includes('%PDF-');
+}
+
+/**
+ * The PDF's own bytes, or a server-authored reason there are none. Real Chrome renders a PDF navigation in its built-in
+ * viewer, and the navigation response's body() is then the viewer's 601-byte
+ * HTML stub, not the document: every PDF came back empty and "blocked". The
+ * bundled Chromium hands over the real body, so that is tried first; otherwise
+ * the same URL is fetched again through the page's context, which carries its
+ * cookies, UA and any session jar.
+ *
+ * That second request is not seen by the page's egress guard, so on the remote
+ * instance it is held to what the guard enforces: the URL the navigation
+ * actually landed on, re-validated, and no redirect followed.
+ */
+async function pdfBytes(page: Page, resp: Response): Promise<Uint8Array | string> {
+  const body = await resp.body().catch(() => undefined);
+  if (body && isPdf(body)) return new Uint8Array(body);
+  try {
+    const restricted = egressRestricted();
+    if (restricted) await assertEgressAllowed(resp.url());
+    const again = await page.context().request.get(resp.url(), {
+      timeout: FETCH_TIMEOUT_MS,
+      ...(restricted ? { maxRedirects: 0 } : {}),
+    });
+    if (!again.ok()) return `the site answered HTTP ${again.status()} when the PDF's bytes were requested; retry shortly`;
+    const bytes = new Uint8Array(await again.body());
+    return isPdf(bytes) ? bytes : 'the response was labelled a PDF but its bytes are not one';
+  } catch (err) {
+    // Server-authored only: a caught message is page-influenced and has no place in `error`.
+    return err instanceof EgressBlockedError
+      ? 'the PDF host was refused by the egress guard'
+      : 'the request for the PDF\'s bytes failed or timed out';
   }
 }
 
