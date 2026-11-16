@@ -380,6 +380,10 @@ export function resolveServed(realRoot: string, urlPath: string): string | null 
     return null;
   }
   if (!real.startsWith(realRoot + path.sep)) return null;
+  // The name checks above saw the REQUESTED path; a symlink inside the root can still
+  // resolve to a hidden or unlisted file there (x.png -> .env). Re-check the resolved one.
+  if (path.relative(realRoot, real).split(path.sep).some((p) => p.startsWith('.'))) return null;
+  if (!MIME[path.extname(real).toLowerCase()]) return null;
   try {
     if (!fs.statSync(real).isFile()) return null;
   } catch {
@@ -1113,7 +1117,9 @@ async function recordOne(
  * reading a sibling file and sending it anywhere: there is nowhere to send it.
  * Service workers are blocked at context creation (they would answer requests
  * this route never sees) and RTCPeerConnection is removed by an init script (a
- * STUN/TURN candidate is a network channel outside HTTP). Vendor assets into the
+ * STUN/TURN candidate is a network channel outside HTTP). The init script runs in
+ * every frame, so a fresh iframe's copy is gone too; test-movie.mjs proves it with
+ * a UDP counter, and fails when the script is removed. Vendor assets into the
  * mock-up's folder instead of linking a CDN.
  */
 async function isolateMockup(context: BrowserContext, origin: string): Promise<void> {

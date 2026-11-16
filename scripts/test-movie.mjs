@@ -10,6 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import dgram from 'node:dgram';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -93,13 +94,16 @@ function mockupTree() {
   fs.writeFileSync(path.join(dir, 'notes.md'), 'unknown extension');
   fs.writeFileSync(path.join(outside, 'secret.html'), 'escaped');
   fs.symlinkSync(path.join(outside, 'secret.html'), path.join(dir, 'link.html'));
+  // In-root symlinks whose NAME passes but whose target is hidden or an unlisted type.
+  fs.symlinkSync(path.join(dir, '.env'), path.join(dir, 'dotlink.html'));
+  fs.symlinkSync(path.join(dir, 'notes.md'), path.join(dir, 'mdlink.html'));
   return { dir: fs.realpathSync(dir), outside };
 }
 
 test('resolveServed: only non-hidden files with a known type, inside the resolved root', () => {
   const { dir } = mockupTree();
   assert.equal(m.resolveServed(dir, '/index.html?x=1'), path.join(dir, 'index.html'));
-  for (const bad of ['/.env', '/.git/x.html', '/../outside/secret.html', '/%2e%2e/x.html', '/link.html', '/notes.md', '/', '/a%5c..%5cb.html', '/%00.html'])
+  for (const bad of ['/.env', '/.git/x.html', '/../outside/secret.html', '/%2e%2e/x.html', '/link.html', '/dotlink.html', '/mdlink.html', '/notes.md', '/', '/a%5c..%5cb.html', '/%00.html'])
     assert.equal(m.resolveServed(dir, bad), null, bad);
 });
 
@@ -248,6 +252,46 @@ test(
     assert.equal(m.describeJob('browser-test').clips.length, 1);
     m.removeJob('browser-test');
     assert.equal(fs.existsSync(r.dir), false);
+  },
+);
+
+test(
+  'recordMovie: a mock-up cannot reach the network over WebRTC, even with an iframe\'s fresh RTCPeerConnection',
+  { skip: BROWSER_TESTS ? false : 'opt-in: needs a real chrome (PLAYWRIGHT_MCP_TEST_BROWSER=1)', timeout: 120_000 },
+  async () => {
+    // A UDP socket stands in for a STUN server; any binding request that reaches it is a leak.
+    let packets = 0;
+    const udp = dgram.createSocket('udp4');
+    udp.on('message', () => (packets += 1));
+    await new Promise((r) => udp.bind(0, '127.0.0.1', r));
+    const port = udp.address().port;
+    const html = `<p id=done></p><script>
+      const f = document.createElement('iframe');
+      document.body.appendChild(f);
+      const PC = window.RTCPeerConnection || f.contentWindow.RTCPeerConnection;
+      document.title = PC ? 'pc-recovered' : 'pc-gone';
+      try {
+        const pc = new PC({ iceServers: [{ urls: 'stun:127.0.0.1:${port}' }] });
+        pc.createDataChannel('x');
+        pc.createOffer().then((o) => pc.setLocalDescription(o));
+      } catch {}
+      setTimeout(() => (document.getElementById('done').textContent = 'done'), 2500);
+    </script>`;
+    try {
+      const r = await m.recordMovie({
+        job: 'webrtc-test',
+        scriptName: 'inline',
+        steps: m.parseSteps([{ action: 'wait', target: 'text=done', holdMs: 300 }]),
+        targets: [{ label: 'mockup', html }],
+        viewports: [m.VIEWPORT_PRESETS.phone],
+        schemes: ['light'],
+      });
+      assert.equal(r.clips[0].error, undefined);
+      assert.equal(packets, 0, 'no STUN packet left the browser');
+      m.removeJob('webrtc-test');
+    } finally {
+      udp.close();
+    }
   },
 );
 
