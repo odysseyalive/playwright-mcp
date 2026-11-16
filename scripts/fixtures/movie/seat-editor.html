@@ -1,0 +1,162 @@
+<!doctype html>
+<!--
+  Mock-up fixture for the movie_* tools (scripts/test-movie.mjs and the acceptance run).
+  A wheelchair companion-seat editor: pick a wheelchair space, swap its companion seat,
+  confirm a "short" space. Plain JS, no network, light + dark via prefers-color-scheme.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accessible seating editor (mock-up)</title>
+<style>
+  :root { --bg:#f7f7f4; --card:#fff; --ink:#1d2330; --muted:#5d6577; --line:#d9dce3;
+          --seat:#e6e9ef; --wc:#1f6feb; --wc-ink:#fff; --comp:#2da44e; --short:#bf8700; --sel:#d1242f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#10141b; --card:#171c25; --ink:#e6e9ef; --muted:#9aa3b5; --line:#2b3240;
+            --seat:#252c39; --wc:#4c8dff; --wc-ink:#0b0e13; --comp:#3fb950; --short:#d29922; --sel:#ff6b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.4 system-ui, sans-serif; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header span { color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns: 1fr 300px; gap:16px; padding:16px; }
+  @media (max-width: 720px) { main { grid-template-columns: 1fr; } }
+  .stage { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; overflow-x:auto; }
+  .screen { text-align:center; font-size:11px; letter-spacing:.2em; color:var(--muted); border-top:3px solid var(--line); margin-bottom:12px; padding-top:4px; }
+  .row { display:flex; gap:6px; align-items:center; margin:6px 0; }
+  .row b { width:18px; color:var(--muted); font-size:12px; }
+  .seat { width:30px; height:30px; border-radius:6px; border:0; background:var(--seat); color:var(--ink); font-size:11px; cursor:pointer; }
+  .seat.wc { background:var(--wc); color:var(--wc-ink); width:44px; font-weight:600; }
+  .seat.wc.short { outline:3px dashed var(--short); outline-offset:1px; }
+  .seat.comp { background:var(--comp); color:#fff; }
+  .seat.selected { box-shadow:0 0 0 3px var(--sel); }
+  .seat.candidate { box-shadow:0 0 0 2px var(--comp) inset; }
+  aside { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  aside h2 { font-size:15px; margin:0 0 8px; }
+  aside p { margin:6px 0; color:var(--muted); }
+  .actions { display:flex; flex-direction:column; gap:8px; margin-top:12px; }
+  button.act { padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); font:inherit; cursor:pointer; text-align:left; }
+  button.act.primary { background:var(--wc); color:var(--wc-ink); border-color:transparent; }
+  button.act[disabled] { opacity:.45; cursor:not-allowed; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:20px; font-size:12px; background:var(--short); color:#000; }
+  .toast { margin-top:12px; padding:8px 10px; border-radius:8px; background:var(--comp); color:#fff; display:none; }
+  .toast.on { display:block; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; color:var(--muted); font-size:12px; }
+  .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:-2px; margin-right:4px; }
+</style>
+</head>
+<body>
+<header><h1>Accessible seating editor</h1><span>Hall A · mock-up</span></header>
+<main>
+  <section class="stage" aria-label="Seat map">
+    <div class="screen">STAGE</div>
+    <div id="grid"></div>
+    <div class="legend">
+      <span><i style="background:var(--wc)"></i>Wheelchair space</span>
+      <span><i style="background:var(--comp)"></i>Companion seat</span>
+      <span><i style="outline:2px dashed var(--short);background:transparent"></i>Short space</span>
+    </div>
+  </section>
+  <aside aria-live="polite">
+    <h2 id="panel-title">No space selected</h2>
+    <p id="panel-body">Select a wheelchair space on the map to edit its companion seat.</p>
+    <div class="actions">
+      <button class="act" id="swap" disabled>Swap companion seat</button>
+      <button class="act primary" id="confirm-short" disabled hidden>Confirm short space</button>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+  </aside>
+</main>
+<script>
+  // Rows A..D, 10 seats each. Wheelchair spaces sit at fixed positions; each owns one companion seat.
+  const ROWS = ['A', 'B', 'C', 'D'];
+  const spaces = {
+    W1: { row: 'B', at: 2, companion: 'B3', short: false },
+    W2: { row: 'B', at: 8, companion: 'B7', short: true, confirmed: false },
+    W3: { row: 'D', at: 5, companion: 'D6', short: false },
+  };
+  let selected = null;
+  let swapping = false;
+  const grid = document.getElementById('grid');
+  const $ = (id) => document.getElementById(id);
+
+  function render() {
+    grid.textContent = '';
+    for (const r of ROWS) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<b>${r}</b>`;
+      for (let n = 1; n <= 10; n++) {
+        const wc = Object.entries(spaces).find(([, s]) => s.row === r && s.at === n);
+        const b = document.createElement('button');
+        if (wc) {
+          const [id, s] = wc;
+          b.className = 'seat wc' + (s.short && !s.confirmed ? ' short' : '') + (selected === id ? ' selected' : '');
+          b.textContent = id;
+          b.dataset.space = id;
+          b.setAttribute('aria-label', `Wheelchair space ${id}`);
+          b.onclick = () => select(id);
+        } else {
+          const seat = `${r}${n}`;
+          const comp = Object.values(spaces).some((s) => s.companion === seat);
+          const sel = selected && spaces[selected];
+          const near = sel && swapping && sel.row === r && Math.abs(sel.at - n) <= 2 && !comp;
+          b.className = 'seat' + (comp ? ' comp' : '') + (near ? ' candidate' : '');
+          b.textContent = n;
+          b.dataset.seat = seat;
+          b.setAttribute('aria-label', `Seat ${seat}`);
+          b.onclick = () => pickCompanion(seat, near);
+        }
+        row.appendChild(b);
+      }
+      grid.appendChild(row);
+    }
+    panel();
+  }
+
+  function panel() {
+    const s = selected && spaces[selected];
+    $('swap').disabled = !s;
+    $('swap').textContent = swapping ? 'Pick a highlighted seat…' : 'Swap companion seat';
+    $('confirm-short').hidden = !(s && s.short);
+    $('confirm-short').disabled = !(s && s.short && !s.confirmed);
+    if (!s) return;
+    $('panel-title').innerHTML = `Space ${selected}` + (s.short ? ' <span class="badge">short</span>' : '');
+    $('panel-body').textContent = `Row ${s.row}, position ${s.at}. Companion seat: ${s.companion}.` +
+      (s.short ? (s.confirmed ? ' Short space confirmed.' : ' This space is shorter than standard and needs confirming.') : '');
+  }
+
+  function toast(msg) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+  }
+
+  function select(id) {
+    selected = id;
+    swapping = false;
+    $('toast').classList.remove('on');
+    render();
+  }
+
+  function pickCompanion(seat, allowed) {
+    if (!swapping || !allowed) return;
+    const from = spaces[selected].companion;
+    spaces[selected].companion = seat;
+    swapping = false;
+    render();
+    toast(`Companion seat for ${selected} moved from ${from} to ${seat}.`);
+  }
+
+  $('swap').onclick = () => { swapping = !swapping; render(); };
+  $('confirm-short').onclick = () => {
+    spaces[selected].confirmed = true;
+    render();
+    toast(`Short space ${selected} confirmed.`);
+  };
+  render();
+</script>
+</body>
+</html>

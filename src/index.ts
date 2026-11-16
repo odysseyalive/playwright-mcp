@@ -139,6 +139,17 @@ function buildInstructions(
         'generate a deterministic Playwright suite (setup-project + dependencies) that reuses it — no model in the loop.',
     );
   }
+  if (names.has('movie_record')) {
+    lines.push(
+      '',
+      'SHOW A GUI CHANGE AS A VIDEO: movie_record renders a mock-up (HTML file or string, served on its own ' +
+        'loopback server) or a live local page, runs a step list (click/type/hover/press/wait/scroll + caption + ' +
+        'highlight) and writes captioned clips per viewport (desktop/phone) and light/dark into one job folder: ' +
+        '.webm + .png poster always, .mp4/.gif/before-after side-by-side when ffmpeg allows. Save the steps with ' +
+        'movie_script_save to re-run after the mock-up changes; movie_list hands off paths, sizes and durations; ' +
+        'movie_clean deletes the job when it is complete. Own browser, NOT queued.',
+    );
+  }
   if (names.has('suite_scaffold') || names.has('suite_methodology')) {
     lines.push(
       '',
@@ -195,6 +206,15 @@ const ALWAYS_DENIED = new Set([
   'session_scaffold_tests',
   'suite_scaffold',
   'suite_audit',
+  // The movie_* family reads local files (a mock-up and its folder), writes and
+  // deletes under the host's config dir, spawns ffmpeg, and can load a captured
+  // session — host-fs power with no human gate, the same class as suite_scaffold.
+  // Local stdio only (DEC-2026-11-16-movie-tools-scripted-recorder).
+  'movie_script_save',
+  'movie_script_list',
+  'movie_record',
+  'movie_list',
+  'movie_clean',
 ]);
 const CLOUD_DENIED = new Set([
   'session_login',
@@ -366,6 +386,22 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
   browser_lease_release:
     'releaseHandler (src/tools/lease.ts) returns BrowserQueue.release’s fixed notes (src/queue.ts) ' +
     'about the caller’s own token. No browser is touched.',
+  movie_script_save:
+    'scriptSaveHandler (src/tools/movie.ts) echoes the caller’s own script name and step count. ' +
+    'Nothing is rendered or fetched.',
+  movie_script_list:
+    'scriptListHandler (src/tools/movie.ts) returns step lists the caller saved, read back through ' +
+    'parseSteps’ closed vocabulary (src/movie.ts). No page is involved.',
+  movie_record:
+    'recordHandler (src/tools/movie.ts) reports paths, sizes, durations and ffmpeg notes this server ' +
+    'wrote. The one page-derived span — a clip’s Playwright error, which can quote the page’s DOM — ' +
+    'is lifted out of the JSON by splitErrors and appended through wrapUntrusted. No page title, URL ' +
+    'or text is otherwise captured.',
+  movie_list:
+    'listHandler (src/tools/movie.ts) reports the job manifest and file stats; the stored clip errors ' +
+    'are page-derived and are appended through wrapUntrusted, outside the JSON.',
+  movie_clean:
+    'cleanHandler (src/tools/movie.ts) reports the folder it removed and its byte count. No browser.',
 };
 
 /**

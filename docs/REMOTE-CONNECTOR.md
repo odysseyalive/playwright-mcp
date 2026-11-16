@@ -30,12 +30,14 @@ The remote surface deliberately differs from the local one:
   `browser_evaluate` injects script into page context. It does neither, and the
   connector keeps its stated purpose without it.
 - **Denylisted remotely** (filtered from `tools/list` **and** rejected by
-  `tools/call`), in two tiers. Six are denied on every non-stdio surface,
+  `tools/call`), in two tiers. Eleven are denied on every non-stdio surface,
   including the local no-auth option: `browser_run_code_unsafe`,
   `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`,
-  `suite_scaffold`, `suite_audit`. Four more are denied on the cloud (OAuth)
+  `suite_scaffold`, `suite_audit`, and the five `movie_*` tools (they read
+  local files, write and delete under the config dir, run ffmpeg, and can load
+  a saved session). Four more are denied on the cloud (OAuth)
   surface only: `session_login`, `session_status`, `session_solve_challenge`,
-  `session_attach`. The cloud surface drops all ten. The no-auth surface keeps
+  `session_attach`. The cloud surface drops all fifteen. The no-auth surface keeps
   the second group because none of them act autonomously. Three open a headed
   window for the human; `session_status` only reports whether a saved session
   exists. None of this touches the local stdio surface. Claude Code on your own

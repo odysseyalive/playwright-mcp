@@ -4,7 +4,7 @@ One install, every Claude Code project gets a real browser. Page fetching with c
 
 ## What it is
 
-An MCP server that wraps `@playwright/mcp` and adds eleven tools of its own for page fetching, authenticated sessions, test suites, and sharing the browser between agents. The installer points Claude at it: page fetches go to `web_fetch` instead of the built-in WebFetch, and browser work goes to the `browser_*` tools instead of the claude-in-chrome extension. The extra features just come along for free.
+An MCP server that wraps `@playwright/mcp` and adds sixteen tools of its own for page fetching, authenticated sessions, test suites, sharing the browser between agents, and recording GUI demo videos. The installer points Claude at it: page fetches go to `web_fetch` instead of the built-in WebFetch, and browser work goes to the `browser_*` tools instead of the claude-in-chrome extension. The extra features just come along for free.
 
 ### How it layers in
 
@@ -18,13 +18,14 @@ This server has nothing to do with web search. Claude runs its own native WebSea
 
 ### The tools
 
-Thirty-four total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The eleven custom ones:
+Thirty-nine total. Twenty-three are the wrapped `browser_*` set (navigate, snapshot, click, screenshot, and the rest). The sixteen custom ones:
 
 - **`web_fetch`** stealth-renders a URL (HTML or PDF), returns readable text plus the citation and health data described above. When a page comes back as a CAPTCHA or bot wall, it opens the same window `session_solve_challenge` does, sends a desktop notification on Linux, and waits up to 90 seconds for you to clear it, then retries. If you're not there, the fetch comes back blocked with a note that a window is waiting for you at that host. The window stays open for up to 30 minutes, and once you solve it the next fetch goes straight through. The clearance is saved as `wall-<host>` and every later fetch to that host reuses it until it lapses, so you only see the window again when the site asks again. That happens on stdio and the local surface, never on the cloud one.
 - **`session_login`**, **`session_status`**, **`session_solve_challenge`**, and **`session_attach`** handle authenticated sessions across your projects. Capture a logged-in session once to a mode-600 storageState file, then reuse it for interactive debugging and generated Playwright test suites in whatever project you're working on. `session_solve_challenge` clears CAPTCHAs and bot walls the same way. `session_attach` binds a captured session to the `browser_*` tools so interactive browsing is authenticated too. For any login, call `session_login({headed:true})` and let the human handle the whole thing in the headed window. Password, 2FA, SSO, CAPTCHA, whatever the site throws. The window opens with a second tab holding an "I'm signed in, save it" button. Log in however the site needs, including hops to other sites, email links and 2FA, then press it. Nothing tries to guess when a login is finished, because every site does it differently. There is no time limit on the stdio surface, and closing the window cancels.
 - **`session_scaffold_tests`** generates a deterministic Playwright E2E test suite into any project, wired to reuse a session captured by `session_login`. No model in the loop. Just `npx playwright test`.
 - **`suite_scaffold`**, **`suite_audit`**, and **`suite_methodology`** carry a full e2e test-suite methodology. Scaffold the complete pack into any project, audit results with per-failure dossiers, or pull the playbook on demand. More in the Test-suite builder section below.
 - **`browser_lease_acquire`** and **`browser_lease_release`** hold the shared browser for a multi-step turn. See the next section.
+- **`movie_record`**, **`movie_script_save`**, **`movie_script_list`**, **`movie_list`**, and **`movie_clean`** record short captioned videos of a GUI, so a proposed interface change can be shown in motion instead of described. More in the GUI demo videos section below.
 
 ### One browser, many agents: the queue
 
@@ -265,6 +266,45 @@ Beyond the basic scaffold, three `suite_*` tools carry a full, project-agnostic 
 
 `suite_scaffold` and `suite_audit` are local-only (remote-denylisted) like the session tools; `suite_methodology` is available everywhere.
 
+## GUI demo videos
+
+A screenshot shows one state. When you're proposing a change to an interface, the interesting part is usually what happens when somebody uses it. The `movie_*` tools record that.
+
+Write the mock-up as an HTML file (or pass the HTML as a string), save the walk-through as a named step list, and record it:
+
+```text
+movie_script_save({ name: "swap-companion", steps: [
+  { action: "click", target: "[data-space=W1]", caption: "Select space W1" },
+  { action: "click", target: "#swap", highlight: true, caption: "Nearby free seats light up" },
+  { action: "click", target: "[data-seat=B1]", highlight: true, highlightStyle: "spotlight", caption: "Pick the new companion seat" }
+]})
+movie_record({ job: "seating-review", scriptName: "swap-companion",
+  targets: [{ label: "mockup", file: "/path/to/seat-editor.html" }],
+  viewports: ["desktop", "phone"], schemes: ["light", "dark"] })
+```
+
+That's four clips, one per viewport and color scheme. Each one has a visible cursor, a ripple on every click, the step captions along the bottom, highlight boxes where the step asks for them, and a corner badge with the target's label. Those overlays are drawn into the page itself, so none of them need ffmpeg. The steps are a closed set: `navigate`, `click`, `type`, `hover`, `press`, `wait`, `scroll`. There's no script evaluation and no file upload. Change the mock-up, call `movie_record` again with the same job and script, and the clips are replaced in place.
+
+A mock-up file is served from a loopback HTTP server the tool starts for the call, confined to the mock-up's own folder. Hidden files are never served, and neither is anything a symlink points outside the folder. You don't need `file://` or a hand-run `python -m http.server`. A mock-up runs offline: it can load anything in its own folder and nothing from anywhere else. Requests off the loopback server are refused, WebSockets are closed, and service workers and WebRTC are switched off, so a mock-up can't read a file next to it and send it somewhere. Copy fonts and libraries into the folder instead of linking a CDN. A target can also be a `url`, which is how you record a live local dev page. Pass `session` with the name of a `session_login` capture for a page behind a login. The session only goes to `url` targets on the domains it was captured on. A mock-up never gets it, because cookies ignore ports and the mock-up's own script would otherwise be able to read a localhost session.
+
+For a before/after, give two targets and `sideBySide: true`. Mark steps the old page can't do as `optional: true` and they're skipped there, with a note.
+
+Everything for a job lands in one folder: `~/.config/playwright-mcp/movies/jobs/<job>/` (or under `PLAYWRIGHT_MCP_MOVIES`, for a host that only lets output land in one place). Saved scripts sit beside the jobs in `movies/scripts/`. Both are owner-only. `movie_list({job})` returns the absolute paths, byte sizes, durations and posters, and flags anything over 15 MB, the claude.ai artifact embed limit. `movie_clean({job})` deletes the folder when the job is done. It only removes folders `movie_record` made, and it refuses a symlink.
+
+What you get depends on ffmpeg:
+
+| Output | Needs |
+|---|---|
+| `.webm` clip, `.png` poster | nothing beyond the installed browser |
+| `.mp4` (H.264, plays everywhere) | an ffmpeg with an h264 encoder |
+| `.gif` preview (`gif: true`) | an ffmpeg with the gif encoder |
+| before/after side-by-side | an ffmpeg with the hstack filter |
+| durations read from the file | ffprobe (otherwise the recording is timed) |
+
+ffmpeg is looked up on `PATH`, or set `PLAYWRIGHT_MCP_FFMPEG` and `PLAYWRIGHT_MCP_FFPROBE`. Playwright's own bundled ffmpeg only encodes VP8, so it can't make any of the extras. When something is skipped, the `movie_record` result says what and why.
+
+Recording runs in its own browser, so it doesn't wait on the shared `browser_*` queue. There's no interactive mode yet, where you'd start recording, drive the page with `browser_*` and then stop. The scripted recorder is the supported path. The `movie_*` tools are local-only, denied on every HTTP surface: they read local files, write and delete under your config directory, run ffmpeg, and can load a saved login.
+
 ## Untrusted content and prompt injection
 
 Every page this server fetches is controlled by somebody else. A page carrying instructions aimed at the model reading it is indirect prompt injection, and no known mitigation fully prevents it. What follows is what this server does about it, and what it does not fix.
@@ -295,7 +335,7 @@ Escape hatches are environment variables (`PLAYWRIGHT_MCP_FETCH_LIMIT`, `PLAYWRI
 
 On the remote surface (`PLAYWRIGHT_MCP_PUBLIC_URL` set), `assertEgressAllowed` blocks targets that resolve to private or metadata addresses. Per-hop redirect re-validation catches redirect chains that land on a private address after the initial URL passed. Both apply to `web_fetch`'s page and to the `browser_*` browser, which this server launches and hands to `@playwright/mcp`. For `browser_*` the check covers every request in the browser context, every redirect hop, and WebSockets. Upstream's own `network.blockedOrigins` list is a second layer on top. The OS-level nftables egress block ([docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md) section 6) is the primary SSRF control. The in-process checks are the backstop.
 
-Tools are stripped by tier. `browser_run_code_unsafe`, `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, and `suite_audit` are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`. The operator's own stdio surface (Claude Code) keeps every tool. These denylists only apply to the HTTP transport. On the HTTP surfaces where `session_login` and `session_solve_challenge` are allowed (local no-auth), they keep a bounded 300-second default because the headed window would open on the server host where nobody is sitting. The full tier distinction is in [docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md).
+Tools are stripped by tier. `browser_run_code_unsafe`, `browser_evaluate`, `browser_file_upload`, `session_scaffold_tests`, `suite_scaffold`, `suite_audit`, and the five `movie_*` tools are denied on every non-stdio surface. `session_login`, `session_status`, `session_solve_challenge`, and `session_attach` are denied on the cloud (OAuth) surface too. Filtering hits both `tools/list` and `tools/call`. The operator's own stdio surface (Claude Code) keeps every tool. These denylists only apply to the HTTP transport. On the HTTP surfaces where `session_login` and `session_solve_challenge` are allowed (local no-auth), they keep a bounded 300-second default because the headed window would open on the server host where nobody is sitting. The full tier distinction is in [docs/REMOTE-CONNECTOR.md](docs/REMOTE-CONNECTOR.md).
 
 ### What this does not fix
 

@@ -1,7 +1,8 @@
 /**
  * Custom tool registry — tools added on top of the wrapped @playwright/mcp set.
  *
- * Tools: web_fetch (stealth render + citations) and the session helpers.
+ * Tools: web_fetch (stealth render + citations), the session helpers, the
+ * test-suite tools, the browser lease, and the movie_* GUI demo recorder.
  * Web search/discovery runs on Claude's native server-side WebSearch, layered
  * with web_fetch as a double-check by the session-side web-search skill — so the
  * scraping web_search/deep_research tools were removed
@@ -58,6 +59,13 @@ import {
 import { sessionScaffoldTool } from './tools/scaffold.js';
 import { suiteScaffoldTool, suiteAuditTool, suiteMethodologyTool } from './tools/suite.js';
 import { leaseAcquireTool, leaseReleaseTool } from './tools/lease.js';
+import {
+  movieScriptSaveTool,
+  movieScriptListTool,
+  movieRecordTool,
+  movieListTool,
+  movieCleanTool,
+} from './tools/movie.js';
 
 const registry: CustomTool[] = [
   webFetch,
@@ -71,6 +79,11 @@ const registry: CustomTool[] = [
   suiteMethodologyTool,
   leaseAcquireTool,
   leaseReleaseTool,
+  movieScriptSaveTool,
+  movieScriptListTool,
+  movieRecordTool,
+  movieListTool,
+  movieCleanTool,
 ];
 
 export const customTools: Tool[] = registry.map((t) => t.definition);

@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+  The "before" half of the movie_* before/after fixture: the current seating editor, which
+  lists wheelchair spaces as a table and has no companion-seat swap or short-space confirm.
+  Same data-space hooks as seat-editor.html so one script drives both.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accessible seating (current)</title>
+<style>
+  :root { --bg:#fff; --ink:#222; --line:#ccc; --sel:#ffe9a8; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181d; --ink:#ddd; --line:#444; --sel:#4a3d12; } }
+  body { margin:0; padding:18px; background:var(--bg); color:var(--ink); font:15px/1.4 system-ui, sans-serif; }
+  h1 { font-size:18px; }
+  table { border-collapse:collapse; width:100%; max-width:560px; }
+  td, th { border:1px solid var(--line); padding:8px; text-align:left; }
+  tr.selected td { background:var(--sel); }
+  button { font:inherit; }
+  #detail { margin-top:14px; }
+</style>
+</head>
+<body>
+<h1>Accessible seating</h1>
+<table>
+  <thead><tr><th>Space</th><th>Row</th><th>Companion</th><th></th></tr></thead>
+  <tbody>
+    <tr data-row="W1"><td>W1</td><td>B</td><td>B3</td><td><button data-space="W1">Select</button></td></tr>
+    <tr data-row="W2"><td>W2</td><td>B</td><td>B7</td><td><button data-space="W2">Select</button></td></tr>
+    <tr data-row="W3"><td>W3</td><td>D</td><td>D6</td><td><button data-space="W3">Select</button></td></tr>
+  </tbody>
+</table>
+<p id="detail">Select a space. To change a companion seat, contact the box office.</p>
+<script>
+  for (const b of document.querySelectorAll('button[data-space]')) {
+    b.onclick = () => {
+      for (const tr of document.querySelectorAll('tr.selected')) tr.classList.remove('selected');
+      document.querySelector(`tr[data-row="${b.dataset.space}"]`).classList.add('selected');
+      document.getElementById('detail').textContent = `Space ${b.dataset.space} selected. Companion seats cannot be changed here.`;
+    };
+  }
+</script>
+</body>
+</html>
