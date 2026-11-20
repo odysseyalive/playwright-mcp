@@ -31,6 +31,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 
@@ -39,6 +40,13 @@ import { guardOutbound, sessionAllowsUrl } from './exfil.js';
 import { STEALTH_LAUNCH, stealthContextOptions } from './stealth.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:movie]', ...args);
+
+/**
+ * templates/movie-page/index.html: the shared-artifact house style (briefing binder, contents
+ * rail) with movie blocks, shipped here so a host without that skill still builds the full page.
+ * Resolved from this module (dist/movie.js → ../templates/movie-page/index.html).
+ */
+export const MOVIE_PAGE_TEMPLATE = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'templates', 'movie-page', 'index.html');
 
 // ── limits ────────────────────────────────────────────────────────────────────
 

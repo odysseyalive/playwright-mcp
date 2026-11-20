@@ -9,7 +9,7 @@
  *                       or HTML string) across viewports × light/dark, into one
  *                       per-job folder; optional before/after side-by-side
  *   movie_list        — what a job folder holds: paths, sizes, durations, posters
- *   movie_clean       — delete one job folder when the job is done
+ *   movie_clean       — delete one job folder (after the upload is confirmed, or to discard a take)
  *
  * The engine (paths, loopback server, overlay, recorder, ffmpeg) is src/movie.ts;
  * this file is the MCP surface only. Interactive recording on the shared
@@ -23,6 +23,7 @@ import type { ToolContext } from '../tools.js';
 import { wrapUntrusted } from '../exfil.js';
 import {
   MAX_OUTPUT_BYTES,
+  MOVIE_PAGE_TEMPLATE,
   STEP_ACTIONS,
   VIEWPORT_PRESETS,
   checkSlug,
@@ -145,7 +146,7 @@ const recordDefinition: Tool = {
     'system ffmpeg with h264/gif is found, and says so when it is not. Two targets + sideBySide:true also ' +
     'makes a before/after composite (ffmpeg). Re-running the same script into the same job replaces those ' +
     `clips. Outputs over ${MB} MB are flagged. Long matrices take a while; movie_list shows what finished. ` +
-    'Clean up with movie_clean when the job is complete.',
+    'Then upload the clips to the shareable artifact, confirm they landed, and movie_clean the job (see the share line).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -217,6 +218,37 @@ function splitErrors(clips: ClipRecord[]) {
   return { clean, errors };
 }
 
+/**
+ * How the clips reach a person. Rendered into movie_record's and movie_list({job})'s
+ * results, so the instruction lands at the moment there are files to share.
+ * Published files are copies held by the artifact, so once a files listing shows them
+ * the local job MUST be cleaned (movie_clean) along with any staging copies.
+ */
+export const SHARE_HINT =
+  'LIFECYCLE: record, upload to the shareable artifact, confirm the files landed, then movie_clean; uploading ' +
+  'is how a movie job is cleaned up. Share these on a claude.ai Artifact HTML page (never Claude Docs). ' +
+  'ADDING TO AN ARTIFACT THIS WORK ALREADY HAS: in this conversation, republish the same local page file; ' +
+  'from an earlier one, Artifact list, read it, ' +
+  'then publish with its url; add the movies as sections that match that page\'s own layout. CREATING A NEW ONE ' +
+  '(only when none matches): use the full house style, including the table of contents (the sticky contents ' +
+  'rail), a section 00 at-a-glance table of every movie, numbered section chips, and one same-shaped section per ' +
+  'movie. Load the shared-artifact skill if it is available; otherwise start from the shipped template ' +
+  `${MOVIE_PAGE_TEMPLATE} (its header comment says how to fill it). Either way this floor is the minimum: :root ` +
+  'colour tokens, a prefers-color-scheme dark block guarded by :root:not([data-theme="light"]), a separate ' +
+  ':root[data-theme="dark"] block, an explicit body background, a 2-4 word <title>, and a viewport meta if the ' +
+  'page owns its <head>. Carry each clip in the publish call\'s files map with an explicit type, e.g. ' +
+  '{"movies/x.mp4": {"from": "<path>", "contentType": "video/mp4"}} ("video/webm" for .webm), plus its .png ' +
+  'poster; no asset:true and no runtime capabilities. Show each with <video controls preload="metadata" ' +
+  'poster="…"> (<source> webm, then mp4) and a visible caption saying what it shows; skip the gif when an mp4 ' +
+  `exists. Files over ${MB} MB (overLimit) cannot be published, and one publish carries at most 64 MB, so a page ` +
+  'with several movies goes up over successive publishes to the same url (each adds files). CLEANUP IS ' +
+  'REQUIRED and goes through the upload, in this order: (1) publish or update the artifact with the clips; ' +
+  '(2) confirm they landed: Artifact action "list", scope "files", with its url, shows each clip path ' +
+  'with a video/* type; (3) then you must call movie_clean({job}) and delete any local copies or staging folder ' +
+  'made for the page (keep only the page\'s own source file if it lives in the project). Never clean before ' +
+  'step 2 succeeds; if a publish failed, keep the files. movie_clean without an upload is only for discarding ' +
+  'a bad take or a job nobody needs.';
+
 async function recordHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
   let status = 'starting';
   const stop = startHeartbeat(ctx, 'movie_record', (what, ms) => `${what}: ${status} (${Math.round(ms / 1000)}s)`);
@@ -249,7 +281,8 @@ async function recordHandler(args: Record<string, unknown>, ctx?: ToolContext): 
             clips: clean,
             composites: result.composites,
             notes: result.notes.length ? result.notes : undefined,
-            next: 'movie_list({job}) for sizes and durations; movie_clean({job}) when the job is complete.',
+            next: 'movie_list({job}) for sizes and durations; then upload the clips to the shareable artifact (share), confirm the files landed, and movie_clean({job}).',
+            share: SHARE_HINT,
           },
           null,
           2,
@@ -296,7 +329,7 @@ async function listHandler(args: Record<string, unknown>): Promise<CallToolResul
     }
     const errors = d.clips.filter((c) => c.error).map((c) => `${c.target}/${c.viewport}/${c.scheme}: ${c.error}`);
     const clips = d.clips.map(({ error, ...rest }) => (error ? { ...rest, failed: true } : rest));
-    const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify({ ...d, clips }, null, 2) }];
+    const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify({ ...d, clips, share: SHARE_HINT }, null, 2) }];
     if (errors.length) content.push({ type: 'text', text: wrapUntrusted(errors.join('\n'), 'movie_list') });
     return { content };
   } catch (err) {
@@ -309,8 +342,10 @@ async function listHandler(args: Record<string, unknown>): Promise<CallToolResul
 const cleanDefinition: Tool = {
   name: 'movie_clean',
   description:
-    'Delete one movie job folder and everything in it, once the job is complete and the files are handed ' +
-    'off. Only folders movie_record made are removed; saved scripts are kept.',
+    'Delete one movie job folder and everything in it. The normal way a job ends: after its clips are uploaded ' +
+    'to the shareable artifact and an Artifact files listing shows them landed (see the share line of ' +
+    'movie_record / movie_list). Also used alone to discard a bad take or a job nobody needs. Only folders ' +
+    'movie_record made are removed; saved scripts are kept.',
   inputSchema: {
     type: 'object',
     properties: { job: { type: 'string', description: 'The job id to delete.' } },

@@ -1,0 +1,346 @@
+<!-- shared-artifact-template-version: 1 -->
+<!-- shared-artifact-ref-version: 1 -->
+<!-- playwright-mcp movie-page starter: the shared-artifact house style (cw-dev's briefing binder),
+     shipped with playwright-mcp so a host without the shared-artifact skill still builds the full
+     page. Source: claude-workforce workforce/skills/shared-artifact/references/template.html
+     (CSS and the rail script copied verbatim; the movie blocks are added) and house-style.md
+     (tokens, dark-mode contract, binder layout, headings, content order). The two version
+     markers above match those files; scripts/test-movie.mjs fails when either source moves on.
+
+     USE IT ONLY TO CREATE A NEW ARTIFACT. Adding clips to an artifact this work already has?
+     Then add them as sections that match THAT page's own layout, and leave this file alone.
+
+     How to fill it:
+     - Copy it, replace every CAPITALISED placeholder, delete the blocks the page does not need.
+       Keep the token block, BOTH dark-mode blocks and the body background exactly as they are.
+     - Each movie touches THREE places, and they must agree: a rail entry in nav.toc
+       (href="#movie-N"), a row in the section 00 table, and its own <section id="movie-N">.
+       The rail highlight script finds sections by the rail's hrefs.
+     - Number the sections 00, 01, 02 ... in rail order. Section 00 "At a glance" comes first.
+     - Every movie section opens the same way: the case-file strip (Target · Viewport · Scheme ·
+       Duration), one summary sentence, the <video>, its caption, then the same H3s.
+     - Video: <video controls preload="metadata" poster="movies/X.png">, a <source> for the
+       .webm first and then the .mp4, and a visible <figcaption> saying what it shows. Skip
+       the .gif when an .mp4 exists. Add class "portrait" to the figure for a phone clip, so a
+       tall clip does not fill the whole screen.
+     - The paths are the published paths in the Artifact publish call's files map, carried with
+       an explicit type: {"movies/X.mp4": {"from": "<abs path>", "contentType": "video/mp4"}},
+       "video/webm" for .webm, and the .png poster. No asset:true and no runtime capabilities.
+       15 MB per file, 64 MB per publish: several movies go up over successive publishes to the
+       same url, each adding files.
+     - Uploading is how a movie job is cleaned up. Cleanup is REQUIRED, in this order: (1) publish or update the artifact
+       with the clips; (2) confirm they landed: Artifact action "list", scope "files", with the
+       artifact url, shows each clip path with a video/* type; (3) then movie_clean({job}) and
+       delete any local copies or staging folder made for the page (keep only the page's own
+       source file if it lives in the project). Never clean before step 2 succeeds; if a publish
+       failed, keep the files. movie_clean without an upload only discards a bad take.
+     - Title: two to four words. Look at it at desktop width and at about 390px, light and dark,
+       before publishing.
+
+     It is a FRAGMENT, starting at <title>, with no <html>, <head> or viewport meta, like the
+     source: the artifact publisher supplies the document wrapper. Writing a standalone file
+     instead? Then add the wrapper AND
+     `<meta name="viewport" content="width=device-width, initial-scale=1">`. -->
+<title>TWO TO FOUR WORDS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=Public+Sans:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: briefing binder. A sticky contents rail on the left, one reading column on the
+   right; every section opens with a numbered tab header. */
+:root {
+  --bg: #f6f7f9;
+  --paper: #ffffff;
+  --ink: #16202b;
+  --muted: #566372;
+  --rule: #dfe3e8;
+  --tint: #eef2f6;
+  --accent: #0d5f73;
+  --accent-soft: #e2f0f3;
+  --crit: #b4262c;   --crit-soft: #fbe9ea;
+  --warn: #9a5b00;   --warn-soft: #fbf0dc;
+  --ok: #2d6a3e;     --ok-soft: #e5f2e8;
+  --info: #3b4f8f;   --info-soft: #e8ecf8;
+  --code-bg: #eef1f4;
+  --f-display: "Archivo", "Arial Narrow", Arial, sans-serif;
+  --f-body: "Public Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+/* The system preference, GUARDED. Without `:not([data-theme="light"])` a viewer who forces
+   light still gets these values. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f151b; --paper: #151d25; --ink: #e5eaf0; --muted: #9aa7b5; --rule: #2a3541; --tint: #1b2530;
+    --accent: #5cc0d4; --accent-soft: #15323a;
+    --crit: #f07a7f; --crit-soft: #3a1c1f; --warn: #e6b45c; --warn-soft: #3a2c14;
+    --ok: #7ccf91; --ok-soft: #17301e; --info: #9fb2f0; --info-soft: #1d2540; --code-bg: #1d2731;
+    color-scheme: dark;
+  }
+}
+/* Dark chosen explicitly, outside the system preference. Same values; both blocks are
+   needed, because a viewer can arrive either way. */
+:root[data-theme="dark"] {
+  --bg: #0f151b; --paper: #151d25; --ink: #e5eaf0; --muted: #9aa7b5; --rule: #2a3541; --tint: #1b2530;
+  --accent: #5cc0d4; --accent-soft: #15323a;
+  --crit: #f07a7f; --crit-soft: #3a1c1f; --warn: #e6b45c; --warn-soft: #3a2c14;
+  --ok: #7ccf91; --ok-soft: #17301e; --info: #9fb2f0; --info-soft: #1d2540; --code-bg: #1d2731;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+/* An explicit body background, or the page inherits the host's and dark ink lands on a
+   dark surface. */
+body { background: var(--bg); color: var(--ink); font: 400 16px/1.65 var(--f-body); margin: 0; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 24px; padding-block: 0 80px;
+  display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 48px; }
+@media (max-width: 900px) { .wrap { grid-template-columns: minmax(0, 1fr); gap: 0; padding-inline: 16px; } }
+
+/* Masthead */
+.mast { grid-column: 1 / -1; padding-block: 48px 32px; border-bottom: 3px solid var(--ink); display: grid; gap: 14px; }
+.eyebrow { font: 500 12px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+.mast h1 { margin: 0; font: 800 clamp(34px, 5vw, 56px)/1.02 var(--f-display); font-stretch: 85%; letter-spacing: -.01em; text-wrap: balance; }
+.mast .lede { margin: 0; max-width: 62ch; font-size: 18px; color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 24px; font: 400 13px/1.4 var(--f-mono); color: var(--muted); }
+.meta b { color: var(--ink); font-weight: 500; }
+
+/* Contents rail */
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 24px); align-self: start; padding-top: 32px; max-height: calc(100vh - 48px); overflow-y: auto; }
+nav.toc h2 { margin: 0 0 12px; font: 500 11px/1 var(--f-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+nav.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+nav.toc a { display: grid; grid-template-columns: 28px 1fr; gap: 4px; padding: 6px 10px; border-radius: 6px; color: var(--ink); text-decoration: none; font-size: 14px; line-height: 1.35; border-left: 2px solid transparent; }
+nav.toc a span { font: 500 12px/1.6 var(--f-mono); color: var(--muted); }
+nav.toc a:hover { background: var(--tint); }
+nav.toc a.on { background: var(--accent-soft); border-left-color: var(--accent); }
+nav.toc a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+nav.toc .grp { margin: 14px 0 4px 10px; font: 500 10.5px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+@media (max-width: 900px) {
+  nav.toc { position: static; max-height: none; padding: 24px 0 8px; border-bottom: 1px solid var(--rule); }
+  nav.toc ol { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+}
+
+main { min-width: 0; padding-top: 8px; }
+
+/* Section headers: the chip is what makes an H2 pop */
+section { padding-block: 56px 8px; scroll-margin-top: 16px; }
+.sec-head { display: grid; grid-template-columns: auto 1fr; gap: 6px 18px; align-items: baseline; padding-top: 14px; border-top: 1px solid var(--ink); margin-bottom: 24px; }
+.sec-num { font: 500 13px/1 var(--f-mono); color: var(--paper); background: var(--ink); padding: 6px 9px; border-radius: 4px; align-self: center; }
+.sec-head h2 { margin: 0; font: 750 clamp(26px, 3.2vw, 34px)/1.12 var(--f-display); font-stretch: 88%; letter-spacing: -.005em; text-wrap: balance; }
+.sec-head .kicker { grid-column: 2; font: 500 12px/1.3 var(--f-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--accent); }
+h3 { margin: 32px 0 10px; font: 700 13px/1.3 var(--f-body); letter-spacing: .09em; text-transform: uppercase; color: var(--accent); }
+p { margin: 0 0 14px; max-width: 70ch; }
+ul, ol.list { margin: 0 0 16px; padding-left: 22px; max-width: 70ch; }
+li { margin-bottom: 6px; }
+li::marker { color: var(--muted); }
+strong { font-weight: 700; }
+a { color: var(--accent); text-underline-offset: 2px; }
+code { font: 400 .86em/1.4 var(--f-mono); background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+pre { margin: 0 0 14px; padding: 14px 16px; background: var(--code-bg); border-radius: 8px; overflow-x: auto; font: 400 13px/1.5 var(--f-mono); }
+
+/* Case-file strip: the same four facts at the head of every repeated item */
+.case { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin-bottom: 22px; }
+.case > div { background: var(--paper); padding: 12px 16px; min-width: 0; }
+.case dt { font: 500 10.5px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.case dd { margin: 0; font-size: 14.5px; line-height: 1.4; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font: 600 12.5px/1 var(--f-body); padding: 5px 10px; border-radius: 999px; white-space: nowrap; }
+.pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.p-crit { color: var(--crit); background: var(--crit-soft); }
+.p-warn { color: var(--warn); background: var(--warn-soft); }
+.p-info { color: var(--info); background: var(--info-soft); }
+.p-low  { color: var(--ok);   background: var(--ok-soft); }
+.summary { font-size: 17.5px; line-height: 1.6; padding-left: 16px; border-left: 3px solid var(--accent); max-width: 68ch; }
+
+/* Tables: always inside the scroll wrapper */
+.tbl { overflow-x: auto; margin: 0 0 18px; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper); }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+th { text-align: left; font: 600 11.5px/1.3 var(--f-body); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--tint); padding: 10px 14px; border-bottom: 1px solid var(--rule); }
+td { padding: 10px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+td:first-child { font-weight: 600; }
+td.mono, .mono { font-family: var(--f-mono); font-size: 13px; font-weight: 400; }
+.nowrap { white-space: nowrap; }
+
+/* Callouts */
+.note { background: var(--paper); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; margin: 0 0 18px; max-width: 74ch; }
+.note p:last-child, .note ul:last-child { margin-bottom: 0; }
+.note.warn { background: var(--warn-soft); border-color: transparent; }
+.note h4 { margin: 0 0 6px; font: 700 14px/1.3 var(--f-body); }
+
+/* People cards */
+.people { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.person { background: var(--paper); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; display: grid; gap: 4px; align-content: start; min-width: 0; }
+.person .nm { font: 700 16px/1.25 var(--f-display); font-stretch: 92%; }
+.person .tt { font-size: 13px; color: var(--muted); }
+.person .rl { font-size: 14px; margin-top: 4px; }
+.person .ct { font: 400 12.5px/1.55 var(--f-mono); margin-top: 6px; overflow-wrap: anywhere; color: var(--ink); }
+.person .ct .na { color: var(--muted); }
+.person.key { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.org { font: 500 11px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 22px 0 10px; }
+
+/* Diagrams. Every colour in an inline SVG comes from a token too: fill="var(--ink)". */
+figure { margin: 0 0 18px; background: var(--paper); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; overflow-x: auto; }
+figure svg { display: block; width: 100%; min-width: 560px; height: auto; }
+figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; }
+
+.foot { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--rule); font-size: 13px; color: var(--muted); }
+
+/* Movies. Every colour from a token. A clip fills the reading column; a phone clip is capped so
+   it reads as a phone. */
+.movie { padding: 12px; }
+.movie video { display: block; width: 100%; height: auto; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px; }
+.movie.portrait video { max-width: 360px; margin-inline: auto; }
+.movie figcaption { font-size: 14px; color: var(--ink); margin-top: 10px; max-width: 70ch; }
+.movie figcaption b { font: 500 11px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-right: 8px; }
+.ba-labels { display: grid; grid-template-columns: 1fr 1fr; margin-bottom: 8px; font: 500 11px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); text-align: center; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">WHO PREPARED IT · GUI DEMO VIDEOS</div>
+    <h1>THE CHANGE THESE MOVIES SHOW, SAID PLAINLY</h1>
+    <p class="lede">ONE SENTENCE SAYING WHAT WAS RECORDED AND WHO IT IS FOR.</p>
+    <div class="meta"><span>As of <b>DATE</b></span><span>Prepared for <b>NAME</b></span><span>Recorded with <b>playwright-mcp movie_record</b></span></div>
+  </header>
+
+  <nav class="toc" aria-label="Contents">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#glance"><span>00</span>At a glance</a></li>
+      <li class="grp">Movies</li>
+      <li><a href="#movie-1"><span>01</span>FIRST MOVIE</a></li>
+      <li><a href="#movie-2"><span>02</span>SECOND MOVIE</a></li>
+      <li class="grp">Compare</li>
+      <li><a href="#before-after"><span>03</span>Before and after</a></li>
+      <li class="grp">Reference</li>
+      <li><a href="#how"><span>04</span>How these were made</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <section id="glance">
+      <div class="sec-head"><span class="sec-num">00</span><h2>At a glance</h2><span class="kicker">EVERY MOVIE ON THIS PAGE, IN ORDER</span></div>
+      <p class="summary">ONE SENTENCE A READER COULD STOP AFTER: WHAT CHANGED AND WHETHER IT WORKS.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Movie</th><th>Shows</th><th>Viewport · Scheme</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td><a href="#movie-1">FIRST MOVIE</a></td><td>WHAT IT SHOWS</td><td class="mono">DESKTOP · LIGHT</td><td><span class="pill p-low">WORKS</span></td></tr>
+          <tr><td><a href="#movie-2">SECOND MOVIE</a></td><td>WHAT IT SHOWS</td><td class="mono">PHONE · DARK</td><td><span class="pill p-warn">NEEDS A DECISION</span></td></tr>
+          <tr><td><a href="#before-after">Before and after</a></td><td>WHAT CHANGED</td><td class="mono">DESKTOP · LIGHT</td><td><span class="pill p-info">FOR REVIEW</span></td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <!-- One section per movie (a clip, or one step of a walk-through). Every one opens with the
+         same strip, the same summary line and the same H3s, in the same order. -->
+    <section id="movie-1">
+      <div class="sec-head"><span class="sec-num">01</span><h2>FIRST MOVIE</h2><span class="kicker">ONE LINE ON WHAT TO WATCH FOR</span></div>
+      <dl class="case">
+        <div><dt>Target</dt><dd>MOCK-UP OR PAGE NAME</dd></div>
+        <div><dt>Viewport</dt><dd class="mono">DESKTOP 1280×800</dd></div>
+        <div><dt>Scheme</dt><dd>LIGHT</dd></div>
+        <div><dt>Duration</dt><dd class="mono">0:00</dd></div>
+      </dl>
+      <p class="summary">WHAT THIS MOVIE SHOWS, IN ONE SENTENCE.</p>
+      <figure class="movie">
+        <video controls preload="metadata" poster="movies/FIRST.png">
+          <source src="movies/FIRST.webm" type="video/webm">
+          <source src="movies/FIRST.mp4" type="video/mp4">
+        </video>
+        <figcaption><b>Movie 01</b>WHAT THE VIEWER SEES, STEP BY STEP, IN ONE OR TWO SENTENCES.</figcaption>
+      </figure>
+      <h3>What it shows</h3>
+      <p>BODY TEXT.</p>
+      <h3>What to look for</h3>
+      <p>BODY TEXT.</p>
+    </section>
+
+    <section id="movie-2">
+      <div class="sec-head"><span class="sec-num">02</span><h2>SECOND MOVIE</h2><span class="kicker">ONE LINE ON WHAT TO WATCH FOR</span></div>
+      <dl class="case">
+        <div><dt>Target</dt><dd>MOCK-UP OR PAGE NAME</dd></div>
+        <div><dt>Viewport</dt><dd class="mono">PHONE 390×844</dd></div>
+        <div><dt>Scheme</dt><dd>DARK</dd></div>
+        <div><dt>Duration</dt><dd class="mono">0:00</dd></div>
+      </dl>
+      <p class="summary">WHAT THIS MOVIE SHOWS, IN ONE SENTENCE.</p>
+      <figure class="movie portrait">
+        <video controls preload="metadata" poster="movies/SECOND.png">
+          <source src="movies/SECOND.webm" type="video/webm">
+          <source src="movies/SECOND.mp4" type="video/mp4">
+        </video>
+        <figcaption><b>Movie 02</b>WHAT THE VIEWER SEES, STEP BY STEP, IN ONE OR TWO SENTENCES.</figcaption>
+      </figure>
+      <h3>What it shows</h3>
+      <p>BODY TEXT.</p>
+      <h3>What to look for</h3>
+      <p>BODY TEXT.</p>
+    </section>
+
+    <!-- Optional. A movie_record sideBySide composite: before on the left, after on the right,
+         one clip. Its container is .mp4 when ffmpeg has h264, else .webm; list only the source
+         the job actually has (movie_list({job}) composites). Delete this section, its rail
+         entry and its glance row when there is no composite. -->
+    <section id="before-after">
+      <div class="sec-head"><span class="sec-num">03</span><h2>Before and after</h2><span class="kicker">THE SAME STEPS, OLD AND NEW, SIDE BY SIDE</span></div>
+      <dl class="case">
+        <div><dt>Target</dt><dd>BEFORE → AFTER</dd></div>
+        <div><dt>Viewport</dt><dd class="mono">DESKTOP 1280×800</dd></div>
+        <div><dt>Scheme</dt><dd>LIGHT</dd></div>
+        <div><dt>Duration</dt><dd class="mono">0:00</dd></div>
+      </dl>
+      <p class="summary">WHAT CHANGED BETWEEN THE TWO, IN ONE SENTENCE.</p>
+      <figure class="movie">
+        <div class="ba-labels" aria-hidden="true"><span>Before</span><span>After</span></div>
+        <video controls preload="metadata" poster="movies/COMPOSITE.png">
+          <source src="movies/COMPOSITE.webm" type="video/webm">
+          <source src="movies/COMPOSITE.mp4" type="video/mp4">
+        </video>
+        <figcaption><b>Compare</b>LEFT IS BEFORE, RIGHT IS AFTER: WHAT TO NOTICE.</figcaption>
+      </figure>
+    </section>
+
+    <section id="how">
+      <div class="sec-head"><span class="sec-num">04</span><h2>How these were made</h2><span class="kicker">WHAT WAS RECORDED, AND HOW</span></div>
+      <div class="tbl"><table>
+        <thead><tr><th>What</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td>Recorder</td><td class="mono">playwright-mcp movie_record, job JOB-ID</td></tr>
+          <tr><td>Script</td><td class="mono">SCRIPT NAME OR "inline", N STEPS</td></tr>
+          <tr><td>Target</td><td class="mono">MOCK-UP FILE OR LOCAL URL</td></tr>
+        </tbody>
+      </table></div>
+      <p class="foot">HOW THE MOVIES WERE MADE, AND WHAT WAS NOT CHANGED.</p>
+    </section>
+  </main>
+</div>
+
+<script id="rail-highlight">
+/* The contents rail highlights the section being read: the last section whose top has
+   passed a line 30% down the window, or the last section once the page is scrolled to the
+   bottom. A clicked entry is highlighted at once and kept while the page scrolls to it.
+   Not an IntersectionObserver band: a clicked target scrolls ABOVE any band and never
+   enters it, which left the previous entry lit (off by one, reported by mutze-studio
+   2026-11-04). The page is fully readable without this script. */
+(() => {
+  const links = [...document.querySelectorAll('nav.toc a')];
+  const sections = links.map(a => document.getElementById(a.getAttribute('href').slice(1))).filter(Boolean);
+  if (!sections.length) return;
+  const mark = id => links.forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + id));
+  let ticking = false, lockUntil = 0;
+  const update = () => {
+    ticking = false;
+    if (Date.now() < lockUntil) return;
+    const line = window.innerHeight * 0.3;
+    let current = sections[0];
+    for (const s of sections) { if (s.getBoundingClientRect().top <= line) current = s; }
+    const doc = document.documentElement;
+    if (window.innerHeight + window.scrollY >= doc.scrollHeight - 4) current = sections[sections.length - 1];
+    mark(current.id);
+  };
+  const onScroll = () => { if (!ticking) { ticking = true; requestAnimationFrame(update); } };
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  links.forEach(a => a.addEventListener('click', () => { lockUntil = Date.now() + 1200; mark(a.getAttribute('href').slice(1)); }));
+  update();
+})();
+</script>

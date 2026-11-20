@@ -335,3 +335,68 @@ test(
     }
   },
 );
+
+test('SHARE_HINT: movie results tell a session to share clips in the existing artifact, or a new one in the full house style', async () => {
+  const { SHARE_HINT } = await import('../dist/tools/movie.js');
+  const { MOVIE_PAGE_TEMPLATE } = await import('../dist/movie.js');
+  for (const must of ['Artifact', 'never Claude Docs', 'ALREADY HAS', 'publish with its url', "match that page's own layout",
+    'CREATING A NEW ONE', 'table of contents', 'contents rail', 'section 00', 'shared-artifact skill if it is available',
+    MOVIE_PAGE_TEMPLATE, 'floor is the minimum', 'data-theme="dark"', 'files', '"contentType": "video/mp4"', 'video/webm',
+    'no asset:true', '64 MB', '<video', 'CLEANUP IS REQUIRED', 'scope "files"', 'video/*',
+    'LIFECYCLE: record, upload to the shareable artifact, confirm the files landed, then movie_clean',
+    'uploading is how a movie job is cleaned up', 'discarding a bad take', 'you must call movie_clean({job})', 'delete any local copies', 'Never clean before step 2 succeeds', 'if a publish failed, keep the files'])
+    assert.ok(SHARE_HINT.includes(must), must);
+  assert.ok(path.isAbsolute(MOVIE_PAGE_TEMPLATE), 'the share line gives an absolute template path');
+  const at = (x) => SHARE_HINT.indexOf(x);
+  assert.ok(at('publish or update the artifact') < at('scope "files"') && at('scope "files"') < at('movie_clean({job})'),
+    'order: publish, then verify the files listing, then movie_clean');
+  assert.doesNotMatch(SHARE_HINT, /movie_clean is safe/, 'cleanup is required, not merely safe');
+  const { movieCleanTool } = await import('../dist/tools/movie.js');
+  assert.match(movieCleanTool.definition.description, /uploaded to the shareable artifact[\s\S]*discard a bad take/, 'movie_clean describes the one lifecycle');
+  assert.doesNotMatch(movieCleanTool.definition.description, /once the job is complete/);
+});
+
+/** `<!-- name: N -->` marker value, or undefined. */
+const marker = (text, name) => text.match(new RegExp(`<!--\\s*${name}:\\s*(\\S+)\\s*-->`))?.[1];
+
+test('movie-page template: ships in the package with the full house style and the movie blocks', async () => {
+  const { MOVIE_PAGE_TEMPLATE } = await import('../dist/movie.js');
+  const repo = path.resolve(fileURLToPath(import.meta.url), '..', '..');
+  assert.equal(MOVIE_PAGE_TEMPLATE, path.join(repo, 'templates', 'movie-page', 'index.html'), 'resolved from the installed package');
+  assert.ok(fs.existsSync(MOVIE_PAGE_TEMPLATE), MOVIE_PAGE_TEMPLATE);
+  const t = fs.readFileSync(MOVIE_PAGE_TEMPLATE, 'utf8');
+  for (const [what, re] of [
+    ['title placeholder', /<title>[A-Z][A-Z ]+<\/title>/],
+    ['token block', /:root\s*\{\s*--bg:/],
+    ['guarded prefers-color-scheme dark block', /@media \(prefers-color-scheme: dark\)\s*\{\s*:root:not\(\[data-theme="light"\]\)/],
+    ['explicit data-theme dark block', /:root\[data-theme="dark"\]\s*\{/],
+    ['body background', /body\s*\{[^}]*background:\s*var\(--bg\)/],
+    ['contents rail', /<nav class="toc"[^>]*>[\s\S]*<a href="#glance"><span>00<\/span>At a glance<\/a>/],
+    ['sticky rail', /nav\.toc\s*\{[^}]*position:\s*sticky/],
+    ['rail highlight script, no IntersectionObserver', /<script id="rail-highlight">[\s\S]*innerHeight \* 0\.3/],
+    ['section chips', /<span class="sec-num">01<\/span>/],
+    ['case-file strip', /<dl class="case">[\s\S]*<dt>Target<\/dt>[\s\S]*<dt>Viewport<\/dt>[\s\S]*<dt>Scheme<\/dt>[\s\S]*<dt>Duration<\/dt>/],
+    ['video, webm then mp4', /<video controls preload="metadata" poster="[^"]+">\s*<source src="[^"]+\.webm" type="video\/webm">\s*<source src="[^"]+\.mp4" type="video\/mp4">/],
+    ['visible caption', /<\/video>\s*<figcaption>/],
+  ])
+    assert.match(t, re, what);
+  assert.doesNotMatch(t.replace(/<!--[\s\S]*?-->/g, ''), /IntersectionObserver\(/, 'the rail script never builds an IntersectionObserver');
+  // Every rail href has a section, so the highlight script can find each one.
+  for (const [, id] of t.matchAll(/<li><a href="#([^"]+)">/g)) assert.match(t, new RegExp(`<section id="${id}">`), `section #${id}`);
+  assert.equal(marker(t, 'shared-artifact-ref-version'), '1');
+  assert.equal(marker(t, 'shared-artifact-template-version'), '1');
+});
+
+// Drift alarm, not a dependency: when the shared-artifact skill is installed, the starter's two
+// markers must match its house-style.md and template.html. Each comparison is skipped on its own
+// when that file is absent (playwright-mcp ships without claude-workforce).
+for (const [file, name] of [['house-style.md', 'shared-artifact-ref-version'], ['template.html', 'shared-artifact-template-version']]) {
+  const src = path.join(os.homedir(), '.claude', 'skills', 'shared-artifact', 'references', file);
+  test(`movie-page template: ${name} matches the installed shared-artifact ${file}`, { skip: !fs.existsSync(src) && `${src} absent` }, async () => {
+    const { MOVIE_PAGE_TEMPLATE } = await import('../dist/movie.js');
+    const theirs = marker(fs.readFileSync(src, 'utf8'), name);
+    assert.ok(theirs, `${src} carries no ${name} marker`);
+    assert.equal(marker(fs.readFileSync(MOVIE_PAGE_TEMPLATE, 'utf8'), name), theirs,
+      `${file} moved to ${name} ${theirs}: update templates/movie-page/index.html from it, then its marker`);
+  });
+}

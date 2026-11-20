@@ -146,8 +146,13 @@ function buildInstructions(
         'loopback server) or a live local page, runs a step list (click/type/hover/press/wait/scroll + caption + ' +
         'highlight) and writes captioned clips per viewport (desktop/phone) and light/dark into one job folder: ' +
         '.webm + .png poster always, .mp4/.gif/before-after side-by-side when ffmpeg allows. Save the steps with ' +
-        'movie_script_save to re-run after the mock-up changes; movie_list hands off paths, sizes and durations; ' +
-        'movie_clean deletes the job when it is complete. Own browser, NOT queued.',
+        'movie_script_save to re-run after the mock-up changes; movie_list hands off paths, sizes and durations. ' +
+        'Own browser, NOT queued. LIFECYCLE: record, upload to the shareable artifact, confirm the files landed, ' +
+        'then movie_clean; uploading is how a movie job is cleaned up (movie_clean alone only discards a bad take). ' +
+        'SHARE the clips in a claude.ai Artifact: add them to the shareable artifact already being worked on (same URL, as sections matching its ' +
+        'layout), or, when none exists, create a new one in the full house style with its table of contents ' +
+        '(the shared-artifact skill, or the movie-page template this server ships). Once the artifact\'s files ' +
+        'listing shows the clips, movie_clean the job and delete local copies (required). The movie_record result says how.',
     );
   }
   if (names.has('suite_scaffold') || names.has('suite_methodology')) {
