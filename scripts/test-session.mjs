@@ -1907,6 +1907,43 @@ test(
   },
 );
 
+test('explicit profile path: refused off stdio for both tools, like profile:system', async () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'path-profile-'));
+  for (const trust of ['local', 'cloud', undefined]) {
+    for (const [tool, args] of [
+      [sessionSolveChallengeTool, { name: 'path-ch', url: FAKE_LOGIN_URL, profile: dir }],
+      [sessionLoginTool, { name: 'path-login', loginUrl: FAKE_LOGIN_URL, headed: true, attach: true, profile: dir }],
+    ]) {
+      const res = await tool.handler(args, trust === undefined ? {} : { trust });
+      assert.equal(res.isError, true, `${tool.definition?.name ?? 'tool'} with trust=${trust} must refuse`);
+      assert.match(res.content[0].text, /explicit profile path/);
+    }
+  }
+  assert.deepEqual(fs.readdirSync(dir), [], 'nothing launched into the refused profile');
+});
+
+test(
+  'explicit profile path challenge on stdio: waits for the save press, never a passive harvest',
+  { skip: skipOnWin32 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(TMP, 'path-profile-'));
+    const name = 'path-challenge-nopress';
+    const started = Date.now();
+    const [res, launched] = await withFakeChrome('cleared', () =>
+      withLaunchReport(name, () =>
+        sessionSolveChallengeTool.handler({ name, url: FAKE_LOGIN_URL, profile: dir, timeoutMs: 7000 }, { trust: 'stdio' }),
+      ),
+    );
+    const env = envelopeOf(res);
+    assert.ok(Date.now() - started >= 6500, 'it waited for the press, not for the wall');
+    assert.equal(env.ok, false);
+    assert.match(env.error, /"I'm signed in, save it" was not pressed/);
+    assert.equal(fs.existsSync(sessionFilePath(name)), false, 'nothing saved without the press');
+    const [, button] = launchedUrls(launched);
+    assert.match(button ?? '', /^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32}$/, 'the save-button tab opened');
+  },
+);
+
 // ── profile:'dedicated' — playwright-mcp's own login profile, kept per name ───
 // MEASURED 2026-11-22 on eBay (Akamai + hCaptcha): plain Chrome with no debugging
 // port and no save tab, on a cold profile, got 403 on the sign-in page's first GET

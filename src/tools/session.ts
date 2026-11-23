@@ -1026,11 +1026,15 @@ export function systemProfileRefusal(
   profileDirectory: unknown,
   trust: SurfaceTrust | undefined,
 ): string | undefined {
-  if (profile !== 'system' && profileDirectory == null) return undefined;
+  // Only playwright-mcp's own profiles are safe off stdio. 'system' and an explicit
+  // <path> both reach a real browser profile's cookies, so both need stdio.
+  const ownProfile = profile === undefined || profile === 'temp' || profile === 'dedicated';
+  if (ownProfile && profileDirectory == null) return undefined;
   if (trust === 'stdio') return undefined;
   return (
-    'profile:"system" (and profileDirectory) copy your real Chrome profile\'s cookies, so they are ' +
-    'accepted only on the local stdio surface, never over HTTP. Use profile:"temp" or "dedicated" instead.'
+    'profile:"system", an explicit profile path, and profileDirectory reach a real browser profile\'s ' +
+    'cookies, so they are accepted only on the local stdio surface, never over HTTP. Use profile:"temp" ' +
+    'or "dedicated" instead.'
   );
 }
 
@@ -1609,7 +1613,9 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   // cookies the page is usually not walled at all, so the passive wall-cleared
   // harvest would save at once with nobody having said yes. One flag drives both the
   // button and the wait, so the two cannot drift apart.
-  const humanSaves = !opts.challenge || prof.copyFrom !== undefined;
+  // A real profile — a 'system' copy or an explicit <path> driven in place — never
+  // saves on the passive wall-cleared harvest; only playwright-mcp's own may.
+  const humanSaves = !opts.challenge || prof.copyFrom !== undefined || prof.guardDir !== undefined;
   const chromePath = resolveChromePath();
   let child: ReturnType<typeof spawn> | undefined;
   let cdp: Browser | undefined;
