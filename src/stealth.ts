@@ -289,11 +289,12 @@ export function resolveChromePath(): string {
 }
 
 /**
- * The host's default Google Chrome user-data-dir — the REAL profile a person
- * browses with. attach-mode capture can ride this profile so an established
- * browser's earned trust (e.g. a Cloudflare `cf_clearance` cookie, real history)
- * carries the capture past a hard bot wall that hard-challenges a fresh profile.
- * Override with PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR.
+ * The host's default Google Chrome user-data-dir — the REAL profiles a person
+ * browses with ("Default", "Profile 1", ... inside it, on every OS). attach-mode
+ * profile:'system' copies one of them so whatever that browser has earned with a
+ * site (a login, a bot-wall clearance, a trusted-device cookie) carries into a
+ * capture that a fresh profile would fail. Override with
+ * PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR.
  */
 export function defaultChromeUserDataDir(): string {
   const env = process.env.PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR;

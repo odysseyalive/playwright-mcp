@@ -73,15 +73,25 @@ export interface LoginOptions {
   // logs in, and the authenticated storageState is harvested passively.
   attach?: boolean;
   // Which Chrome profile the attach capture uses:
-  //   'temp'   (default) — a fresh throwaway profile; correct for soft walls.
-  //   'system' — the host's REAL default Chrome profile, so an established
-  //              browser's earned trust (cf_clearance, history) carries the
-  //              capture past a HARD Cloudflare wall that hard-challenges a
-  //              fresh profile. The user must fully quit Chrome first. Export
-  //              is auto-scoped to the login site's domain (never the whole jar).
+  //   'dedicated' (default for a login) — playwright-mcp's OWN persistent profile
+  //              for this session name, kept between logins so the trust a site
+  //              grants a browser (Akamai/hCaptcha clearances, device cookies)
+  //              carries into the next login instead of starting cold every time.
+  //   'temp'   (default for a challenge) — a fresh throwaway profile.
+  //   'system' — a COPY of one profile from the host's real Chrome user-data-dir
+  //              (its cookies, Local State and prefs), so whatever that browser
+  //              has earned with the site carries into the capture: an existing
+  //              login, a bot-wall clearance, a "known device" cookie, for ANY
+  //              site. Works while the user's Chrome is running (the copy is
+  //              checked for consistency). Export is auto-scoped to the login
+  //              site's domain (never the whole jar).
   //   <path>   — an explicit user-data-dir (e.g. a dedicated persistent capture
-  //              profile that accumulates trust across runs).
-  profile?: 'temp' | 'system' | string;
+  //              profile that accumulates trust across runs), driven in place.
+  profile?: 'dedicated' | 'temp' | 'system' | string;
+  // With profile 'system' only: which profile directory inside the user-data-dir
+  // to copy, by its on-disk name ("Default", "Profile 1", ...). Default 'Default'.
+  // Untrusted input reaching a path, so validateProfileDirectory() gates it.
+  profileDirectory?: string;
   // Capture a CLEARED BOT WALL rather than a login: the human solves the CAPTCHA
   // and nothing else, so the page never leaves `loginUrl` and the login-shaped
   // "moved past the login page" predicate can never fire. Completion is instead
@@ -662,8 +672,8 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
 // Chrome (a normal child process, not chromium.launch — so it carries none of
 // Playwright's automation instrumentation while the human solves the challenge),
 // let the person clear the challenge + log in, then connectOverCDP and read the
-// authenticated storageState back out. A dedicated throwaway profile keeps the
-// user's real Chrome profile untouched.
+// authenticated storageState back out. A dedicated profile (playwright-mcp's own, kept per
+// session name for a login; throwaway for a challenge) keeps the user's real Chrome untouched.
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -952,57 +962,274 @@ const mkTempProfile = () => fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PROFILE_M
 
 interface AttachProfile {
   dir: string; // the user-data-dir Chrome actually drives
+  dedicated?: boolean; // playwright-mcp's own per-name login profile: kept, its Chrome reaped, closed gracefully
   cleanup: boolean; // rm `dir` afterwards (fresh temp + profile copies; NEVER a real profile)
   scope: boolean; // domain-scope the export (a real cookie jar is involved)
-  guardDir?: string; // a running Chrome on this dir blocks the capture (SingletonLock)
+  guardDir?: string; // a running Chrome on this dir blocks the capture (SingletonLock) — driven in place only
   copyFrom?: string; // copy trust-bearing essentials from here into `dir` before launch
+  profileDirectory?: string; // the one profile inside copyFrom to copy, and to launch with --profile-directory
+}
+
+/** The profile directory 'system' copies when none is named — Chrome's first profile on every OS. */
+export const DEFAULT_PROFILE_DIRECTORY = 'Default';
+
+/**
+ * Gate a caller-supplied Chrome profile directory name before it touches a path.
+ * It must be ONE plain path segment ("Default", "Profile 2", a custom name) that is
+ * a real directory directly under `userDataDir`. Chrome names them the same way on
+ * Linux, macOS and Windows; only the user-data-dir differs (defaultChromeUserDataDir).
+ * Separators of EVERY platform are refused on every platform, so a name that is
+ * harmless here cannot become a traversal on Windows. A symlink is refused too:
+ * the copy must come from the profile Chrome itself keeps, not wherever a link
+ * points. The error never lists the profiles that do exist — this runs on the
+ * local HTTP surface too, and the names are the user's, not the caller's.
+ * Returns the absolute profile path.
+ */
+export function validateProfileDirectory(userDataDir: string, name: unknown): string {
+  const bad = (why: string) =>
+    new Error(`profileDirectory ${JSON.stringify(String(name)).slice(0, 80)} refused: ${why}`);
+  if (typeof name !== 'string' || !name.trim()) throw bad('it must be a non-empty profile folder name such as "Default" or "Profile 1"');
+  if (name.length > 128) throw bad('too long for a profile folder name');
+  if (name === '.' || name === '..' || /[/\\:\0]/.test(name) || path.isAbsolute(name) || path.win32.isAbsolute(name))
+    throw bad('it must be a single folder name (no "..", slashes, drive letters or absolute paths)');
+  const root = path.resolve(userDataDir);
+  const full = path.resolve(root, name);
+  if (path.dirname(full) !== root || path.basename(full) !== name)
+    throw bad('it must name a folder directly inside the Chrome user-data-dir');
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(full);
+  } catch {
+    throw bad(`no such profile folder in the Chrome user-data-dir (${root}); see chrome://version "Profile Path" for the right name`);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) throw bad('it is not a plain profile folder');
+  return full;
 }
 
 /**
  * Resolve which Chrome profile the attach capture drives.
- *  - 'temp'   → fresh throwaway (fine for soft walls).
+ *  - 'dedicated' (a login's default) → playwright-mcp's own persistent profile for
+ *               this session name (dedicatedProfileDir), driven in place and kept.
+ *  - 'temp'   → fresh throwaway (a challenge's default).
  *  - 'system' → Chrome 136+ DISABLES --remote-debugging-port on the DEFAULT
  *               user-data-dir (an anti-cookie-theft security fix), so we cannot
- *               drive it in place. Instead copy its trust-bearing essentials
- *               (Local State + cookies) into a fresh NON-default dir and drive
- *               that — the copy carries the same cf_clearance the real browser
- *               earned, and the debug port is allowed. Export is domain-scoped.
- *  - <path>   → an explicit non-default user-data-dir, driven in place.
+ *               drive it in place. Instead copy ONE of its profiles' trust-bearing
+ *               essentials (Local State + that profile's cookies and prefs) into a
+ *               fresh NON-default dir and drive that, launched with
+ *               --profile-directory so Chrome opens the copied profile rather than
+ *               whatever Local State last used. The copy carries whatever the real
+ *               browser earned with the site (a login, a bot-wall clearance), the
+ *               debug port is allowed, and the export is domain-scoped. The real dir
+ *               is only READ, so a running Chrome there is no obstacle (copyProfileEssentials
+ *               checks the copy is consistent instead).
+ *  - <path>   → an explicit non-default user-data-dir, driven in place — so a
+ *               running Chrome on it still blocks the capture.
+ * Validation runs BEFORE the temp dir exists, so a refused name leaks nothing.
  */
-function resolveAttachProfile(profile: LoginOptions['profile']): AttachProfile {
+function resolveAttachProfile(
+  profile: LoginOptions['profile'],
+  profileDirectory?: string,
+  login?: { name: string },
+): AttachProfile {
+  if (profileDirectory !== undefined && profile !== 'system')
+    throw new Error('profileDirectory only applies with profile:"system" (it picks which real Chrome profile to copy)');
+  // A login with no profile named gets its own persistent profile; a challenge stays throwaway.
+  if (profile === 'dedicated' || (!profile && login)) {
+    if (!login) throw new Error('profile:"dedicated" is for a login (session_login); a challenge uses "temp"');
+    return { dir: dedicatedProfileDir(login.name), cleanup: false, scope: false, dedicated: true };
+  }
   if (!profile || profile === 'temp') return { dir: mkTempProfile(), cleanup: true, scope: false };
   if (profile === 'system') {
     const src = defaultChromeUserDataDir();
-    return { dir: mkTempProfile(), cleanup: true, scope: true, guardDir: src, copyFrom: src };
+    const name = profileDirectory ?? DEFAULT_PROFILE_DIRECTORY;
+    validateProfileDirectory(src, name);
+    return { dir: mkTempProfile(), cleanup: true, scope: true, copyFrom: src, profileDirectory: name };
   }
   return { dir: profile, cleanup: false, scope: true, guardDir: profile };
 }
 
 /**
- * Copy just the trust-bearing profile files (cookies + the Local State that
- * holds the OS-keyring-wrapped cookie key, so the copied cookies still decrypt)
- * into a fresh dir. Small and fast — never the multi-GB caches.
+ * Where playwright-mcp keeps its OWN login profiles, one user-data-dir per session
+ * name. Never the user's Chrome: these are created here and only ever driven by
+ * attach captures. PLAYWRIGHT_MCP_LOGIN_PROFILES overrides it (the tests use it).
  */
-function copyProfileEssentials(src: string, dst: string): void {
-  const rels = [
-    'Local State',
-    'Default/Cookies',
-    'Default/Cookies-journal',
-    'Default/Network/Cookies',
-    'Default/Network/Cookies-journal',
-    'Default/Preferences',
-    'Default/Secure Preferences',
-  ];
-  for (const rel of rels) {
-    const s = path.join(src, rel);
+export function loginProfilesDir(): string {
+  return (
+    process.env.PLAYWRIGHT_MCP_LOGIN_PROFILES ??
+    path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'playwright-mcp', 'login-profiles')
+  );
+}
+
+/**
+ * The dedicated login profile for one session name, created owner-only on first use.
+ *
+ * WHY it persists. MEASURED 2026-11-22 on eBay (Akamai Bot Manager + hCaptcha), with
+ * plain google-chrome-stable, NO debugging port and NO save tab: a cold profile got
+ * 403 on the very first GET of the sign-in page, before any script ran, and the same
+ * profile relaunched was sent to /splashui/captcha. Neither the port nor the save tab
+ * was needed to be refused; what the user's everyday Chrome had and the capture did
+ * not was earned trust with the site. A throwaway profile throws that trust away at
+ * the end of every capture, so every login started cold and met the wall again. A
+ * per-name profile keeps it: a captcha solved once, and the device cookies a sign-in
+ * issues, are still there for the next login. Per NAME, not shared, so one site's
+ * login never rides along in another's capture and the export needs no domain scope
+ * (which would drop an identity provider's cookies on an SSO login).
+ */
+export function dedicatedProfileDir(name: string): string {
+  const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!safe || /^\.+$/.test(safe)) throw new Error(`attach: session name ${JSON.stringify(name)} cannot name a login profile`);
+  const root = loginProfilesDir();
+  const dir = path.join(root, safe);
+  // Owner-only, re-asserted every time: the profile holds a logged-in cookie jar.
+  for (const d of [root, dir]) {
+    ownerOnlyDir(d);
+    if (process.platform !== 'win32') fs.chmodSync(d, 0o700);
+  }
+  return dir;
+}
+
+/**
+ * The pid of a Chrome that is RUNNING on `dir`, else null. Chrome's SingletonLock is a
+ * symlink to "<host>-<pid>"; after a crash or a kill it stays behind, pointing at a dead
+ * pid, and a lock-file test alone would then refuse the dedicated profile for good.
+ * Anything unreadable counts as running, the safe side of two Chromes on one profile.
+ */
+export function liveChromeOn(dir: string): number | null {
+  let target: string;
+  try {
+    target = fs.readlinkSync(path.join(dir, 'SingletonLock'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null; // no lock: nothing running
+    return profileInUse(dir) ? -1 : null; // not a symlink (win32 lockfile): fall back to presence
+  }
+  const pid = Number(/-(\d+)$/.exec(target)?.[1]);
+  if (!Number.isInteger(pid) || pid <= 0) return -1;
+  return processAlive(pid) ? pid : null;
+}
+
+/** SQLite files Chrome may be writing while it runs: each is copied with its sidecars, then verified. */
+const SQLITE_ESSENTIALS = ['Cookies', 'Network/Cookies'];
+const SQLITE_SIDECARS = ['-journal', '-wal'];
+/** Plain files Chrome replaces atomically (write-then-rename), so a single copy is never torn. */
+const PLAIN_ESSENTIALS = ['Preferences', 'Secure Preferences'];
+const COPY_ATTEMPTS = 5;
+
+type MiniSqlite = { DatabaseSync: new (p: string) => { prepare(q: string): { all(): unknown[] }; close(): void } };
+let sqliteMod: MiniSqlite | null | undefined;
+/** node:sqlite when this Node has it unflagged (22.13+), else null. Loaded lazily, once. */
+async function loadSqlite(): Promise<MiniSqlite | null> {
+  if (sqliteMod === undefined) {
+    try {
+      const spec = 'node:sqlite'; // a variable: @types/node here predates the module
+      sqliteMod = (await import(spec)) as MiniSqlite;
+    } catch {
+      sqliteMod = null;
+    }
+  }
+  return sqliteMod;
+}
+
+/** Size + mtime of a file and its sidecars: the "did Chrome write while we copied" fingerprint. */
+function sqliteStamp(file: string): string {
+  return ['', ...SQLITE_SIDECARS]
+    .map((sfx) => {
+      try {
+        const st = fs.statSync(file + sfx);
+        return `${st.size}:${st.mtimeMs}`;
+      } catch {
+        return '-';
+      }
+    })
+    .join('|');
+}
+
+/**
+ * Is the copied database whole? With node:sqlite, open it (which rolls back a
+ * copied hot journal, on the COPY) and run quick_check. Without it, fall back to
+ * the SQLite header, and rely on the unchanged size/mtime stamp alone.
+ */
+export async function sqliteCopyIntact(file: string): Promise<boolean> {
+  const sqlite = await loadSqlite();
+  if (!sqlite) {
+    try {
+      const fd = fs.openSync(file, 'r');
+      const head = Buffer.alloc(16);
+      fs.readSync(fd, head, 0, 16, 0);
+      fs.closeSync(fd);
+      return head.toString('latin1') === 'SQLite format 3\0';
+    } catch {
+      return false;
+    }
+  }
+  try {
+    const db = new sqlite.DatabaseSync(file);
+    try {
+      const rows = db.prepare('PRAGMA quick_check').all() as Array<Record<string, unknown>>;
+      return rows.length === 1 && Object.values(rows[0])[0] === 'ok';
+    } finally {
+      db.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Copy one live SQLite database (plus its journal/WAL) so the copy is consistent
+ * even while Chrome keeps writing the original. A plain read is never blocked by
+ * Chrome's SQLite locks; what can go wrong is a TORN copy, taken mid-write. So:
+ * stamp, copy, stamp again, verify — and retry when anything moved. After
+ * COPY_ATTEMPTS it fails loudly rather than launch on a damaged cookie jar.
+ */
+async function copySqliteConsistent(src: string, dst: string, label: string): Promise<void> {
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  for (let attempt = 1; attempt <= COPY_ATTEMPTS; attempt++) {
+    const before = sqliteStamp(src);
+    for (const sfx of SQLITE_SIDECARS) fs.rmSync(dst + sfx, { force: true });
+    fs.copyFileSync(src, dst);
+    for (const sfx of SQLITE_SIDECARS) if (fs.existsSync(src + sfx)) fs.copyFileSync(src + sfx, dst + sfx);
+    if (sqliteStamp(src) === before && (await sqliteCopyIntact(dst))) return;
+    await sleep(150 * attempt);
+  }
+  throw new Error(
+    `attach: could not take a consistent copy of Chrome's ${label} after ${COPY_ATTEMPTS} tries — the running ` +
+      'Chrome kept writing it. Nothing was launched; retry in a moment.',
+  );
+}
+
+/**
+ * Copy just the trust-bearing files of ONE profile (cookies + prefs) plus the
+ * user-data-dir's Local State, which holds the cookie key (wrapped by the OS
+ * keyring on Windows; on Linux/macOS the key lives in the keyring itself, shared
+ * by every user-data-dir), so the copied cookies still decrypt. The profile keeps
+ * its own folder name in the copy. Small and fast — never the multi-GB caches.
+ * Safe while Chrome runs on `src`: the databases are verified (copySqliteConsistent).
+ */
+export async function copyProfileEssentials(src: string, dst: string, profileDirectory = DEFAULT_PROFILE_DIRECTORY): Promise<void> {
+  validateProfileDirectory(src, profileDirectory); // the engine re-checks: never trust the caller did
+  const ls = path.join(src, 'Local State');
+  if (fs.existsSync(ls)) {
+    try {
+      fs.copyFileSync(ls, path.join(dst, 'Local State'));
+    } catch {
+      /* skip a file we can't read */
+    }
+  }
+  for (const rel of PLAIN_ESSENTIALS) {
+    const s = path.join(src, profileDirectory, rel);
     if (!fs.existsSync(s)) continue;
-    const d = path.join(dst, rel);
+    const d = path.join(dst, profileDirectory, rel);
     try {
       fs.mkdirSync(path.dirname(d), { recursive: true });
       fs.copyFileSync(s, d);
     } catch {
       /* skip a file we can't read */
     }
+  }
+  // The cookie jar is the whole point, so a failure here is NOT skipped silently.
+  for (const rel of SQLITE_ESSENTIALS) {
+    const s = path.join(src, profileDirectory, rel);
+    if (fs.existsSync(s)) await copySqliteConsistent(s, path.join(dst, profileDirectory, rel), `${profileDirectory}/${rel}`);
   }
   try {
     fs.writeFileSync(path.join(dst, 'First Run'), ''); // skip the first-run UI
@@ -1251,6 +1478,8 @@ interface AttachRec {
    * Absent on records written before this field existed; those are reaped as before.
    */
   owner?: number;
+  /** A dedicated login profile (dedicatedProfileDir): its orphaned Chrome is reaped, the dir is never deleted. */
+  keep?: boolean;
 }
 const registryPath = () => path.join(sessionsDir(), '.attach-chromes.json');
 function readRegistry(): AttachRec[] {
@@ -1297,18 +1526,25 @@ function killGroup(pid: number): void {
     }
   }
 }
-/** Reap any TEMP-profile Chrome an interrupted prior run left behind (safe: never touches a real profile). */
+/**
+ * Reap any TEMP-profile Chrome an interrupted prior run left behind, and the Chrome of a
+ * dedicated login profile (whose dir is kept). Safe: never touches a real profile.
+ */
 function reapOrphans(): void {
   const recs = readRegistry();
   if (!recs.length) return;
   const kept: AttachRec[] = [];
   for (const r of recs) {
-    if (!r.profile.includes(TEMP_PROFILE_MARK)) continue; // only temp spawns are auto-reaped
+    // only temp spawns and our own dedicated login profiles are auto-reaped
+    const dedicated = r.keep === true && path.dirname(path.resolve(r.profile)) === path.resolve(loginProfilesDir());
+    if (!dedicated && !r.profile.includes(TEMP_PROFILE_MARK)) continue;
     if (r.owner !== undefined && processAlive(r.owner)) {
       kept.push(r); // its server is alive and will close it itself
       continue;
     }
-    if (cmdlineMatches(r.pid, r.profile)) killGroup(r.pid);
+    // A dedicated path is a prefix of a longer name's ("ebay" of "ebay2"): match the whole argument.
+    if (cmdlineMatches(r.pid, dedicated ? `--user-data-dir=${r.profile}\0` : r.profile)) killGroup(r.pid);
+    if (dedicated) continue; // kept for the next login: only its Chrome was an orphan
     try {
       fs.rmSync(r.profile, { recursive: true, force: true });
     } catch {
@@ -1330,20 +1566,30 @@ function processAlive(pid: number): boolean {
 export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   reapOrphans(); // clean up anything a previous interrupted run left running
   const out = sessionFilePath(opts.name);
-  const prof = resolveAttachProfile(opts.profile);
+  const prof = resolveAttachProfile(opts.profile, opts.profileDirectory, opts.challenge ? undefined : { name: opts.name });
   const chromePath = resolveChromePath();
   let child: ReturnType<typeof spawn> | undefined;
   let cdp: Browser | undefined;
   let button: DoneButton | undefined;
   try {
+    // Only a dir we DRIVE in place is guarded: two Chromes cannot share one
+    // user-data-dir. 'system' only READS the real dir, so the user's running Chrome
+    // is fine there; the copy is verified instead (copyProfileEssentials).
     if (prof.guardDir && profileInUse(prof.guardDir))
       throw new Error(
-        `attach: Chrome is running on ${prof.guardDir} — fully quit it first (all windows AND any ` +
-          "background process) so its trust cookies can be read cleanly, then retry",
+        `attach: Chrome is running on ${prof.guardDir} — this profile is driven in place, so fully quit ` +
+          'that Chrome first (all windows AND any background process), then retry',
+      );
+    // The dedicated profile is ours, so only a Chrome that is really running on it
+    // (an earlier login window for the same name, still open) blocks the capture.
+    if (prof.dedicated && liveChromeOn(prof.dir) !== null)
+      throw new Error(
+        `attach: a login window for "${opts.name}" is already open (its Chrome is still running). ` +
+          'Finish or close that window, then retry.',
       );
     // 'system' rides the real profile's trust: copy its cookies into the fresh
     // (non-default) dir we drive, so Chrome 136+ still allows the debug port.
-    if (prof.copyFrom) copyProfileEssentials(prof.copyFrom, prof.dir);
+    if (prof.copyFrom) await copyProfileEssentials(prof.copyFrom, prof.dir, prof.profileDirectory);
 
     const port = await freePort(); // never 0 — see freePort()
     // A login opens with the "I'm signed in" tab beside the site (login-done.ts); a
@@ -1356,6 +1602,9 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       );
     }
     const args = attachChromeArgs(prof.dir, port, opts.loginUrl, ...(button ? [button.url] : []));
+    // Open the COPIED profile, not whatever the copied Local State last used (on a
+    // multi-profile host that is often another profile, empty in the copy).
+    if (prof.profileDirectory) args.unshift(`--profile-directory=${prof.profileDirectory}`);
     child = spawn(chromePath, args, { stdio: 'ignore', detached: true }); // own process group → clean tree-kill
     child.on('error', (e) => log(`attach: chrome spawn error: ${e.message}`));
     // The end signal for the unbounded wait, HINT half: the Chrome we spawned is
@@ -1366,12 +1615,14 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     child.on('exit', () => {
       chromeExited = true;
     });
-    if (child.pid && prof.cleanup) registerAttachRecord(child.pid, prof.dir); // temp/copy dirs are reap-eligible
+    // temp/copy dirs are reap-eligible; a dedicated profile's Chrome is reaped, its dir kept
+    if (child.pid && (prof.cleanup || prof.dedicated)) registerAttachRecord(child.pid, prof.dir, prof.dedicated);
     log(
       opts.challenge
         ? `attach challenge for "${opts.name}" — a real Chrome window opened; solve the CAPTCHA there and stay on the page`
-        : `attach login for "${opts.name}" — a real Chrome window opened; log in there, then press ` +
-            `"I'm signed in, save it" on its second tab`,
+        : `attach login for "${opts.name}" — a real Chrome window opened; log in there (solve any ` +
+            `CAPTCHA the site shows first), then press "I'm signed in, save it" on its second tab` +
+            (prof.dedicated ? ` (playwright-mcp's own profile for "${opts.name}", kept between logins)` : ''),
     );
 
     await waitForDevtools(port, 20_000); // startup, not a human wait — still bounded
@@ -1464,6 +1715,10 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       ...(err instanceof LoginCancelledError ? { cancelled: true as const } : {}),
     };
   } finally {
+    // A dedicated profile is kept for the next login, so let Chrome shut down cleanly:
+    // it writes its cookie store on the way out, where a kill can lose what the last
+    // seconds earned (a just-solved captcha), and the next launch shows no crash bubble.
+    if (cdp && child && prof.dedicated) await closeChromeGracefully(cdp, child);
     await cdp?.close().catch(() => {}); // detaches the CDP client — does not close the browser
     if (child?.pid) {
       killGroup(child.pid); // kill the Chrome WE spawned (its own process group)
@@ -1474,9 +1729,24 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   }
 }
 
-function registerAttachRecord(pid: number, profile: string): void {
+/** Browser.close over the capture's own CDP connection, then wait (bounded) for Chrome to exit. */
+async function closeChromeGracefully(cdp: Browser, child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((r) => child.once('exit', () => r()));
+  try {
+    const s = await cdp.newBrowserCDPSession();
+    await s.send('Browser.close').catch(() => {}); // the connection drops as Chrome goes
+  } catch {
+    return; // no session: the kill that follows still ends it
+  }
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([exited, new Promise<void>((r) => (timer = setTimeout(r, 8000)))]);
+  clearTimeout(timer);
+}
+
+function registerAttachRecord(pid: number, profile: string, keep = false): void {
   const recs = readRegistry();
-  recs.push({ pid, profile, startedAt: new Date().toISOString(), owner: process.pid });
+  recs.push({ pid, profile, startedAt: new Date().toISOString(), owner: process.pid, ...(keep ? { keep: true } : {}) });
   writeRegistry(recs);
 }
 function unregisterAttachRecord(pid: number): void {
@@ -2065,6 +2335,9 @@ const loginDefinition: Tool = {
     'the login form (e.g. dash.cloudflare.com, chatgpt.com), use attach:true FROM THE START: the ' +
     'headed automation window is rejected by these checks. attach:true opens a real Chrome window ' +
     'and the session is harvested passively (no CDP driving during the solve). ' +
+    'If a site rejects that fresh window but the user\'s everyday Chrome gets in, add ' +
+    'profile:"system": it copies that Chrome profile\'s cookies into the capture, for ANY site, while ' +
+    'that Chrome keeps running (profileDirectory picks a profile other than "Default"). ' +
     'If your own call is cut short while the human is still logging in, the capture KEEPS GOING and ' +
     'still saves; poll session_status({name}) to see it finish instead of starting a second login. ' +
     'To capture a CLEARED BOT WALL with NO login at all, use session_solve_challenge instead. ' +
@@ -2101,12 +2374,25 @@ const loginDefinition: Tool = {
       profile: {
         type: 'string',
         description:
-          'attach-mode Chrome profile. "temp" (default) = fresh throwaway, fine for soft walls. ' +
-          '"system" = copy the host\'s REAL Chrome profile\'s trust cookies (cf_clearance) into the ' +
-          'driven profile, so an established browser\'s trust carries the capture past a HARD ' +
-          'Cloudflare wall that hard-challenges a fresh profile (Chrome 136+ blocks the debug port on ' +
-          'the default dir, hence the copy); the user must fully quit Chrome first and the export is ' +
-          'auto-scoped to the login site\'s domain. Or an explicit user-data-dir path.',
+          'attach-mode Chrome profile. "dedicated" (default) = playwright-mcp\'s OWN persistent profile ' +
+          'for this session name, kept between logins so a site that walls a cold browser (Akamai, ' +
+          'hCaptcha: eBay) sees the trust earned last time instead of a brand-new browser; never the ' +
+          'user\'s Chrome. "temp" = fresh throwaway, deleted afterwards. ' +
+          '"system" = copy one profile of the host\'s REAL Chrome (its cookies, prefs and Local State) ' +
+          'into the driven profile, so whatever that browser has earned with the site (an existing ' +
+          'login, a bot-wall clearance, a trusted-device cookie) carries into the capture, for ANY ' +
+          'site that rejects a fresh profile. Chrome 136+ blocks the debug port on its default ' +
+          'user-data-dir, hence a copy rather than driving it. Works while that Chrome is running; ' +
+          'the export is auto-scoped to the login site\'s domain and the copy is deleted afterwards. ' +
+          'Or an explicit user-data-dir path, driven in place (that one must not be open in Chrome).',
+      },
+      profileDirectory: {
+        type: 'string',
+        description:
+          'With profile:"system" only: which of the real Chrome\'s profiles to copy, by its folder name ' +
+          'inside the Chrome user-data-dir: "Default" (the default), "Profile 1", "Profile 2", ... — the ' +
+          'last part of "Profile Path" on chrome://version in the profile that has the login. A single ' +
+          'folder name only; paths are refused.',
       },
       timeoutMs: {
         type: 'number',
@@ -2163,7 +2449,7 @@ function reservedName(name: string): CallToolResult | undefined {
 }
 
 async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
-  const refused = refusal(args);
+  const refused = refusal(args) ?? profileRefusal(args);
   if (refused) return refused;
   const opts: LoginOptions = {
     name: String(args.name ?? ''),
@@ -2172,6 +2458,7 @@ async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): P
     headed: Boolean(args.headed),
     attach: Boolean(args.attach),
     profile: args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
+    profileDirectory: args.profileDirectory != null ? String(args.profileDirectory) : undefined,
     timeoutMs: args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
     credKeys: args.credKeys as LoginOptions['credKeys'],
     envFile: args.envFile ? String(args.envFile) : undefined,
@@ -2223,6 +2510,23 @@ async function runCapture(
  * that is worth saying BEFORE a human spends minutes in a login window. A lease
  * that is live here may still lapse during the wait; bindAndReport handles that.
  */
+/**
+ * A bad profileDirectory is refused at the handler, as a clean tool error, before
+ * any capture record or temp dir exists. resolveAttachProfile re-checks it in the
+ * engine; this is only the polite front door.
+ */
+function profileRefusal(args: Record<string, unknown>): CallToolResult | undefined {
+  if (args.profileDirectory == null) return undefined;
+  try {
+    if (args.profile !== 'system')
+      throw new Error('profileDirectory only applies with profile:"system" (it picks which real Chrome profile to copy)');
+    validateProfileDirectory(defaultChromeUserDataDir(), args.profileDirectory);
+    return undefined;
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+  }
+}
+
 function refusal(args: Record<string, unknown>): CallToolResult | undefined {
   const reserved = reservedName(String(args.name ?? ''));
   if (reserved) return reserved;
@@ -2412,7 +2716,8 @@ const solveChallengeDefinition: Tool = {
     'with web_fetch({url, session}) to read a page that is otherwise unreachable. NOTE the artifact ' +
     'is SHORT-LIVED — a clearance cookie lasts minutes, not days; the result reports expiresAt, and ' +
     'session_status cannot detect this kind of expiry. If a fresh profile keeps getting hard-' +
-    'challenged, retry with profile:"system" to ride your real browser\'s established trust.',
+    'challenged, retry with profile:"system" to ride your real browser\'s established trust (it works ' +
+    'while that Chrome is running).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2421,10 +2726,19 @@ const solveChallengeDefinition: Tool = {
       profile: {
         type: 'string',
         description:
-          '"temp" (default) = fresh throwaway profile, fine for soft walls. "system" = copy the host\'s ' +
-          "REAL Chrome profile's trust cookies (cf_clearance) into the driven profile so an established " +
-          'browser\'s trust carries the capture past a HARD wall (the user must fully quit Chrome first; ' +
-          'the export is auto-scoped to the site\'s domain). Or an explicit user-data-dir path.',
+          '"temp" (default) = fresh throwaway profile, fine for soft walls. "system" = copy one profile ' +
+          "of the host's REAL Chrome (cookies, prefs, Local State) into the driven profile so whatever " +
+          'that browser has earned with the site carries past a HARD wall. Works while that Chrome is ' +
+          'running; the export is auto-scoped to the site\'s domain and the copy is deleted afterwards. ' +
+          'Or an explicit user-data-dir path, driven in place (that one must not be open in Chrome).',
+      },
+      profileDirectory: {
+        type: 'string',
+        description:
+          'With profile:"system" only: which of the real Chrome\'s profiles to copy, by its folder name ' +
+          'inside the Chrome user-data-dir: "Default" (the default), "Profile 1", "Profile 2", ... — the ' +
+          'last part of "Profile Path" on chrome://version in the profile that has the login. A single ' +
+          'folder name only; paths are refused.',
       },
       timeoutMs: {
         type: 'number',
@@ -2452,7 +2766,7 @@ async function solveChallengeHandler(
   args: Record<string, unknown>,
   ctx?: ToolContext,
 ): Promise<CallToolResult> {
-  const refused = refusal(args);
+  const refused = refusal(args) ?? profileRefusal(args);
   if (refused) return refused;
   return bindAndReport(
     await solveChallenge(
@@ -2461,6 +2775,7 @@ async function solveChallengeHandler(
       ctx,
       args.profile != null ? (String(args.profile) as LoginOptions['profile']) : undefined,
       args.timeoutMs != null ? Number(args.timeoutMs) : undefined,
+      args.profileDirectory != null ? String(args.profileDirectory) : undefined,
     ), ctx, args);
 }
 
@@ -2479,6 +2794,7 @@ export function solveChallenge(
   ctx?: ToolContext,
   profile?: LoginOptions['profile'],
   timeoutMs?: number,
+  profileDirectory?: string,
 ): Promise<LoginResult> {
   return runCapture(
     {
@@ -2487,6 +2803,7 @@ export function solveChallenge(
       challenge: true,
       attach: true,
       profile,
+      profileDirectory,
       timeoutMs,
       // Always human-present: the whole point is a person clearing the wall by hand.
       wait: resolveHumanWait(timeoutMs, ctx?.trust ?? 'local'),

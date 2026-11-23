@@ -146,7 +146,7 @@ const recordDefinition: Tool = {
     'system ffmpeg with h264/gif is found, and says so when it is not. Two targets + sideBySide:true also ' +
     'makes a before/after composite (ffmpeg). Re-running the same script into the same job replaces those ' +
     `clips. Outputs over ${MB} MB are flagged. Long matrices take a while; movie_list shows what finished. ` +
-    'Then upload the clips to the shareable artifact, confirm they landed, and movie_clean the job (see the share line).',
+    'Then deliver the clips using the share line, verify the destination, and movie_clean the job.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -225,7 +225,7 @@ function splitErrors(clips: ClipRecord[]) {
  * the local job MUST be cleaned (movie_clean) along with any staging copies.
  */
 export const SHARE_HINT =
-  'LIFECYCLE: record, upload to the shareable artifact, confirm the files landed, then movie_clean; uploading ' +
+  'WHEN CLAUDE ARTIFACT TOOLS ARE AVAILABLE: LIFECYCLE: record, upload to the shareable artifact, confirm the files landed, then movie_clean; uploading ' +
   'is how a movie job is cleaned up. Share these on a claude.ai Artifact HTML page (never Claude Docs). ' +
   'ADDING TO AN ARTIFACT THIS WORK ALREADY HAS: in this conversation, republish the same local page file; ' +
   'from an earlier one, Artifact list, read it, ' +
@@ -247,7 +247,13 @@ export const SHARE_HINT =
   'with a video/* type; (3) then you must call movie_clean({job}) and delete any local copies or staging folder ' +
   'made for the page (keep only the page\'s own source file if it lives in the project). Never clean before ' +
   'step 2 succeeds; if a publish failed, keep the files. movie_clean without an upload is only for discarding ' +
-  'a bad take or a job nobody needs.';
+  'a bad take or a job nobody needs. ' +
+  'IN CODEX OR CLIENTS WITHOUT CLAUDE ARTIFACT TOOLS: publish through an available publishing tool, adding the clips ' +
+  'to the existing page when possible, and verify playback/download at the destination. The template above also works ' +
+  'as a local HTML page; put video/poster copies beside it using relative paths. If no publishing tool is available, ' +
+  'give the user absolute paths to durable local copies outside the movie job folder. Keep originals until the upload ' +
+  'or local copies are verified, then movie_clean({job}). Never hand off job-folder paths and then delete their files. ' +
+  'If delivery fails or a destination is unavailable, keep the job for movie_list recovery.';
 
 async function recordHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
   let status = 'starting';
@@ -281,7 +287,7 @@ async function recordHandler(args: Record<string, unknown>, ctx?: ToolContext): 
             clips: clean,
             composites: result.composites,
             notes: result.notes.length ? result.notes : undefined,
-            next: 'movie_list({job}) for sizes and durations; then upload the clips to the shareable artifact (share), confirm the files landed, and movie_clean({job}).',
+            next: 'movie_list({job}) for sizes and durations; deliver the clips using share, verify the destination, then movie_clean({job}).',
             share: SHARE_HINT,
           },
           null,
@@ -343,7 +349,8 @@ const cleanDefinition: Tool = {
   name: 'movie_clean',
   description:
     'Delete one movie job folder and everything in it. The normal way a job ends: after its clips are uploaded ' +
-    'to the shareable artifact and an Artifact files listing shows them landed (see the share line of ' +
+    'to the shareable artifact and an Artifact files listing shows them landed, or verified durable copies ' +
+    'have been delivered in Codex/other clients (see the share line of ' +
     'movie_record / movie_list). Also used alone to discard a bad take or a job nobody needs. Only folders ' +
     'movie_record made are removed; saved scripts are kept.',
   inputSchema: {

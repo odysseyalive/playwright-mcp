@@ -15,9 +15,15 @@ await client.connect(transport);
 // capability map. With web_fetch present it must also carry the REPLACES NATIVE
 // WebFetch steering line (web search is delegated to native WebSearch, not us).
 const instructions = client.getInstructions() ?? '';
+// Claude Code cuts server instructions off at 4096 characters (seen live: the cut
+// landed mid-sentence and every section after it never reached the model), so the
+// whole map, tool list included, must fit.
+const INSTRUCTIONS_BUDGET = 4096;
 const instructionsOk =
   instructions.includes('browser_navigate') && instructions.includes('REPLACES NATIVE WebFetch');
 console.log(instructionsOk ? 'instructions: capability map present (+ replaces-native-WebFetch steering)' : 'FAIL: instructions missing or incomplete');
+const budgetOk = instructions.length <= INSTRUCTIONS_BUDGET;
+console.log(budgetOk ? `instructions: ${instructions.length}/${INSTRUCTIONS_BUDGET} chars, fits Claude Code's cut-off` : `FAIL: instructions are ${instructions.length} chars; Claude Code truncates at ${INSTRUCTIONS_BUDGET}`);
 
 const { tools } = await client.listTools();
 const names = new Set(tools.map((t) => t.name));
@@ -76,4 +82,4 @@ if (pid) {
 console.log(shutdownOk ? 'shutdown: SIGTERM exits cleanly' : 'FAIL: server still running 10s after SIGTERM');
 
 await client.close().catch(() => {});
-process.exit(text.includes('smoke-ok') && instructionsOk && toolsOk && noticeOk && shutdownOk ? 0 : 1);
+process.exit(text.includes('smoke-ok') && instructionsOk && budgetOk && toolsOk && noticeOk && shutdownOk ? 0 : 1);

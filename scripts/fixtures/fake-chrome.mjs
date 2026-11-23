@@ -19,7 +19,9 @@
 //   popup  — an SSO identity provider opens a popup and the ORIGINAL tab closes.
 //            Poll 1 shows both pages, every later poll shows only the popup.
 //            A page is still open, so this must NOT cancel.
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 
 const port = Number(
   (process.argv.find((a) => a.startsWith('--remote-debugging-port=')) ?? '').split('=')[1],
@@ -30,6 +32,23 @@ if (!Number.isInteger(port) || port <= 0) {
 }
 
 const mode = process.env.PWMCP_FAKE_CHROME_MODE ?? 'alive';
+
+// PWMCP_FAKE_CHROME_REPORT=<file>: record what this "Chrome" was launched with —
+// its argv and every file in its --user-data-dir AT LAUNCH — so a test can prove
+// which profile a profile:'system' capture copied and asked Chrome to open.
+if (process.env.PWMCP_FAKE_CHROME_REPORT) {
+  const udd = (process.argv.find((a) => a.startsWith('--user-data-dir=')) ?? '').slice('--user-data-dir='.length);
+  const files = [];
+  const walk = (dir, rel) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(path.join(dir, e.name), r);
+      else files.push(r);
+    }
+  };
+  if (udd) walk(udd, '');
+  fs.writeFileSync(process.env.PWMCP_FAKE_CHROME_REPORT, JSON.stringify({ argv: process.argv.slice(2), files: files.sort() }));
+}
 
 // The attach wait never connects over CDP before the "I'm signed in" button is
 // pressed, and these tests never press it, so this fixture needs no CDP. The page

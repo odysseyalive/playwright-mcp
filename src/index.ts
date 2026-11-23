@@ -77,8 +77,9 @@ function buildInstructions(
   if (names.has('web_fetch')) {
     lines.push(
       'REPLACES NATIVE WebFetch: use web_fetch to fetch a URL — it stealth-renders JS pages and PDFs and ' +
-        'extracts readable text + author/date/CMS citations. For web SEARCH use the native WebSearch tool, ' +
-        'then verify and cite the top results with web_fetch.',
+        'extracts readable text + author/date/CMS citations. For web SEARCH use the native WebSearch tool in Claude Code, ' +
+        'or the available native web-search tool in Codex/other clients (when enabled); this server does not provide search. ' +
+        'Then verify and cite the top results with web_fetch.',
       '',
     );
   }
@@ -96,40 +97,31 @@ function buildInstructions(
   if (names.has('session_login')) {
     lines.push(
       '',
-      'SITE BEHIND A LOGIN: call session_login({name, loginUrl, headed:true}) and let the human ' +
-        'handle the entire login in the headed window. Do NOT use browser_* tools to probe the ' +
-        'login form or work out whether it needs a password, 2FA, SSO, or a CAPTCHA. The human ' +
-        'does every step, at their own pace, ' +
+      'SITE BEHIND A LOGIN: call session_login({name, loginUrl, headed:true}) and let the human do the whole ' +
+        'login in the headed window; do NOT probe the login form with browser_* tools. The human ' +
         (noTimeLimit
-          ? 'with no time limit, and presses "I\'m signed in, save it" on the window\'s second tab ' +
-            'when done; closing the window cancels. '
-          : 'up to this surface\'s bounded 300000ms default (pass timeoutMs to change it). ') +
-        'Credentials never pass through ' +
-        'the model. Point loginUrl at the app page you want; redirects to the identity provider ' +
-        'are followed, and the capture FAILS LOUDLY rather than saving an unauthenticated session. ' +
-        'Then read authenticated pages with web_fetch({url, session:"name"}); session_status({name}) ' +
-        'says OFFLINE (no browser) whether that session already exists and which domains it covers. ' +
-        'Check it BEFORE proposing a login; add probeUrl to live-probe it. It also reports a capture ' +
-        'still in progress and whether it saved, so a tool call cut short mid-login is recovered by ' +
-        'polling it rather than by logging in again. The capture BINDS the ' +
-        'browser automatically, so browser_* are then authenticated too. ' +
-        'session_attach({name}) re-binds a session captured in an earlier run; ' +
-        'session_attach({name:null}) drops back to anonymous.',
+          ? 'has no time limit, presses "I\'m signed in, save it" on the window\'s second tab when done, and ' +
+            'cancels by closing the window. '
+          : 'has this surface\'s bounded 300000ms default (pass timeoutMs to change it). ') +
+        'Credentials never pass through the model. Identity-provider redirects are followed, and the capture ' +
+        'FAILS LOUDLY rather than save an unauthenticated session. Then read authenticated pages with ' +
+        'web_fetch({url, session:"name"}). Check session_status({name}) BEFORE proposing a login: OFFLINE (no ' +
+        'browser) it says whether the session exists and which domains it covers (probeUrl live-probes it), and ' +
+        'it reports a capture still in progress, so a call cut short mid-login is recovered by polling it, not by ' +
+        'logging in again. The capture BINDS the browser, so browser_* are authenticated too; ' +
+        'session_attach({name}) re-binds an earlier session, session_attach({name:null}) returns to anonymous.',
     );
   }
   if (names.has('session_solve_challenge')) {
     lines.push(
       '',
-      'BLOCKED BY A CAPTCHA / BOT WALL: session_solve_challenge opens a real Chrome for the ' +
-        'human to solve it once, ' +
+      'BLOCKED BY A CAPTCHA / BOT WALL: session_solve_challenge opens a real Chrome for the human to solve it ' +
+        'once, ' +
         (noTimeLimit ? 'with no time limit, ' : 'within this surface\'s bounded 300000ms default, ') +
-        'then saves the cleared session AND binds it ' +
-        'exactly as session_login does. browser_* and web_fetch({url, session}) both get past the ' +
-        'wall afterwards. Short-lived (minutes); re-solve when it lapses. web_fetch does this on its ' +
-        'own: a fetch that lands on a wall opens that window and waits up to 90s; if the wall is still ' +
-        'up it returns blocked, saying a window is waiting at that host. Ask the human to solve it, ' +
-        'then retry. The clearance is saved as wall-<host> and reused by later fetches to that host ' +
-        'until it lapses.',
+        'then saves and binds the cleared session as session_login does, for browser_* and ' +
+        'web_fetch({url, session}). Short-lived (minutes); re-solve when it lapses. web_fetch does this itself: ' +
+        'a fetch that hits a wall opens that window and waits up to 90s, then returns blocked, saying a window ' +
+        'is waiting at that host. Ask the human to solve it, then retry; the clearance is reused as wall-<host>.',
     );
   }
   if (names.has('session_scaffold_tests')) {
@@ -137,22 +129,6 @@ function buildInstructions(
       '',
       'AUTHENTICATED E2E TESTS: capture a login once with session_login, then call session_scaffold_tests to ' +
         'generate a deterministic Playwright suite (setup-project + dependencies) that reuses it — no model in the loop.',
-    );
-  }
-  if (names.has('movie_record')) {
-    lines.push(
-      '',
-      'SHOW A GUI CHANGE AS A VIDEO: movie_record renders a mock-up (HTML file or string, served on its own ' +
-        'loopback server) or a live local page, runs a step list (click/type/hover/press/wait/scroll + caption + ' +
-        'highlight) and writes captioned clips per viewport (desktop/phone) and light/dark into one job folder: ' +
-        '.webm + .png poster always, .mp4/.gif/before-after side-by-side when ffmpeg allows. Save the steps with ' +
-        'movie_script_save to re-run after the mock-up changes; movie_list hands off paths, sizes and durations. ' +
-        'Own browser, NOT queued. LIFECYCLE: record, upload to the shareable artifact, confirm the files landed, ' +
-        'then movie_clean; uploading is how a movie job is cleaned up (movie_clean alone only discards a bad take). ' +
-        'SHARE the clips in a claude.ai Artifact: add them to the shareable artifact already being worked on (same URL, as sections matching its ' +
-        'layout), or, when none exists, create a new one in the full house style with its table of contents ' +
-        '(the shared-artifact skill, or the movie-page template this server ships). Once the artifact\'s files ' +
-        'listing shows the clips, movie_clean the job and delete local copies (required). The movie_record result says how.',
     );
   }
   if (names.has('suite_scaffold') || names.has('suite_methodology')) {
@@ -163,9 +139,34 @@ function buildInstructions(
         'per-failure dossiers for TEST-DEFECT vs PRODUCT-BUG adjudication (fix scripts only — never paper over product bugs).',
     );
   }
+  if (names.has('movie_record')) {
+    lines.push(
+      '',
+      'SHOW A GUI CHANGE AS A VIDEO: movie_record renders a mock-up (HTML file or string) or a live local page, ' +
+        'runs a step list (click/type/hover/press/wait/scroll + caption + highlight) and writes captioned ' +
+        'desktop/phone, light/dark clips into one job folder (.webm + .png poster; .mp4/.gif/before-after with ' +
+        'ffmpeg). movie_script_save keeps the steps for re-runs; movie_list hands off paths, sizes and durations. ' +
+        'Own browser, NOT queued. A job ends once its clips are delivered and verified, then movie_clean: with ' +
+        'Claude Artifact tools, add them to the claude.ai Artifact this work already has (or a new house-style one) ' +
+        'and confirm its files listing shows them; without those tools, publish another way or hand off durable ' +
+        'local copies outside the job folder. movie_record\'s share line has the full steps.',
+    );
+  }
   lines.push(
     '',
-    `All tools (${names.size}): ${[...names].sort().join(', ')}`,
+    // Counts, not names: Claude Code truncates instructions at 4096 chars and
+    // already lists every tool name itself, so a full list here only pushed
+    // real guidance past the cut (scripts/smoke.mjs enforces the budget).
+    `Tools (${names.size}): ` +
+      Object.entries(
+        [...names].reduce<Record<string, string[]>>((acc, n) => {
+          (acc[`${n.split('_')[0]}_*`] ??= []).push(n);
+          return acc;
+        }, {}),
+      )
+        .sort(([x], [y]) => x.localeCompare(y))
+        .map(([k, members]) => (members.length > 1 ? `${k} (${members.length})` : members[0]))
+        .join(', '),
   );
   return lines.join('\n');
 }

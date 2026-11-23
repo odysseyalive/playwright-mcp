@@ -18,6 +18,7 @@ import { withPlatformSync } from './fixtures/platform.mjs';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-sess-'));
 process.env.PLAYWRIGHT_MCP_SESSIONS = path.join(TMP, 'sessions');
 process.env.PLAYWRIGHT_MCP_SECRETS = path.join(TMP, 'secrets.env');
+process.env.PLAYWRIGHT_MCP_LOGIN_PROFILES = path.join(TMP, 'login-profiles');
 fs.writeFileSync(
   process.env.PLAYWRIGHT_MCP_SECRETS,
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
@@ -669,10 +670,13 @@ test('attachChromeArgs: attach never launches Chrome with debugging port 0', asy
 test('session_login and session_solve_challenge share one bind path', async () => {
   const src = fs.readFileSync(new URL('../src/tools/session.ts', import.meta.url), 'utf8');
 
-  const loginTail = src.slice(src.indexOf('async function loginHandler'));
-  const challengeTail = src.slice(src.indexOf('async function solveChallengeHandler'));
-  assert.match(loginTail.slice(0, 1200), /return bindAndReport\(/, 'login binds via the shared helper');
-  assert.match(challengeTail.slice(0, 1200), /return bindAndReport\(/, 'challenge binds via the shared helper');
+  // Each handler's own body, start to closing brace (not a fixed character count).
+  const body = (marker) => {
+    const at = src.indexOf(marker);
+    return src.slice(at, src.indexOf('\n}\n', at));
+  };
+  assert.match(body('async function loginHandler'), /return bindAndReport\(/, 'login binds via the shared helper');
+  assert.match(body('async function solveChallengeHandler'), /return bindAndReport\(/, 'challenge binds via the shared helper');
 
   // Exactly one implementation of the bind, so the modes cannot diverge.
   const impls = src.match(/async function bindAndReport\(/g) ?? [];
@@ -1319,7 +1323,8 @@ test(
       process.env.TMP = bogus;
       try {
         await assert.rejects(
-          sessionLoginTool.handler({ name, loginUrl: FAKE_LOGIN_URL, attach: true }, { trust: 'stdio' }),
+          // profile:'temp': a login's default is now the dedicated profile, which never touches TMPDIR.
+          sessionLoginTool.handler({ name, loginUrl: FAKE_LOGIN_URL, attach: true, profile: 'temp' }, { trust: 'stdio' }),
           /ENOENT|no such file/i,
           'the throw propagates untouched',
         );
@@ -1431,7 +1436,11 @@ test('DRIFT GUARD: the unbounded wait is granted by the SURFACE only, and fails 
 
   const humanHandlers = ['async function loginHandler', 'async function solveChallengeHandler'];
   for (const marker of humanHandlers) {
-    const body = src.slice(src.indexOf(marker), src.indexOf(marker) + 1500);
+    // Bounded by code, not a fixed character count: loginHandler's own body, and
+    // solveChallengeHandler through the engine entry it calls (solveChallenge).
+    const at = src.indexOf(marker);
+    const end = marker.endsWith('loginHandler') ? src.indexOf('\n}\n', at) : src.indexOf('export const sessionLoginTool');
+    const body = src.slice(at, end);
     assert.match(body, /resolveHumanWait\([^)]*ctx\?\.trust \?\? 'local'\)/, `${marker} must fail closed to 'local'`);
     assert.doesNotMatch(body, /\?\? 'stdio'/, `${marker} must never default to the permissive tier`);
   }
@@ -1518,4 +1527,345 @@ test('session_status reports a COMPLETED capture, so an abandoned call is still 
   const blob = JSON.stringify(status.capture);
   assert.ok(!blob.includes(base), 'no caller URL in the record');
   assert.ok(!blob.includes('secret'), 'no credential value in the record');
+});
+
+// ── profile:'system' — which real Chrome profile is copied, and how ───────────
+// Every test here points PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR at a FIXTURE user-data-
+// dir, so nothing in this block ever reads the host's real Chrome profiles.
+
+const { validateProfileDirectory, copyProfileEssentials, sqliteCopyIntact, DEFAULT_PROFILE_DIRECTORY } =
+  await import('../dist/tools/session.js');
+const { DatabaseSync } = await import('node:sqlite');
+
+/** A tiny Chrome-shaped cookie DB whose one row names the profile it came from. */
+function fakeCookieDb(file, marker) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const db = new DatabaseSync(file);
+  db.exec('CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)');
+  db.prepare('INSERT INTO cookies VALUES (?, ?, ?)').run('.site.test', marker, Buffer.from('v11xxxx'));
+  db.close();
+}
+const cookieMarker = (file) => {
+  const db = new DatabaseSync(file);
+  try {
+    return db.prepare('SELECT name FROM cookies').get().name;
+  } finally {
+    db.close();
+  }
+};
+
+/** A user-data-dir with two profiles, a Local State that last used ANOTHER one, and a live Chrome's lock. */
+function fakeUserDataDir({ locked = true } = {}) {
+  const udd = fs.mkdtempSync(path.join(TMP, 'udd-'));
+  fs.writeFileSync(path.join(udd, 'Local State'), JSON.stringify({ profile: { last_used: 'Profile 6' } }));
+  fakeCookieDb(path.join(udd, 'Default', 'Cookies'), 'from-default');
+  fs.writeFileSync(path.join(udd, 'Default', 'Preferences'), '{"who":"default"}');
+  fakeCookieDb(path.join(udd, 'Profile 1', 'Cookies'), 'from-profile-1');
+  fs.writeFileSync(path.join(udd, 'Profile 1', 'Preferences'), '{"who":"p1"}');
+  fs.writeFileSync(path.join(udd, 'Profile 1', 'History'), 'not an essential');
+  fs.writeFileSync(path.join(udd, 'stray-file'), '');
+  fs.mkdirSync(path.join(udd, 'Elsewhere'));
+  if (!IS_WIN32) fs.symlinkSync(path.join(udd, 'Elsewhere'), path.join(udd, 'Linked'));
+  if (locked) fs.writeFileSync(path.join(udd, 'SingletonLock'), ''); // the user's Chrome is RUNNING
+  return udd;
+}
+
+async function withUserDataDir(udd, fn) {
+  const prev = process.env.PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR;
+  process.env.PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR = udd;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR;
+    else process.env.PLAYWRIGHT_MCP_CHROME_USER_DATA_DIR = prev;
+  }
+}
+
+/**
+ * Run `fn` with os.tmpdir() pointed at a private, empty dir (it reads the env at call
+ * time), and return the pwmcp-attach-* copies left in it afterwards. Private, so a
+ * concurrently running test file's captures can never show up here.
+ */
+async function leftoverAttachDirs(fn) {
+  const priv = fs.mkdtempSync(path.join(TMP, 'tmpdir-'));
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  process.env.TMPDIR = process.env.TEMP = process.env.TMP = priv;
+  try {
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  return fs.readdirSync(priv).filter((n) => n.startsWith('pwmcp-attach-'));
+}
+
+test('validateProfileDirectory: one plain folder directly in the user-data-dir, nothing else', () => {
+  const udd = fakeUserDataDir();
+  assert.equal(DEFAULT_PROFILE_DIRECTORY, 'Default');
+  assert.equal(validateProfileDirectory(udd, 'Default'), path.join(udd, 'Default'));
+  assert.equal(validateProfileDirectory(udd, 'Profile 1'), path.join(udd, 'Profile 1'));
+  const refused = [
+    ['', /non-empty/],
+    ['   ', /non-empty/],
+    [undefined, /non-empty/],
+    [7, /non-empty/],
+    ['.', /single folder name/],
+    ['..', /single folder name/],
+    ['../Default', /single folder name/],
+    ['Default/..', /single folder name/],
+    ['Profile 1/Cookies', /single folder name/],
+    ['..\\Default', /single folder name/], // a Windows separator is refused on every OS
+    ['/etc', /single folder name/],
+    [path.join(udd, 'Default'), /single folder name/], // absolute, even when it exists
+    ['C:\\Users', /single folder name/],
+    ['C:', /single folder name/],
+    ['Default\0', /single folder name/],
+    ['x'.repeat(200), /too long/],
+    ['Profile 9', /no such profile folder/],
+    ['stray-file', /not a plain profile folder/],
+  ];
+  if (!IS_WIN32) refused.push(['Linked', /not a plain profile folder/]); // a symlink, even to a real dir
+  for (const [name, why] of refused)
+    assert.throws(() => validateProfileDirectory(udd, name), why, `must refuse ${JSON.stringify(name)}`);
+  // The refusal never enumerates the user's real profiles.
+  try {
+    validateProfileDirectory(udd, 'Profile 9');
+  } catch (err) {
+    assert.doesNotMatch(err.message, /Profile 1|Default"/);
+  }
+});
+
+test('copyProfileEssentials: copies ONLY the chosen profile, under its own name, while Chrome holds the lock', async () => {
+  const udd = fakeUserDataDir({ locked: true });
+  const dst = fs.mkdtempSync(path.join(TMP, 'copy-'));
+  await copyProfileEssentials(udd, dst, 'Profile 1');
+  assert.equal(cookieMarker(path.join(dst, 'Profile 1', 'Cookies')), 'from-profile-1');
+  assert.equal(fs.readFileSync(path.join(dst, 'Profile 1', 'Preferences'), 'utf8'), '{"who":"p1"}');
+  assert.ok(fs.existsSync(path.join(dst, 'Local State')), 'Local State rides along so the cookies still decrypt');
+  assert.equal(fs.existsSync(path.join(dst, 'Default')), false, 'another profile\'s cookies never come along');
+  assert.equal(fs.existsSync(path.join(dst, 'SingletonLock')), false, 'the live Chrome\'s lock is never copied');
+  assert.equal(fs.existsSync(path.join(dst, 'Profile 1', 'History')), false, 'essentials only');
+  // The default is Default.
+  const dst2 = fs.mkdtempSync(path.join(TMP, 'copy-'));
+  await copyProfileEssentials(udd, dst2);
+  assert.equal(cookieMarker(path.join(dst2, 'Default', 'Cookies')), 'from-default');
+  // The engine re-validates on its own: a traversal never reaches a path.
+  await assert.rejects(copyProfileEssentials(udd, dst2, '../x'), /single folder name/);
+});
+
+test('copyProfileEssentials: a torn/corrupt cookie DB fails LOUDLY after retries — never launched on', async () => {
+  const udd = fakeUserDataDir();
+  const live = path.join(udd, 'Profile 1', 'Cookies');
+  // What a copy taken mid-write looks like: a header, then garbage where pages should be.
+  fs.writeFileSync(live, Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.alloc(4096, 0xab)]));
+  assert.equal(await sqliteCopyIntact(live), false, 'the integrity check sees the damage');
+  const dst = fs.mkdtempSync(path.join(TMP, 'copy-'));
+  await assert.rejects(copyProfileEssentials(udd, dst, 'Profile 1'), /could not take a consistent copy of Chrome's Profile 1\/Cookies after 5 tries/);
+  // ...and a whole DB, journal sidecar included, passes.
+  fakeCookieDb(path.join(udd, 'Default', 'Cookies2'), 'ok');
+  assert.equal(await sqliteCopyIntact(path.join(udd, 'Default', 'Cookies2')), true);
+});
+
+test(
+  'profile:system: runs WHILE the real Chrome holds its lock, copies the named profile, and opens it by name',
+  { skip: skipOnWin32 },
+  async () => {
+    const udd = fakeUserDataDir({ locked: true });
+    const report = path.join(TMP, 'fake-chrome-report.json');
+    const run = async (extra) => {
+      fs.rmSync(report, { force: true });
+      process.env.PWMCP_FAKE_CHROME_REPORT = report;
+      try {
+        return envelopeOf(
+          await withUserDataDir(udd, () =>
+            withFakeChrome('die', () =>
+              sessionLoginTool.handler(
+                { name: 'sys-profile', loginUrl: FAKE_LOGIN_URL, attach: true, profile: 'system', ...extra },
+                { trust: 'stdio' },
+              ),
+            ),
+          ),
+        );
+      } finally {
+        delete process.env.PWMCP_FAKE_CHROME_REPORT;
+      }
+    };
+
+    let env;
+    const left1 = await leftoverAttachDirs(async () => {
+      env = await run({ profileDirectory: 'Profile 1' });
+    });
+    assert.deepEqual(left1, [], 'the copy is deleted afterwards');
+    assert.doesNotMatch(env.error ?? '', /Chrome is running/, 'a running Chrome no longer blocks a COPY');
+    assert.equal(env.cancelled, true, 'it got as far as launching and waiting for the human');
+    const launched = JSON.parse(fs.readFileSync(report, 'utf8'));
+    assert.ok(launched.argv.includes('--profile-directory=Profile 1'), 'Chrome is told which copied profile to open');
+    assert.ok(launched.files.includes('Profile 1/Cookies'));
+    assert.ok(launched.files.includes('Local State'));
+    assert.ok(!launched.files.some((f) => f.startsWith('Default/')), 'only the chosen profile was copied');
+    assert.ok(!launched.files.includes('SingletonLock'));
+
+    // No profileDirectory → Default, named explicitly (the copied Local State last used "Profile 6").
+    assert.deepEqual(await leftoverAttachDirs(() => run({})), []);
+    const dflt = JSON.parse(fs.readFileSync(report, 'utf8'));
+    assert.ok(dflt.argv.includes('--profile-directory=Default'));
+    assert.ok(dflt.files.includes('Default/Cookies'));
+  },
+);
+
+test('profile:<path> driven IN PLACE is still refused while a Chrome holds its lock', { skip: skipOnWin32 }, async () => {
+  const udd = fakeUserDataDir({ locked: true });
+  const env = envelopeOf(
+    await withFakeChrome('die', () =>
+      sessionLoginTool.handler({ name: 'path-profile', loginUrl: FAKE_LOGIN_URL, attach: true, profile: udd }, { trust: 'stdio' }),
+    ),
+  );
+  assert.equal(env.ok, false);
+  assert.match(env.error, /Chrome is running on .*driven in place/);
+});
+
+test('profileDirectory: refused at the handler — a clean tool error, no capture record, no temp dir', async () => {
+  const udd = fakeUserDataDir();
+  const left = await leftoverAttachDirs(() => withUserDataDir(udd, async () => {
+    for (const [args, why] of [
+      [{ profile: 'system', profileDirectory: '../Default' }, /single folder name/],
+      [{ profile: 'system', profileDirectory: '/etc' }, /single folder name/],
+      [{ profile: 'system', profileDirectory: 'Profile 9' }, /no such profile folder/],
+      [{ profileDirectory: 'Profile 1' }, /only applies with profile:"system"/],
+      [{ profile: 'temp', profileDirectory: 'Profile 1' }, /only applies with profile:"system"/],
+    ]) {
+      for (const tool of [sessionLoginTool, sessionSolveChallengeTool]) {
+        const name = 'refused-profile-dir';
+        const res = await tool.handler({ name, loginUrl: FAKE_LOGIN_URL, url: FAKE_LOGIN_URL, attach: true, ...args }, { trust: 'stdio' });
+        assert.equal(res.isError, true, `${JSON.stringify(args)} must be refused`);
+        assert.match(res.content[0].text, why);
+        assert.equal(captureProgress(name), undefined, 'refused before any capture began');
+      }
+    }
+  }));
+  assert.deepEqual(left, [], 'refused before any temp copy existed');
+});
+
+// ── profile:'dedicated' — playwright-mcp's own login profile, kept per name ───
+// MEASURED 2026-11-22 on eBay (Akamai + hCaptcha): plain Chrome with no debugging
+// port and no save tab, on a cold profile, got 403 on the sign-in page's first GET
+// and a captcha on relaunch. What the user's own Chrome had was earned trust, which
+// a throwaway profile discards after every capture. So a LOGIN now defaults to a
+// persistent profile per session name; a challenge stays throwaway.
+
+/** Run one attach capture against the fake Chrome and return [envelope, what Chrome was launched with]. */
+async function launchReport(tool, args, mode = 'die') {
+  const report = path.join(TMP, `fake-chrome-report-${args.name}.json`);
+  fs.rmSync(report, { force: true });
+  process.env.PWMCP_FAKE_CHROME_REPORT = report;
+  try {
+    const env = envelopeOf(await withFakeChrome(mode, () => tool.handler(args, { trust: 'stdio' })));
+    return [env, fs.existsSync(report) ? JSON.parse(fs.readFileSync(report, 'utf8')) : null];
+  } finally {
+    delete process.env.PWMCP_FAKE_CHROME_REPORT;
+  }
+}
+const uddOf = (launched) => (launched.argv.find((a) => a.startsWith('--user-data-dir=')) ?? '').slice('--user-data-dir='.length);
+
+test(
+  'attach login, no profile named: Chrome runs on playwright-mcp\'s OWN profile for that name, and it outlives the capture',
+  { skip: skipOnWin32 },
+  async () => {
+    const { loginProfilesDir } = await import('../dist/tools/session.js');
+    const name = 'dedicated-ebay';
+    const dir = path.join(loginProfilesDir(), name);
+    // An earned-trust marker from a previous login in this profile.
+    fs.mkdirSync(path.join(dir, 'Default'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'Default', 'Cookies'), 'earned');
+
+    const left = await leftoverAttachDirs(async () => {
+      const [env, launched] = await launchReport(sessionLoginTool, { name, loginUrl: FAKE_LOGIN_URL, attach: true });
+      assert.equal(env.cancelled, true, 'it launched and waited for the human');
+      assert.equal(uddOf(launched), dir, 'the dedicated profile, not a temp dir, and never the user\'s Chrome');
+      assert.ok(launched.files.includes('Default/Cookies'), 'Chrome starts WITH what the last login earned');
+      assert.ok(launched.argv.some((a) => a.startsWith('--remote-debugging-port=') && !a.endsWith('=0')));
+    });
+    assert.deepEqual(left, [], 'no throwaway profile was made');
+    assert.equal(fs.readFileSync(path.join(dir, 'Default', 'Cookies'), 'utf8'), 'earned', 'kept after the capture ended');
+    if (!IS_WIN32) assert.equal(fs.statSync(dir).mode & 0o777, 0o700, 'owner-only');
+
+    // A different name never shares it.
+    const [, other] = await launchReport(sessionLoginTool, { name: 'dedicated-other', loginUrl: FAKE_LOGIN_URL, attach: true });
+    assert.equal(uddOf(other), path.join(loginProfilesDir(), 'dedicated-other'));
+  },
+);
+
+test('attach challenge, no profile named: still a throwaway profile, deleted afterwards', { skip: skipOnWin32 }, async () => {
+  const { loginProfilesDir } = await import('../dist/tools/session.js');
+  let launched;
+  const left = await leftoverAttachDirs(async () => {
+    [, launched] = await launchReport(sessionSolveChallengeTool, { name: 'dedicated-challenge', url: FAKE_LOGIN_URL });
+  });
+  assert.ok(launched, 'the challenge launched Chrome');
+  assert.match(path.basename(uddOf(launched)), /^pwmcp-attach-/);
+  assert.deepEqual(left, [], 'and removed it');
+  assert.equal(fs.existsSync(path.join(loginProfilesDir(), 'dedicated-challenge')), false);
+});
+
+test('profile:"temp" on a login still opts back into a throwaway profile', { skip: skipOnWin32 }, async () => {
+  let launched;
+  const left = await leftoverAttachDirs(async () => {
+    [, launched] = await launchReport(sessionLoginTool, { name: 'temp-optout', loginUrl: FAKE_LOGIN_URL, attach: true, profile: 'temp' });
+  });
+  assert.match(path.basename(uddOf(launched)), /^pwmcp-attach-/);
+  assert.deepEqual(left, []);
+});
+
+test('liveChromeOn: a stale SingletonLock does not block the dedicated profile; a live one does', { skip: skipOnWin32 }, async () => {
+  const { liveChromeOn, loginProfilesDir } = await import('../dist/tools/session.js');
+  const dir = fs.mkdtempSync(path.join(TMP, 'lock-'));
+  assert.equal(liveChromeOn(dir), null, 'no lock: nothing running');
+  // What Chrome leaves behind after a kill: a symlink to "<host>-<pid>" of a dead pid,
+  // plus a SingletonSocket the old presence test alone would have read as "running".
+  fs.symlinkSync(`${os.hostname()}-2147483646`, path.join(dir, 'SingletonLock'));
+  fs.writeFileSync(path.join(dir, 'SingletonSocket'), '');
+  assert.equal(liveChromeOn(dir), null, 'a dead pid is a stale lock');
+  fs.rmSync(path.join(dir, 'SingletonLock'));
+  fs.symlinkSync(`${os.hostname()}-${process.pid}`, path.join(dir, 'SingletonLock'));
+  assert.equal(liveChromeOn(dir), process.pid);
+
+  // ...and at the handler: an open window for the same name refuses, a stale one does not.
+  const name = 'dedicated-locked';
+  const prof = path.join(loginProfilesDir(), name);
+  fs.mkdirSync(prof, { recursive: true });
+  fs.symlinkSync(`${os.hostname()}-${process.pid}`, path.join(prof, 'SingletonLock'));
+  const [busy, none] = await launchReport(sessionLoginTool, { name, loginUrl: FAKE_LOGIN_URL, attach: true });
+  assert.equal(busy.ok, false);
+  assert.match(busy.error, /login window for "dedicated-locked" is already open/);
+  assert.equal(none, null, 'no second Chrome was started on it');
+  fs.rmSync(path.join(prof, 'SingletonLock'));
+  fs.symlinkSync(`${os.hostname()}-2147483646`, path.join(prof, 'SingletonLock'));
+  const [stale] = await launchReport(sessionLoginTool, { name, loginUrl: FAKE_LOGIN_URL, attach: true });
+  assert.equal(stale.cancelled, true, 'a stale lock launches normally');
+});
+
+test('reaper: an orphaned dedicated-profile Chrome record is dropped, and its profile is KEPT', { skip: skipOnWin32 }, async () => {
+  const { loginProfilesDir } = await import('../dist/tools/session.js');
+  const prof = path.join(loginProfilesDir(), 'dedicated-orphan');
+  fs.mkdirSync(prof, { recursive: true });
+  fs.writeFileSync(path.join(prof, 'keepme'), 'x');
+  const outside = fs.mkdtempSync(path.join(TMP, 'not-ours-'));
+  const reg = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, '.attach-chromes.json');
+  fs.mkdirSync(path.dirname(reg), { recursive: true });
+  // Dead pids and a dead owner: both records are orphans.
+  fs.writeFileSync(
+    reg,
+    JSON.stringify([
+      { pid: 2147483645, profile: prof, startedAt: new Date().toISOString(), owner: 2147483644, keep: true },
+      // keep:true on a dir that is NOT under the login-profiles root is not trusted as ours.
+      { pid: 2147483643, profile: outside, startedAt: new Date().toISOString(), owner: 2147483644, keep: true },
+    ]),
+  );
+  await launchReport(sessionLoginTool, { name: 'dedicated-reap-trigger', loginUrl: FAKE_LOGIN_URL, attach: true });
+  assert.equal(fs.readFileSync(path.join(prof, 'keepme'), 'utf8'), 'x', 'the dedicated profile survives the reap');
+  assert.ok(fs.existsSync(outside), 'a dir outside the root is never touched');
+  const left = JSON.parse(fs.readFileSync(reg, 'utf8'));
+  assert.ok(!left.some((r) => r.profile === prof), 'the orphan record is gone');
 });

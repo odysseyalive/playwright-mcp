@@ -20,6 +20,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -113,4 +115,32 @@ test('a CRLF working copy (Git for Windows checkout) is not drift', () => {
 test('negative: a missing marker throws rather than comparing two empty bodies', () => {
   const unmarked = Buffer.from(PS1.toString('utf8').replace("    $steer = @'", "    $steer = @\"'"), 'utf8');
   assert.throws(() => ps1Steering(unmarked), /opening marker line not found/);
+});
+
+for (const failedMode of ['--print', '--write']) {
+  test(`Codex ${failedMode} failure leaves the remaining installer steps running`, {
+    skip: process.platform === 'win32' && 'POSIX installer requires bash; PowerShell guard runs below',
+  }, (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-installer-codex-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(dir, 'scripts'));
+    fs.writeFileSync(path.join(dir, 'scripts', 'merge-codex.mjs'),
+      `if (process.argv.at(-1) === ${JSON.stringify(failedMode)}) process.exit(1); console.log('preview');\n`);
+    const block = SH.toString('utf8').split('if command -v codex >/dev/null 2>&1; then\n')[1]
+      .split('\n# Crush has no')[0];
+    assert.ok(block?.includes('merge-codex.mjs'), 'the live Codex block was found');
+    const script = `set -euo pipefail\nsay() { echo "$*"; }\nwarn() { echo "$*" >&2; }\nHERE="$1"\nNODE_CMD="$2"\nif true; then\n${block}\necho REMAINING_STEPS_RAN\n`;
+    const result = spawnSync('bash', ['-c', script, '_', dir, process.execPath], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /REMAINING_STEPS_RAN/);
+    assert.match(result.stderr, /Codex registration skipped|Skipped Codex registration/);
+    assert.doesNotMatch(result.stdout, /Registered with Codex \(existing options retained\)/);
+  });
+}
+
+test('PowerShell Codex failures warn and leave other clients to finish', () => {
+  const block = PS1.toString('utf8').split('if ($hasCodex) {\n')[1].split('\n# Crush has no')[0];
+  assert.match(block, /Warn "Skipped Codex registration/);
+  assert.match(block, /Warn "Could not write the Codex config/);
+  assert.doesNotMatch(block, /\bDie\b|\bthrow\b|\bexit\b/);
 });

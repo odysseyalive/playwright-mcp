@@ -412,9 +412,20 @@ fi
 
 if command -v codex >/dev/null 2>&1; then
   say "Registering playwright-mcp with Codex…"
-  codex mcp remove playwright-mcp >/dev/null 2>&1 || true
-  codex mcp add playwright-mcp -- "$NODE_CMD" "$HERE/dist/index.js"
-  say "Registered with Codex. Check with: codex mcp list"
+  if CODEX_PREVIEW="$("$NODE_CMD" "$HERE/scripts/merge-codex.mjs" "$NODE_CMD" "$HERE/dist/index.js" --print)"; then
+    if [ -z "$CODEX_PREVIEW" ]; then
+      say "Already registered with Codex — nothing to change."
+    else
+      echo "$CODEX_PREVIEW"
+      if "$NODE_CMD" "$HERE/scripts/merge-codex.mjs" "$NODE_CMD" "$HERE/dist/index.js" --write; then
+        say "Registered with Codex (existing options retained). Check with: codex mcp list"
+      else
+        warn "Could not write the Codex config; Codex registration skipped."
+      fi
+    fi
+  else
+    warn "Skipped Codex registration (see the message above)."
+  fi
 else
   warn "Skipped Codex registration. Run manually once 'codex' is installed:"
   echo "    codex mcp add playwright-mcp -- \"$NODE_CMD\" \"$HERE/dist/index.js\""
@@ -496,3 +507,4 @@ steer
 
 say "Done. playwright-mcp $(read_version "$HERE/package.json") is installed at $HERE."
 say "Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."
+say "Restart Codex to load the same tools; /mcp shows the connection."

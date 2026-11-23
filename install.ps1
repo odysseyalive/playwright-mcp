@@ -305,9 +305,21 @@ if ($hasClaude) {
 
 if ($hasCodex) {
   Say "Registering playwright-mcp with Codex…"
-  codex mcp remove playwright-mcp 2>$null
-  codex mcp add playwright-mcp -- node "$entry"
-  Say "Registered with Codex. Check with: codex mcp list"
+  $codexMerge = Join-Path $Here "scripts\merge-codex.mjs"
+  $codexPreview = node "$codexMerge" node "$entry" --print
+  if ($LASTEXITCODE -ne 0) {
+    Warn "Skipped Codex registration (see the message above)."
+  } elseif (-not $codexPreview) {
+    Say "Already registered with Codex — nothing to change."
+  } else {
+    Write-Host ($codexPreview -join "`n")
+    node "$codexMerge" node "$entry" --write
+    if ($LASTEXITCODE -ne 0) {
+      Warn "Could not write the Codex config; Codex registration skipped."
+    } else {
+      Say "Registered with Codex (existing options retained). Check with: codex mcp list"
+    }
+  }
 } else {
   Warn "Skipped Codex registration. Run manually once 'codex' is installed:"
   Write-Host "    codex mcp add playwright-mcp -- node `"$entry`""
@@ -393,4 +405,5 @@ Add-Steering
 
 Say "Done. playwright-mcp $(Read-Version (Join-Path $Here 'package.json')) is installed at $Here."
 Say "Restart Claude Code, then run /mcp in any project to see mcp__playwright-mcp__* tools."
+Say "Restart Codex to load the same tools; /mcp shows the connection."
 }
