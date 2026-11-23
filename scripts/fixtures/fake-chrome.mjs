@@ -19,6 +19,13 @@
 //   popup  — an SSO identity provider opens a popup and the ORIGINAL tab closes.
 //            Poll 1 shows both pages, every later poll shows only the popup.
 //            A page is still open, so this must NOT cancel.
+//   cleared — one page target ON the url Chrome was launched with, with a real
+//            title: the wall is already gone (what a real profile's cookies do).
+//            A passive challenge capture moves straight on to the read-out.
+//
+// PWMCP_FAKE_CHROME_PRESS_MS=<ms>: after that delay, press the "I'm signed in,
+// save it" button whose tab Chrome was launched with (the loopback URL after the
+// site URL), the way the human would. No button tab, no press.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -56,10 +63,23 @@ if (process.env.PWMCP_FAKE_CHROME_REPORT) {
 const ORIGINAL = { type: 'page', url: 'https://idp.fake.test/login', title: 'IdP Login' };
 const POPUP = { type: 'page', url: 'https://idp.fake.test/consent?popup=1', title: 'Approve sign-in' };
 
+// attachChromeArgs: ... '--new-window', <site url>, [<button url>]
+const afterNewWindow = process.argv.slice(process.argv.indexOf('--new-window') + 1);
+const SITE = { type: 'page', url: afterNewWindow[0] ?? '', title: 'App Home' };
+const BUTTON = afterNewWindow[1];
+
+if (BUTTON && process.env.PWMCP_FAKE_CHROME_PRESS_MS) {
+  setTimeout(() => {
+    // The answer is held until the capture ends, so fire and forget.
+    fetch(`${BUTTON}/done`, { method: 'POST' }).catch(() => {});
+  }, Number(process.env.PWMCP_FAKE_CHROME_PRESS_MS));
+}
+
 let listPolls = 0;
 
 const targets = () => {
   listPolls += 1;
+  if (mode === 'cleared') return [SITE];
   if (mode !== 'popup') return [ORIGINAL];
   // Poll 1: the login tab plus the popup the IdP just opened.
   // Poll 2+: the IdP closed the original tab — one page is still open.

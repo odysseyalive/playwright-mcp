@@ -109,6 +109,12 @@ export interface LoginOptions {
    * unknown surface is treated as a non-stdio one — capped, not unbounded.
    */
   wait?: WaitBudget;
+  /**
+   * The surface the call arrived on, copied from ToolContext by the TOOL HANDLER
+   * (never from an argument). Only 'stdio' may use profile:'system': it copies the
+   * user's REAL Chrome cookies. Absent or anything else is refused (fail closed).
+   */
+  trust?: SurfaceTrust;
   credKeys?: { user: string; pass: string }; // dotenv key names (project .env / secrets.env)
   envFile?: string; // explicit dotenv file for credKeys (default: ./.env in cwd, then secrets.env)
   selectors?: { user?: string; pass?: string; submit?: string };
@@ -1007,6 +1013,28 @@ export function validateProfileDirectory(userDataDir: string, name: unknown): st
 }
 
 /**
+ * profile:'system' copies the user's REAL Chrome cookies into a capture, for any
+ * site. That is only acceptable where a person is at this display and the caller is
+ * the local Claude Code process: the stdio surface. On every other surface, and when
+ * the surface is unknown (missing or unrecognised trust), it is refused — the same
+ * fail-closed rule as resolveHumanWait. Checked before any profile name is looked up,
+ * so a refused caller learns nothing about which profiles exist or where.
+ * Returns the refusal message, or undefined when allowed.
+ */
+export function systemProfileRefusal(
+  profile: unknown,
+  profileDirectory: unknown,
+  trust: SurfaceTrust | undefined,
+): string | undefined {
+  if (profile !== 'system' && profileDirectory == null) return undefined;
+  if (trust === 'stdio') return undefined;
+  return (
+    'profile:"system" (and profileDirectory) copy your real Chrome profile\'s cookies, so they are ' +
+    'accepted only on the local stdio surface, never over HTTP. Use profile:"temp" or "dedicated" instead.'
+  );
+}
+
+/**
  * Resolve which Chrome profile the attach capture drives.
  *  - 'dedicated' (a login's default) → playwright-mcp's own persistent profile for
  *               this session name (dedicatedProfileDir), driven in place and kept.
@@ -1028,9 +1056,13 @@ export function validateProfileDirectory(userDataDir: string, name: unknown): st
  */
 function resolveAttachProfile(
   profile: LoginOptions['profile'],
-  profileDirectory?: string,
+  profileDirectory: string | undefined,
+  trust: SurfaceTrust | undefined,
   login?: { name: string },
 ): AttachProfile {
+  // The engine's own gate: whatever front door this came through, 'system' needs stdio.
+  const offSurface = systemProfileRefusal(profile, profileDirectory, trust);
+  if (offSurface) throw new Error(`attach: ${offSurface}`);
   if (profileDirectory !== undefined && profile !== 'system')
     throw new Error('profileDirectory only applies with profile:"system" (it picks which real Chrome profile to copy)');
   // A login with no profile named gets its own persistent profile; a challenge stays throwaway.
@@ -1566,7 +1598,18 @@ function processAlive(pid: number): boolean {
 export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   reapOrphans(); // clean up anything a previous interrupted run left running
   const out = sessionFilePath(opts.name);
-  const prof = resolveAttachProfile(opts.profile, opts.profileDirectory, opts.challenge ? undefined : { name: opts.name });
+  const prof = resolveAttachProfile(
+    opts.profile,
+    opts.profileDirectory,
+    opts.trust,
+    opts.challenge ? undefined : { name: opts.name },
+  );
+  // A capture from the user's REAL profile (a copy of 'system') is saved only when
+  // the human presses "I'm signed in, save it" — for a challenge too. With their real
+  // cookies the page is usually not walled at all, so the passive wall-cleared
+  // harvest would save at once with nobody having said yes. One flag drives both the
+  // button and the wait, so the two cannot drift apart.
+  const humanSaves = !opts.challenge || prof.copyFrom !== undefined;
   const chromePath = resolveChromePath();
   let child: ReturnType<typeof spawn> | undefined;
   let cdp: Browser | undefined;
@@ -1593,8 +1636,9 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
 
     const port = await freePort(); // never 0 — see freePort()
     // A login opens with the "I'm signed in" tab beside the site (login-done.ts); a
-    // challenge does not, since a cleared wall is something this server can see.
-    if (!opts.challenge) {
+    // challenge does not, since a cleared wall is something this server can see —
+    // except a challenge on the user's real profile (humanSaves, above).
+    if (humanSaves) {
       button = await startDoneButton(opts.name, async () =>
         ((await devtoolsJson(port, '/json/list')) as Array<{ type?: string; url?: string }>)
           .filter((p) => p.type === 'page')
@@ -1619,7 +1663,8 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     if (child.pid && (prof.cleanup || prof.dedicated)) registerAttachRecord(child.pid, prof.dir, prof.dedicated);
     log(
       opts.challenge
-        ? `attach challenge for "${opts.name}" — a real Chrome window opened; solve the CAPTCHA there and stay on the page`
+        ? `attach challenge for "${opts.name}" — a real Chrome window opened; solve the CAPTCHA there and stay on the page` +
+            (humanSaves ? `, then press "I'm signed in, save it" on its second tab` : '')
         : `attach login for "${opts.name}" — a real Chrome window opened; log in there (solve any ` +
             `CAPTCHA the site shows first), then press "I'm signed in, save it" on its second tab` +
             (prof.dedicated ? ` (playwright-mcp's own profile for "${opts.name}", kept between logins)` : ''),
@@ -1634,7 +1679,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       chromeExited: () => chromeExited,
     };
     if (w.wait.deadline === 'none') log('attach: no time limit — closing the Chrome window cancels the capture');
-    if (opts.challenge) await pollAttachedChallenge(port, opts.loginUrl, w);
+    if (!humanSaves) await pollAttachedChallenge(port, opts.loginUrl, w);
     else {
       // The press itself ends the wait, so a human who presses and closes the window
       // at once still saves; the window watch only ever ends it as a cancel.
@@ -1642,8 +1687,9 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
         port,
         () => button!.isPressed(),
         w,
-        `attach: login not saved — "I'm signed in, save it" was not pressed before the timeout. Nothing was saved.`,
-        CANCELLED_ATTACH,
+        `${opts.challenge ? 'challenge' : 'attach: login'} not saved — "I'm signed in, save it" was not ` +
+          'pressed before the timeout. Nothing was saved.',
+        opts.challenge ? CANCELLED_CHALLENGE : CANCELLED_ATTACH,
       );
       watching.catch(() => {}); // outlived by a press: its later cancel is nobody's error
       await Promise.race([button!.pressed, watching]);
@@ -2337,7 +2383,8 @@ const loginDefinition: Tool = {
     'and the session is harvested passively (no CDP driving during the solve). ' +
     'If a site rejects that fresh window but the user\'s everyday Chrome gets in, add ' +
     'profile:"system": it copies that Chrome profile\'s cookies into the capture, for ANY site, while ' +
-    'that Chrome keeps running (profileDirectory picks a profile other than "Default"). ' +
+    'that Chrome keeps running (profileDirectory picks a profile other than "Default"). "system" is ' +
+    'accepted only on the local stdio surface, and saves only when the human presses the save button. ' +
     'If your own call is cut short while the human is still logging in, the capture KEEPS GOING and ' +
     'still saves; poll session_status({name}) to see it finish instead of starting a second login. ' +
     'To capture a CLEARED BOT WALL with NO login at all, use session_solve_challenge instead. ' +
@@ -2384,12 +2431,13 @@ const loginDefinition: Tool = {
           'site that rejects a fresh profile. Chrome 136+ blocks the debug port on its default ' +
           'user-data-dir, hence a copy rather than driving it. Works while that Chrome is running; ' +
           'the export is auto-scoped to the login site\'s domain and the copy is deleted afterwards. ' +
-          'Or an explicit user-data-dir path, driven in place (that one must not be open in Chrome).',
+          'STDIO ONLY: refused on any HTTP surface; it saves only when the human presses "I\'m signed in, ' +
+          'save it". Or an explicit user-data-dir path, driven in place (that one must not be open in Chrome).',
       },
       profileDirectory: {
         type: 'string',
         description:
-          'With profile:"system" only: which of the real Chrome\'s profiles to copy, by its folder name ' +
+          'With profile:"system" only (stdio surface only): which of the real Chrome\'s profiles to copy, by its folder name ' +
           'inside the Chrome user-data-dir: "Default" (the default), "Profile 1", "Profile 2", ... — the ' +
           'last part of "Profile Path" on chrome://version in the profile that has the login. A single ' +
           'folder name only; paths are refused.',
@@ -2449,7 +2497,7 @@ function reservedName(name: string): CallToolResult | undefined {
 }
 
 async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
-  const refused = refusal(args) ?? profileRefusal(args);
+  const refused = refusal(args) ?? profileRefusal(args, ctx);
   if (refused) return refused;
   const opts: LoginOptions = {
     name: String(args.name ?? ''),
@@ -2463,6 +2511,7 @@ async function loginHandler(args: Record<string, unknown>, ctx?: ToolContext): P
     credKeys: args.credKeys as LoginOptions['credKeys'],
     envFile: args.envFile ? String(args.envFile) : undefined,
     selectors: args.selectors as LoginOptions['selectors'],
+    trust: ctx?.trust, // from the server, never from args; the engine re-checks 'system' against it
   };
   // Only the handler knows the SURFACE, so only the handler can grant an unbounded
   // wait; a missing ctx is an unknown surface, and an unknown surface is capped.
@@ -2511,14 +2560,19 @@ async function runCapture(
  * that is live here may still lapse during the wait; bindAndReport handles that.
  */
 /**
- * A bad profileDirectory is refused at the handler, as a clean tool error, before
- * any capture record or temp dir exists. resolveAttachProfile re-checks it in the
- * engine; this is only the polite front door.
+ * profile:"system" off the stdio surface, or a bad profileDirectory, is refused at
+ * the handler, as a clean tool error, before any capture record or temp dir exists.
+ * The surface check runs FIRST, so a refused caller never reaches a profile lookup.
+ * resolveAttachProfile re-checks both in the engine; this is only the polite front door.
  */
-function profileRefusal(args: Record<string, unknown>): CallToolResult | undefined {
+function profileRefusal(args: Record<string, unknown>, ctx?: ToolContext): CallToolResult | undefined {
+  // The handler hands the engine String(args.profile), so judge the same coerced value.
+  const profile = args.profile != null ? String(args.profile) : undefined;
+  const offSurface = systemProfileRefusal(profile, args.profileDirectory, ctx?.trust);
+  if (offSurface) return { content: [{ type: 'text', text: `Error: ${offSurface}` }], isError: true };
   if (args.profileDirectory == null) return undefined;
   try {
-    if (args.profile !== 'system')
+    if (profile !== 'system')
       throw new Error('profileDirectory only applies with profile:"system" (it picks which real Chrome profile to copy)');
     validateProfileDirectory(defaultChromeUserDataDir(), args.profileDirectory);
     return undefined;
@@ -2717,7 +2771,8 @@ const solveChallengeDefinition: Tool = {
     'is SHORT-LIVED — a clearance cookie lasts minutes, not days; the result reports expiresAt, and ' +
     'session_status cannot detect this kind of expiry. If a fresh profile keeps getting hard-' +
     'challenged, retry with profile:"system" to ride your real browser\'s established trust (it works ' +
-    'while that Chrome is running).',
+    'while that Chrome is running; stdio surface only). With "system" nothing is harvested passively: ' +
+    'the window gets an "I\'m signed in, save it" tab and the session saves only when the human presses it.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2730,12 +2785,13 @@ const solveChallengeDefinition: Tool = {
           "of the host's REAL Chrome (cookies, prefs, Local State) into the driven profile so whatever " +
           'that browser has earned with the site carries past a HARD wall. Works while that Chrome is ' +
           'running; the export is auto-scoped to the site\'s domain and the copy is deleted afterwards. ' +
-          'Or an explicit user-data-dir path, driven in place (that one must not be open in Chrome).',
+          'STDIO ONLY (refused on any HTTP surface), and never saved passively: the human must press ' +
+          '"I\'m signed in, save it" in the window. Or an explicit user-data-dir path, driven in place (that one must not be open in Chrome).',
       },
       profileDirectory: {
         type: 'string',
         description:
-          'With profile:"system" only: which of the real Chrome\'s profiles to copy, by its folder name ' +
+          'With profile:"system" only (stdio surface only): which of the real Chrome\'s profiles to copy, by its folder name ' +
           'inside the Chrome user-data-dir: "Default" (the default), "Profile 1", "Profile 2", ... — the ' +
           'last part of "Profile Path" on chrome://version in the profile that has the login. A single ' +
           'folder name only; paths are refused.',
@@ -2766,7 +2822,7 @@ async function solveChallengeHandler(
   args: Record<string, unknown>,
   ctx?: ToolContext,
 ): Promise<CallToolResult> {
-  const refused = refusal(args) ?? profileRefusal(args);
+  const refused = refusal(args) ?? profileRefusal(args, ctx);
   if (refused) return refused;
   return bindAndReport(
     await solveChallenge(
@@ -2805,6 +2861,7 @@ export function solveChallenge(
       profile,
       profileDirectory,
       timeoutMs,
+      trust: ctx?.trust, // the engine refuses profile:'system' unless this is 'stdio'
       // Always human-present: the whole point is a person clearing the wall by hand.
       wait: resolveHumanWait(timeoutMs, ctx?.trust ?? 'local'),
     },

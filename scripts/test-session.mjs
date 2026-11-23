@@ -1748,6 +1748,165 @@ test('profileDirectory: refused at the handler — a clean tool error, no captur
   assert.deepEqual(left, [], 'refused before any temp copy existed');
 });
 
+// ── profile:'system' is stdio-only, and saves only on the human's press ───────
+// 'system' copies the user's REAL Chrome cookies. A caller steered by page content
+// must not be able to pull them into a session file on its own: off the stdio
+// surface it is refused outright (fail closed on a missing/unknown surface), and
+// even on stdio a challenge saves only when the human presses the save button,
+// never on the passive wall-cleared harvest.
+
+/** Run `fn` with the fake Chrome's launch report pointed at a fresh file; returns [result, report|null]. */
+async function withLaunchReport(tag, fn) {
+  const report = path.join(TMP, `fake-chrome-report-${tag}.json`);
+  fs.rmSync(report, { force: true });
+  process.env.PWMCP_FAKE_CHROME_REPORT = report;
+  try {
+    const out = await fn();
+    return [out, fs.existsSync(report) ? JSON.parse(fs.readFileSync(report, 'utf8')) : null];
+  } finally {
+    delete process.env.PWMCP_FAKE_CHROME_REPORT;
+  }
+}
+/** The URLs Chrome was launched with after --new-window: [site, button?]. */
+const launchedUrls = (launched) => launched.argv.slice(launched.argv.indexOf('--new-window') + 1);
+
+test('profile:system: refused off the stdio surface and on an UNKNOWN one, for both tools, before anything starts', async () => {
+  const udd = fakeUserDataDir();
+  const left = await leftoverAttachDirs(() => withUserDataDir(udd, () => withFakeChrome('die', async () => {
+    for (const tool of [sessionLoginTool, sessionSolveChallengeTool]) {
+      for (const ctx of [{ trust: 'local' }, { trust: 'cloud' }, {}, undefined, { trust: 'bogus' }]) {
+        for (const extra of [
+          { profile: 'system' },
+          { profile: 'system', profileDirectory: 'Profile 1' },
+          { profile: 'system', profileDirectory: 'Profile 9' }, // never reaches the lookup
+          { profileDirectory: 'Profile 1' },
+          { profile: ['system'] }, // coerces to "system" exactly as the engine would see it
+        ]) {
+          const name = 'system-off-stdio';
+          const [res, launched] = await withLaunchReport(name, () =>
+            tool.handler({ name, loginUrl: FAKE_LOGIN_URL, url: FAKE_LOGIN_URL, attach: true, ...extra }, ctx),
+          );
+          const what = `${tool.definition.name} ${JSON.stringify(ctx)} ${JSON.stringify(extra)}`;
+          assert.equal(res.isError, true, `${what} must be refused`);
+          assert.match(res.content[0].text, /accepted only on the local stdio surface/, what);
+          assert.doesNotMatch(res.content[0].text, /Profile 1|Profile 9|no such profile/, `${what}: no profile oracle`);
+          assert.ok(!res.content[0].text.includes(udd), `${what}: the user-data-dir path is never shown`);
+          assert.equal(launched, null, `${what}: no Chrome launched`);
+          assert.equal(captureProgress(name), undefined, `${what}: refused before any capture began`);
+        }
+      }
+    }
+  })));
+  assert.deepEqual(left, [], 'refused before any profile copy existed');
+});
+
+test('profile:system: the ENGINE refuses it too without stdio, whatever front door is used', async () => {
+  const { sessionAttach, solveChallenge } = await import('../dist/tools/session.js');
+  const udd = fakeUserDataDir();
+  const left = await leftoverAttachDirs(() => withUserDataDir(udd, () => withFakeChrome('die', async () => {
+    for (const trust of [undefined, 'local', 'cloud']) {
+      const [, launched] = await withLaunchReport('engine-system', async () => {
+        await assert.rejects(
+          sessionAttach({ name: 'engine-system', loginUrl: FAKE_LOGIN_URL, attach: true, profile: 'system', trust }),
+          /accepted only on the local stdio surface/,
+          `sessionAttach with trust ${trust}`,
+        );
+        await assert.rejects(
+          sessionAttach({ name: 'engine-system', loginUrl: FAKE_LOGIN_URL, attach: true, challenge: true, profileDirectory: 'Default', trust }),
+          /accepted only on the local stdio surface/,
+        );
+        await assert.rejects(
+          solveChallenge('engine-system', FAKE_LOGIN_URL, trust ? { trust } : undefined, 'system', 5000),
+          /accepted only on the local stdio surface/,
+          `solveChallenge with trust ${trust}`,
+        );
+      });
+      assert.equal(launched, null, 'no Chrome launched');
+    }
+  })));
+  assert.deepEqual(left, [], 'refused before any profile copy existed');
+});
+
+test('web_fetch\'s automatic wall flow can never ask for profile:system', () => {
+  const src = fs.readFileSync(new URL('../src/tools/web-fetch.ts', import.meta.url), 'utf8');
+  const calls = src.match(/solveChallenge\([^;]*\)/g) ?? [];
+  assert.equal(calls.length, 1, 'one call site');
+  assert.match(calls[0], /^solveChallenge\(wall, opts\.url, \{ trust: ctx\.trust \}, undefined, /, 'profile is fixed to the default (temp)');
+});
+
+test(
+  'profile:system challenge: an already-cleared page is NOT saved until the human presses the save button',
+  { skip: skipOnWin32 },
+  async () => {
+    const udd = fakeUserDataDir();
+    const name = 'system-challenge-nopress';
+    const started = Date.now();
+    const [res, launched] = await withUserDataDir(udd, () =>
+      withFakeChrome('cleared', () =>
+        withLaunchReport(name, () =>
+          sessionSolveChallengeTool.handler({ name, url: FAKE_LOGIN_URL, profile: 'system', timeoutMs: 7000 }, { trust: 'stdio' }),
+        ),
+      ),
+    );
+    const env = envelopeOf(res);
+    // The fake page is cleared from the very first poll: a passive harvest would have
+    // fired at ~2-3s. Running to the 7s deadline is the proof it waited for a press.
+    assert.ok(Date.now() - started >= 6500, 'it waited for the press, not for the wall');
+    assert.equal(env.ok, false);
+    assert.equal(env.mode, 'challenge');
+    assert.match(env.error, /^challenge not saved — "I'm signed in, save it" was not pressed before the timeout/);
+    assert.equal(fs.existsSync(sessionFilePath(name)), false, 'nothing saved without the press');
+    const [site, button] = launchedUrls(launched);
+    assert.equal(site, FAKE_LOGIN_URL);
+    assert.match(button ?? '', /^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32}$/, 'the save-button tab opened beside the site');
+  },
+);
+
+test(
+  'profile:system challenge: the press is what moves it on to the read-out',
+  { skip: skipOnWin32 },
+  async () => {
+    const udd = fakeUserDataDir();
+    const name = 'system-challenge-press';
+    const started = Date.now();
+    process.env.PWMCP_FAKE_CHROME_PRESS_MS = '4500';
+    let env;
+    try {
+      env = envelopeOf(
+        await withUserDataDir(udd, () =>
+          withFakeChrome('cleared', () =>
+            sessionSolveChallengeTool.handler({ name, url: FAKE_LOGIN_URL, profile: 'system', timeoutMs: 60_000 }, { trust: 'stdio' }),
+          ),
+        ),
+      );
+    } finally {
+      delete process.env.PWMCP_FAKE_CHROME_PRESS_MS;
+    }
+    assert.ok(Date.now() - started >= 4500, 'nothing moved before the press');
+    // The fixture speaks no CDP, so the read-out after the press fails — reaching it is the point.
+    assert.match(env.error ?? '', /connectOverCDP/, 'the press ended the wait and the session read-out began');
+    assert.doesNotMatch(env.error ?? '', /not pressed/);
+  },
+);
+
+test(
+  'profile:temp challenge: still harvested PASSIVELY once the wall is gone — no button, no press',
+  { skip: skipOnWin32 },
+  async () => {
+    const name = 'temp-challenge-passive';
+    const started = Date.now();
+    const [res, launched] = await withFakeChrome('cleared', () =>
+      withLaunchReport(name, () =>
+        sessionSolveChallengeTool.handler({ name, url: FAKE_LOGIN_URL, timeoutMs: 60_000 }, { trust: 'stdio' }),
+      ),
+    );
+    const env = envelopeOf(res);
+    assert.ok(Date.now() - started < 30_000, 'it did not wait for anything but the wall');
+    assert.match(env.error ?? '', /connectOverCDP/, 'the cleared wall alone moved it on to the read-out');
+    assert.deepEqual(launchedUrls(launched), [FAKE_LOGIN_URL], 'no save-button tab for a temp challenge');
+  },
+);
+
 // ── profile:'dedicated' — playwright-mcp's own login profile, kept per name ───
 // MEASURED 2026-11-22 on eBay (Akamai + hCaptcha): plain Chrome with no debugging
 // port and no save tab, on a cold profile, got 403 on the sign-in page's first GET
