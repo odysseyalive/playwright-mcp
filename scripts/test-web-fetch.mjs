@@ -262,6 +262,14 @@ test('jarWorthKeeping: a wall or a sign-in redirect never writes the session jar
 // A session is replayed in the browser that looks like the real Chrome it was
 // captured in: no fixed locale, zone or Accept-Language (each measured to differ
 // on the wire or in Intl), and no fake plugin list over a real one.
+// User decision 2026-11-23: dev servers with self-signed certs and mixed content
+// load out of the box, like a "Chrome (dev)" launcher. No env switch.
+test('stealth: every context accepts invalid certificates and mixed content by default', async () => {
+  const { STEALTH_ARGS } = await import('../dist/stealth.js');
+  assert.equal(stealthContextOptions.ignoreHTTPSErrors, true);
+  assert.ok(STEALTH_ARGS.includes('--allow-running-insecure-content'));
+});
+
 test('stealth: the context leaves locale, zone and Accept-Language to the browser', () => {
   for (const k of ['locale', 'timezoneId', 'extraHTTPHeaders']) assert.equal(k in stealthContextOptions, false, k);
   assert.doesNotMatch(STEALTH_INIT, /languages/);

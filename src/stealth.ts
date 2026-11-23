@@ -352,8 +352,13 @@ export const STEALTH_UA = `Mozilla/5.0 (${PLATFORM_TOKEN}) AppleWebKit/537.36 (K
 
 export const VIEWPORT = { width: 1366, height: 768 };
 
-/** Launch args that strip the automation tell. Reused by every launch. */
-export const STEALTH_ARGS = ['--disable-blink-features=AutomationControlled'];
+/**
+ * Launch args reused by every launch: strip the automation tell, and load mixed
+ * content (an https dev page pulling http assets) the way a "Chrome (dev)"
+ * launcher with --allow-running-insecure-content does. The certificate half of
+ * that launcher is `ignoreHTTPSErrors` in stealthContextOptions below.
+ */
+export const STEALTH_ARGS = ['--disable-blink-features=AutomationControlled', '--allow-running-insecure-content'];
 
 /**
  * Launch options for a stealth browser: the REAL installed Google Chrome
@@ -406,7 +411,11 @@ export const STEALTH_INIT = `
 /**
  * Context options that make a headless context look like a real desktop browser.
  * Spread into newContext()/launchPersistentContext(); merge caller-specific keys
- * (storageState, ignoreHTTPSErrors) alongside.
+ * (storageState) alongside.
+ *
+ * ignoreHTTPSErrors is ON for every context, by the user's decision (2026-11-23):
+ * self-signed and otherwise invalid certificates load, as in a "Chrome (dev)"
+ * launcher with --ignore-certificate-errors, so local dev servers just work.
  *
  * No locale, timezone or Accept-Language: the browser's own are the real
  * Chrome's on this host, which is what a session was captured with. MEASURED
@@ -420,4 +429,5 @@ export const STEALTH_INIT = `
 export const stealthContextOptions: BrowserContextOptions = {
   userAgent: STEALTH_UA,
   viewport: VIEWPORT,
+  ignoreHTTPSErrors: true,
 };
