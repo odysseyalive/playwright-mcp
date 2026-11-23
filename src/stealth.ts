@@ -8,7 +8,7 @@
  * about IDENTITY — separate BrowserContext, profile, and cookie jar so authed
  * cookies never ride along with scraping and the scraping profile's fingerprint
  * never bleeds into an authed capture. The disguise *technique* (UA, launch
- * args, webdriver erasure, locale/viewport) is anti-bot hardening, not an
+ * args, webdriver erasure, viewport) is anti-bot hardening, not an
  * identity; every context is entitled to it. web_fetch keeps its own persistent
  * profile; session.ts uses ephemeral contexts — they never share a cookie jar.
  *
@@ -350,8 +350,6 @@ function detectChromeMajor(): number {
 export const CHROME_MAJOR = detectChromeMajor();
 export const STEALTH_UA = `Mozilla/5.0 (${PLATFORM_TOKEN}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 
-export const LOCALE = 'en-US';
-export const TIMEZONE = 'America/New_York';
 export const VIEWPORT = { width: 1366, height: 768 };
 
 /** Launch args that strip the automation tell. Reused by every launch. */
@@ -385,13 +383,23 @@ export const STEALTH_LAUNCH = {
   },
 };
 
-/** addInitScript payload: erase the headless tells before any page script runs. */
+/**
+ * addInitScript payload: erase the headless tells before any page script runs.
+ *
+ * Only what the browser gets WRONG. MEASURED 2026-11-23, Chrome 158 headless
+ * against the same binary headed, on a local page dumping navigator: both already
+ * report `languages` ['en-US','en'] and a real 5-entry PluginArray. This script
+ * used to replace those with fixed values, and the plugin list it put there was a
+ * plain Array of {name:'Plugin 1'…}, a tell the real browser never shows. So the
+ * plugins are filled in only where there are none, and languages are left alone.
+ */
 export const STEALTH_INIT = `
   Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-  Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5].map((i) => ({ name: 'Plugin ' + i })),
-  });
+  if (!navigator.plugins || navigator.plugins.length === 0) {
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5].map((i) => ({ name: 'Plugin ' + i })),
+    });
+  }
   window.chrome = window.chrome || { runtime: {} };
 `;
 
@@ -399,11 +407,17 @@ export const STEALTH_INIT = `
  * Context options that make a headless context look like a real desktop browser.
  * Spread into newContext()/launchPersistentContext(); merge caller-specific keys
  * (storageState, ignoreHTTPSErrors) alongside.
+ *
+ * No locale, timezone or Accept-Language: the browser's own are the real
+ * Chrome's on this host, which is what a session was captured with. MEASURED
+ * 2026-11-23 against headed google-chrome-stable 158 on a local echo page: the
+ * fixed `locale:'en-US'` put `Accept-Language: en-US` on the wire, out of
+ * Chrome's place in the header order, where Chrome itself sends
+ * `en-US,en;q=0.9` last (the extraHTTPHeaders copy of it never landed), and the
+ * fixed America/New_York disagreed with the host's zone, and so with its IP.
+ * Bot managers that bind a clearance to a fingerprint (Akamai, on eBay) read both.
  */
 export const stealthContextOptions: BrowserContextOptions = {
   userAgent: STEALTH_UA,
-  locale: LOCALE,
-  timezoneId: TIMEZONE,
   viewport: VIEWPORT,
-  extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
 };

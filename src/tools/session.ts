@@ -43,6 +43,7 @@ import {
 } from '../secrets.js';
 import { storageStateDomains, wrapUntrusted } from '../exfil.js';
 import { startDoneButton, type DoneButton } from '../login-done.js';
+import { classifyHealth, extractReadable, jarWorthKeeping } from '../extract.js';
 import { bindSession } from '../upstream.js';
 import { browserQueue, leaseArg, LEASE_PROPERTY, type RunOptions } from '../queue.js';
 import {
@@ -2222,6 +2223,8 @@ export interface StatusResult {
   name: string;
   state: 'fresh' | 'stale' | 'missing' | 'unreachable' | 'present';
   checkedAt: string;
+  /** The live probe landed on a bot wall: the login is unknown, and nothing was saved. */
+  walled?: true;
   /** Set only on the offline branch — its absence means a live probe ran. */
   check?: 'artifact';
   artifact?: ArtifactSummary;
@@ -2331,8 +2334,9 @@ async function statusVerdict(opts: StatusOptions): Promise<StatusResult> {
     });
     await context.addInitScript(STEALTH_INIT);
     const page = await context.newPage();
+    let resp;
     try {
-      await page.goto(probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      resp = await page.goto(probeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } catch {
       // The probe never completed (app down, DNS/network failure) — that says
       // nothing about the session itself. Never report it as expired.
@@ -2344,6 +2348,15 @@ async function statusVerdict(opts: StatusOptions): Promise<StatusResult> {
     if (!stale && opts.loginIndicator) {
       if (url.includes(opts.loginIndicator)) stale = true;
       else stale = (await page.$(opts.loginIndicator).catch(() => null)) !== null;
+    }
+    // A bot wall is not a sign-in page, so the test above calls it fresh: eBay's
+    // Akamai "SORRY" page did (2026-11-23), and the write-back below then saved
+    // the cookies the wall had just rewritten over the human's capture. It says
+    // nothing about the login either way, so it is 'unreachable', and nothing is saved.
+    if (!stale) {
+      const html = await page.content();
+      const health = classifyHealth(html, resp?.status() ?? 0, extractReadable(html, url).text);
+      if (!jarWorthKeeping(health)) return { name: opts.name, state: 'unreachable', walled: true, checkedAt };
     }
     if (!stale) {
       // Rolling session write-back: a fresh probe just made an authed request,
@@ -2724,7 +2737,8 @@ const statusDefinition: Tool = {
     'web_fetch({url, session}) or session_attach({name}) instead. ' +
     'PASS probeUrl to additionally live-probe an authenticated route; that reports fresh / stale / ' +
     'missing / unreachable. "unreachable" means the probe itself failed (app down, network error) — ' +
-    'the session may still be fine, so fix reachability instead of re-logging-in. ' +
+    'the session may still be fine, so fix reachability instead of re-logging-in; walled:true means a ' +
+    'bot wall answered the probe. ' +
     'It ALSO reports a capture this server is still running for that name, and whether it finished and ' +
     'saved: if a session_login call of yours was cut short while the human was mid-login, poll this ' +
     'instead of starting a second one. The login keeps going and still saves. ' +

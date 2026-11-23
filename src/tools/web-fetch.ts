@@ -48,6 +48,7 @@ import {
   harvestLinks,
   extractLinkIndex,
   extractPdfText,
+  jarWorthKeeping,
   wallVendor,
   type Citation,
   type FetchStatus,
@@ -352,6 +353,8 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
   // Set only on the remote instance; reads back the reason a redirect hop was
   // refused, which page.goto reports only as net::ERR_ACCESS_DENIED.
   let egressGuard: EgressGuardHandle | undefined;
+  // Whether a session read may write its jar back; set once the result is known.
+  let keepJar = false;
   try {
     if (opts.session) {
       if (egressRestricted()) {
@@ -395,11 +398,12 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
         // Rolling session write-back: sites extend cookie expiry on every authed
         // request; persisting the refreshed jar means each read PROLONGS the
         // session instead of letting the artifact age toward its original expiry.
-        // Skipped when the page landed on a login wall — a logged-out jar must
-        // never overwrite the (possibly recoverable) captured one.
+        // Only after a read that came back as content (jarWorthKeeping): a
+        // logged-out jar, or one a bot wall just rewrote, must never overwrite
+        // the captured one. A read that threw never sets `keepJar` at all.
         try {
           const landed = page.url();
-          if (!looksLikeSignIn(landed)) {
+          if (keepJar && !looksLikeSignIn(landed)) {
             await context.storageState({ path: file });
             reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
           }
@@ -562,6 +566,7 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
     if (!loaded) {
       result = withNote(result, `the page had not finished loading after ${FETCH_TIMEOUT_MS / 1000}s; this is what had rendered`);
     }
+    keepJar = jarWorthKeeping(result.fetchStatus);
     if (opts.quality === 'research') result.appraisalRequested = true;
     // A failure is not cached: a wall must be seen again after a solve, and a
     // transient one (a 503, a half-loaded page) must not stick for five minutes.

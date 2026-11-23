@@ -187,6 +187,19 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
   return 'ok';
 }
 
+/**
+ * Whether a render that carried a saved session may write its cookie jar back
+ * over that session's file. Not after a wall or a sign-in redirect: a bot
+ * manager answers a challenge by rewriting its own cookies (Akamai's bm_s /
+ * bm_so / ak_bmsc on eBay), and saving those overwrites the jar the human
+ * earned with the one the wall just flagged. MEASURED 2026-11-23: ebay.json,
+ * captured by a human at 00:13Z, was last written at 02:21Z by a walled
+ * web_fetch, and its Akamai cookies' expiries date them to that walled run.
+ */
+export function jarWorthKeeping(status: FetchStatus): boolean {
+  return status !== 'blocked' && status !== 'login-wall';
+}
+
 // ── Readable content ─────────────────────────────────────────────────────────
 
 export interface Readable {

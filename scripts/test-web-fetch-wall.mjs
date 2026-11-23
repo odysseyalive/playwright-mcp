@@ -187,6 +187,26 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     assert.doesNotMatch(r.error, /CAPTCHA/);
   });
 
+  await t.test('a session read that hits a wall leaves the session jar as it was', async () => {
+    // eBay, 2026-11-23: the write-back saved the walled read's cookies over the capture.
+    const file = path.join(sessions, 'walljar.json');
+    const jar = JSON.stringify({
+      cookies: [{ name: 'sid', value: 'human', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }],
+      origins: [],
+    });
+    fs.writeFileSync(file, jar, { mode: 0o600 });
+    const r = await fetchUrl({ url: `${base}/e`, session: 'walljar' }, { trust: 'stdio' });
+    assert.equal(r.fetchStatus, 'blocked');
+    assert.equal(fs.readFileSync(file, 'utf8'), jar);
+    // ...while a read that comes back as content still rolls the jar forward.
+    const ok = JSON.parse(jar);
+    ok.cookies.push({ ...ok.cookies[0], name: 'cleared', value: '1' });
+    fs.writeFileSync(file, JSON.stringify(ok), { mode: 0o600 });
+    const r2 = await fetchUrl({ url: `${base}/f`, session: 'walljar' }, { trust: 'stdio' });
+    assert.equal(r2.fetchStatus, 'ok');
+    assert.notEqual(fs.readFileSync(file, 'utf8'), JSON.stringify(ok), 'written back after a good read');
+  });
+
   await t.test('no ctx is an unknown surface: no reuse', async () => {
     const r = await fetchUrl({ url: `${base}/d` });
     assert.equal(r.fetchStatus, 'blocked');

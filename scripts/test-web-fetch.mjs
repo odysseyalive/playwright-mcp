@@ -14,8 +14,10 @@ import {
   detectCms,
   harvestLinks,
   extractPdfText,
+  jarWorthKeeping,
   wallVendor,
 } from '../dist/extract.js';
+import { stealthContextOptions, STEALTH_INIT } from '../dist/stealth.js';
 
 const FX = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'web-fetch');
 const html = (name) => readFileSync(join(FX, name), 'utf8');
@@ -248,4 +250,20 @@ test('robustness: extractors never throw on garbage input', () => {
   assert.doesNotThrow(() => extractCitation('', 'https://x.test'));
   assert.doesNotThrow(() => classifyHealth('', 200));
   assert.doesNotThrow(() => detectCms(''));
+});
+
+// eBay, 2026-11-23: a walled session read saved the cookies the wall had just
+// rewritten over the human's capture. Only a read that came back as content writes.
+test('jarWorthKeeping: a wall or a sign-in redirect never writes the session jar back', () => {
+  for (const s of ['blocked', 'login-wall']) assert.equal(jarWorthKeeping(s), false, s);
+  for (const s of ['ok', '404', 'paywall', 'parked', 'consent-wall']) assert.equal(jarWorthKeeping(s), true, s);
+});
+
+// A session is replayed in the browser that looks like the real Chrome it was
+// captured in: no fixed locale, zone or Accept-Language (each measured to differ
+// on the wire or in Intl), and no fake plugin list over a real one.
+test('stealth: the context leaves locale, zone and Accept-Language to the browser', () => {
+  for (const k of ['locale', 'timezoneId', 'extraHTTPHeaders']) assert.equal(k in stealthContextOptions, false, k);
+  assert.doesNotMatch(STEALTH_INIT, /languages/);
+  assert.match(STEALTH_INIT, /plugins\.length === 0/, 'plugins are filled in only where the browser has none');
 });

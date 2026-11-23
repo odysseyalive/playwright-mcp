@@ -124,6 +124,13 @@ function startApp() {
   const server = http.createServer((req, res) => {
     const cookie = req.headers.cookie ?? '';
     const authed = /(?:^|;\s*)sid=ok(?:;|$)/.test(cookie);
+    // An Akamai-style wall (eBay, 2026-11-23): a 403 "SORRY" page that also rewrites
+    // the bot-manager cookie, which is what the write-back used to save.
+    if (req.url === '/walled') {
+      res.writeHead(403, { 'Content-Type': 'text/html', 'Set-Cookie': 'bm_s=flagged; Path=/; Max-Age=3600' });
+      res.end('<!DOCTYPE html><html><head><title>Error Page</title></head><body><h1>SORRY</h1><p>Something went wrong on our end. Please go back and try again.</p></body></html>');
+      return;
+    }
     if (req.method === 'POST' && req.url === '/login') {
       let body = '';
       req.on('data', (c) => (body += c));
@@ -814,6 +821,19 @@ test('session_status: fresh for a valid saved session', async () => {
   // Live-path guard: a real probeUrl must NOT take the offline branch.
   assert.equal(s.check, undefined);
   assert.equal(s.artifact, undefined);
+});
+
+test('session_status: a bot wall is unreachable + walled, never fresh, and the jar is not rewritten', async () => {
+  const file = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'walled.json');
+  const jar = JSON.stringify({
+    cookies: [{ name: 'sid', value: 'ok', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }],
+    origins: [],
+  });
+  fs.writeFileSync(file, jar, { mode: 0o600 });
+  const s = await sessionStatus({ name: 'walled', probeUrl: `${base}/walled` });
+  assert.equal(s.state, 'unreachable');
+  assert.equal(s.walled, true);
+  assert.equal(fs.readFileSync(file, 'utf8'), jar, 'the captured jar is left exactly as it was');
 });
 
 test('session_status: missing when no file exists', async () => {

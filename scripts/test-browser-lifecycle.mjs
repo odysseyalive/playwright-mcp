@@ -11,6 +11,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -158,4 +159,42 @@ test('a closed context is dropped, not handed out again', { skip: !BROWSER_TESTS
   const page = await second.newPage(); // would throw if the corpse came back
   await page.close();
   await closeBrowser();
+});
+
+// eBay/Akamai, 2026-11-23: a session earned in headed Chrome was replayed by a
+// context whose Accept-Language, header order, time zone and plugin list each
+// differed from that same browser's own. The disguise must change none of them.
+test('stealth context: wire headers, zone and plugins match the browser\'s own', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TEST_BROWSER=1' }, async () => {
+  const { chromium } = await import('playwright');
+  const { STEALTH_LAUNCH, stealthContextOptions } = await import('../dist/stealth.js');
+  const seen = {};
+  const server = http.createServer((req, res) => {
+    seen[new URL(req.url, 'http://x').searchParams.get('l')] = req.rawHeaders.filter((_, i) => i % 2 === 0).map((h) => h.toLowerCase());
+    res.setHeader('content-type', 'text/html');
+    res.end('<title>t</title>');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
+  try {
+    const probe = async (label, opts, init) => {
+      const ctx = await browser.newContext(opts);
+      if (init) await ctx.addInitScript(init);
+      const page = await ctx.newPage();
+      const resp = await page.goto(`http://127.0.0.1:${server.address().port}/?l=${label}`);
+      const js = await page.evaluate(() => ({
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        languages: navigator.languages,
+        plugins: Object.prototype.toString.call(navigator.plugins),
+      }));
+      const lang = (await resp.request().allHeaders())['accept-language'];
+      await ctx.close();
+      return { ...js, lang, order: seen[label] };
+    };
+    const own = await probe('own', {});
+    const disguised = await probe('stealth', stealthContextOptions, STEALTH_INIT);
+    assert.deepEqual(disguised, own);
+  } finally {
+    await browser.close();
+    server.close();
+  }
 });
