@@ -226,6 +226,32 @@ test('citation: visible byline yields dateConfidence low', () => {
   assert.equal(c.author[0]?.family, 'Asher');
 });
 
+// eBay item pages, 2026-11-23: the listing photo is only in og:image. The JSON-LD
+// in this fixture proves the image survives whichever citation branch wins.
+test('citation: a relative og:image resolves to an absolute URL, ahead of twitter:image', () => {
+  const c = extractCitation(html('lead-image-og.html'), 'https://harborfinds.test/itm/1920');
+  assert.equal(c.image, 'https://harborfinds.test/img/tide-clock-500.jpg');
+  assert.equal(c['container-title'], 'Harbor Finds', 'the JSON-LD branch won');
+});
+
+test('citation: a javascript: og:image is skipped for the twitter:image fallback', () => {
+  const c = extractCitation(html('lead-image-twitter.html'), 'https://marsh.test/kelp');
+  assert.equal(c.image, 'https://cdn.marsh.test/kelp/transect.png');
+});
+
+test('citation: javascript:, data: and over-long lead images are dropped, not returned', () => {
+  const c = extractCitation(html('lead-image-rejected.html'), 'https://marsh.test/x');
+  assert.ok(!('image' in c), 'no image key at all');
+  const long = `<meta property="og:image" content="/${'a'.repeat(3000)}.jpg">`;
+  assert.ok(!('image' in extractCitation(long, 'https://marsh.test/y')), 'a cut URL would point elsewhere');
+});
+
+test('citation: a page with no lead-image meta has no image key', () => {
+  for (const name of ['article-jsonld.html', 'article-byline.html']) {
+    assert.ok(!('image' in extractCitation(html(name), 'https://marsh.test/notes')), name);
+  }
+});
+
 test('cms: WordPress detected from generator meta', () => {
   assert.equal(detectCms(html('article-jsonld.html')), 'WordPress');
 });

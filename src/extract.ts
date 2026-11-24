@@ -28,6 +28,8 @@ export interface Citation {
   issued?: { 'date-parts': number[][] };
   URL: string;
   dateConfidence: 'high' | 'low';
+  /** The page's lead image (og:image / twitter:image), absolute http(s). Not CSL; absent when none. */
+  image?: string;
 }
 
 // ── Page health ────────────────────────────────────────────────────────────
@@ -345,6 +347,41 @@ function meta(doc: Document, sel: string): string | undefined {
   return v?.trim() || undefined;
 }
 
+/**
+ * Lead-image metas, in trust order. eBay item pages, 2026-11-23: the listing photo
+ * is in og:image and nowhere in the text or links web_fetch returns.
+ */
+const IMAGE_METAS = [
+  'meta[property="og:image"]',
+  'meta[property="og:image:secure_url"]',
+  'meta[name="twitter:image"]',
+  'meta[name="twitter:image:src"]',
+];
+/** Past this a value is not a photo's address; dropped, not cut, since a cut URL points elsewhere. */
+const IMAGE_URL_MAX = 2048;
+
+/**
+ * The first lead-image meta that resolves against the page to an absolute http(s)
+ * URL. The page chose it, so it rides inside the citation (and so inside the
+ * quarantine); a javascript: or data: value is skipped for the next candidate.
+ */
+function leadImage(doc: Document, url: string): string | undefined {
+  for (const sel of IMAGE_METAS) {
+    const raw = meta(doc, sel);
+    if (!raw) continue;
+    let abs: URL;
+    try {
+      abs = new URL(raw, url);
+    } catch {
+      continue;
+    }
+    if (!/^https?:$/i.test(abs.protocol)) continue;
+    const href = abs.toString();
+    if (href.length <= IMAGE_URL_MAX) return href;
+  }
+  return undefined;
+}
+
 const ARTICLE_TYPES = /Article|NewsArticle|BlogPosting|ScholarlyArticle|Report|WebPage/;
 
 function fromJsonLd(doc: Document): Partial<Citation> | undefined {
@@ -389,7 +426,16 @@ function fromJsonLd(doc: Document): Partial<Citation> | undefined {
 export function extractCitation(html: string, url: string): Citation {
   const doc = new JSDOM(html, { url }).window.document;
   const title = doc.title || meta(doc, 'meta[property="og:title"]') || '';
-  const base: Citation = { type: 'webpage', title, author: [], URL: url, dateConfidence: 'low' };
+  const image = leadImage(doc, url);
+  // Every branch below spreads `base`, so the image rides along whichever one wins.
+  const base: Citation = {
+    type: 'webpage',
+    title,
+    author: [],
+    URL: url,
+    dateConfidence: 'low',
+    ...(image && { image }),
+  };
 
   // 1. JSON-LD (highest trust)
   const ld = fromJsonLd(doc);

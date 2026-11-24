@@ -739,7 +739,8 @@ const definition: Tool = {
   description:
     'Fetch a URL via headless Playwright with full JS rendering (handles SPAs and PDFs). ' +
     'Replaces the built-in WebFetch tool. Returns readable main text plus author/date/publisher ' +
-    'citation data (CSL-JSON) and page-health status. Set links:true to also harvest outbound ' +
+    'citation data (CSL-JSON, plus citation.image: the page\'s og:image / twitter:image lead image as an ' +
+    'absolute URL, when it has one) and page-health status. Set links:true to also harvest outbound ' +
     'links and the reference section, and linkScope:"same-origin" to enumerate a site\'s own pages ' +
     '(archives, indexes, tables of contents). quality:"research" flags the result for source appraisal. ' +
     'Pass session:"name" to read paywalled content behind a session_login capture (local only). ' +

@@ -77,7 +77,7 @@ function buildInstructions(
   if (names.has('web_fetch')) {
     lines.push(
       'REPLACES NATIVE WebFetch: use web_fetch to fetch a URL — it stealth-renders JS pages and PDFs and ' +
-        'extracts readable text + author/date/CMS citations. For web SEARCH use the native WebSearch tool in Claude Code, ' +
+        'extracts readable text + author/date/CMS citations + lead image. For web SEARCH use the native WebSearch tool in Claude Code, ' +
         'or the available native web-search tool in Codex/other clients (when enabled); this server does not provide search. ' +
         'Then verify and cite the top results with web_fetch.',
       '',
