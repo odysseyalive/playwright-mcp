@@ -425,8 +425,12 @@ test('proxy: every upstream tool advertises `lease`; it is stripped before the c
   const client = await outward(up);
   try {
     const { tools } = await client.listTools();
-    for (const t of tools.filter((x) => x.name.startsWith('browser_') && !x.name.startsWith('browser_lease_')))
-      assert.equal(t.inputSchema.properties.lease?.type, 'string', `${t.name} takes lease`);
+    // Upstream's names, read from the stub: this server's own browser_* tools
+    // (the lease pair, browser_status) are not upstream's and are not queued.
+    const upstreamNames = new Set((await up.listTools()).tools.map((t) => t.name));
+    const proxied = tools.filter((x) => upstreamNames.has(x.name));
+    assert.ok(proxied.length > 0, 'the stub upstream tools reach the surface');
+    for (const t of proxied) assert.equal(t.inputSchema.properties.lease?.type, 'string', `${t.name} takes lease`);
     assert.ok(tools.some((t) => t.name === 'browser_lease_acquire'));
     assert.ok(tools.some((t) => t.name === 'browser_lease_release'));
     const attach = tools.find((t) => t.name === 'session_attach');

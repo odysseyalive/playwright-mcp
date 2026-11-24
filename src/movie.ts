@@ -38,6 +38,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from 'playwrig
 import { configDir, ownerOnlyDir, sessionFilePath, secretInventory } from './secrets.js';
 import { guardOutbound, sessionAllowsUrl } from './exfil.js';
 import { STEALTH_LAUNCH, stealthContextOptions } from './stealth.js';
+import { trackBrowser, type BrowserHandle } from './lifetime.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:movie]', ...args);
 
@@ -1166,9 +1167,14 @@ export async function recordMovie(opts: RecordOptions): Promise<RecordResult> {
   const composites: CompositeRecord[] = [];
   const targets: ResolvedTarget[] = [];
   let browser: Browser | undefined;
+  let tracker: BrowserHandle | undefined;
   try {
     for (const spec of opts.targets) targets.push(await resolveTarget(spec, dir));
     browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
+    // Registered for ownership, status and shutdown (src/lifetime.ts); call-scoped,
+    // so it closes in the `finally` below, never on idle.
+    const b = browser;
+    tracker = trackBrowser({ kind: 'movie', close: () => b.close() });
     let n = 0;
     outer: for (const vp of opts.viewports)
       for (const scheme of opts.schemes)
@@ -1205,6 +1211,7 @@ export async function recordMovie(opts: RecordOptions): Promise<RecordResult> {
     }
   } finally {
     await browser?.close().catch(() => {});
+    tracker?.done();
     await Promise.all(targets.map((t) => t.served?.close()));
     busyJobs.delete(opts.job);
   }

@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import type { Page, Response } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { getStealthContext, openSessionContext, pace, writeBackSessionJar } from '../browser.js';
+import { getStealthContext, openSessionContext, pace, useStealthContext, writeBackSessionJar } from '../browser.js';
 import { dismissConsent } from '../consent.js';
 import {
   egressRestricted,
@@ -486,10 +486,15 @@ async function fetchOnce(opts: FetchOptions, wallAdvice?: string): Promise<Fetch
         await session.close();
       };
     } else {
+      // Held from before the launch until the page is closed, so the shared
+      // context's idle close (src/lifetime.ts) can never land mid-fetch.
+      const release = useStealthContext();
+      cleanup = async () => release();
       const context = await getStealthContext();
       page = await context.newPage();
       cleanup = async () => {
         await page.close().catch(() => {});
+        release();
       };
       if (egressRestricted()) egressGuard = await installEgressGuard(page);
     }

@@ -2,6 +2,7 @@
 // Smoke test: start dist/index.js over stdio, list tools, navigate to a data: URL.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { chromeRootDir, procTable, sameProcess } from '../dist/lifetime.js';
 
 const transport = new StdioClientTransport({
   command: process.execPath, // the Node running this test, not whatever `node` is first on PATH
@@ -27,7 +28,7 @@ console.log(budgetOk ? `instructions: ${instructions.length}/${INSTRUCTIONS_BUDG
 
 const { tools } = await client.listTools();
 const names = new Set(tools.map((t) => t.name));
-const expectedCustom = ['web_fetch', 'session_login', 'session_status', 'session_scaffold_tests', 'suite_scaffold', 'suite_audit', 'suite_methodology', 'browser_lease_acquire', 'browser_lease_release', 'movie_script_save', 'movie_script_list', 'movie_record', 'movie_list', 'movie_clean'];
+const expectedCustom = ['web_fetch', 'session_login', 'session_status', 'session_scaffold_tests', 'suite_scaffold', 'suite_audit', 'suite_methodology', 'browser_lease_acquire', 'browser_lease_release', 'browser_status', 'movie_script_save', 'movie_script_list', 'movie_record', 'movie_list', 'movie_clean'];
 const removed = ['web_search', 'deep_research'];
 const missing = expectedCustom.filter((n) => !names.has(n));
 const resurrected = removed.filter((n) => names.has(n));
@@ -61,13 +62,14 @@ console.log(noticeOk ? 'guards: browser_* results carry the untrusted-content no
 // and because one process serves stdio AND the HTTP port off the SAME upstream,
 // this covers the local and served cases alike.
 //
-// What this does NOT prove: that chromium was closed *gracefully*. The
-// process.exit(0) after the awaits takes the browser down either way, so deleting
-// closeUpstream() would leave this green. It goes red on a shutdown that hangs or
-// throws — verified by stubbing closeUpstream() to never resolve. A real
-// leak test would have to observe the browser's own pid, which we don't own.
+// It also goes red on a LEAK now (2026-11-24): the Chrome roots the server
+// launched are read from /proc before the signal, and every one of them must be
+// gone after it. It does not prove the close was graceful rather than a kill;
+// the lifetime tests (scripts/test-browser-ownership.mjs) cover each path.
 console.log('\nSIGTERM with a live browser...');
 const pid = transport.pid;
+const chromes = [...procTable().values()].filter((p) => p.ppid === pid && chromeRootDir(p) !== undefined);
+console.log(`  ${chromes.length} Chrome root(s) under the server before SIGTERM`);
 let shutdownOk = false;
 if (pid) {
   process.kill(pid, 'SIGTERM');
@@ -80,6 +82,17 @@ if (pid) {
   }
 }
 console.log(shutdownOk ? 'shutdown: SIGTERM exits cleanly' : 'FAIL: server still running 10s after SIGTERM');
+const table = procTable();
+const leaked = chromes.filter((c) => sameProcess(table, c.pid, c.start));
+const leakOk = chromes.length > 0 && leaked.length === 0;
+console.log(
+  leakOk
+    ? 'shutdown: every Chrome the server launched is gone'
+    : chromes.length === 0
+      ? 'FAIL: no Chrome was found under the server, so the leak check observed nothing'
+      : `FAIL: Chrome left running after shutdown: ${leaked.map((c) => c.pid).join(', ')}`,
+);
+for (const c of leaked) try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ }
 
 await client.close().catch(() => {});
-process.exit(text.includes('smoke-ok') && instructionsOk && budgetOk && toolsOk && noticeOk && shutdownOk ? 0 : 1);
+process.exit(text.includes('smoke-ok') && instructionsOk && budgetOk && toolsOk && noticeOk && shutdownOk && leakOk ? 0 : 1);

@@ -57,6 +57,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { dropTempProfile, launchOnPool, type ProfilePool } from './browser.js';
+import { trackBrowser, type BrowserHandle } from './lifetime.js';
 import { loadSecrets, sessionFilePath } from './secrets.js';
 import {
   BROWSER_CHANNEL,
@@ -78,8 +79,14 @@ interface Bound {
   client: Client;
   /** Session name whose storageState this browser was launched with, if any. */
   session: string | null;
+  /** That session's file, so an idle close can bring the same binding back. */
+  storageState?: string;
   /** Close the browser this connection launched. Upstream never does. */
   closeBrowser: () => Promise<void>;
+  /** Whether a browser is up on this connection right now. */
+  isLive: () => boolean;
+  /** A browser_* call just used it: restart its idle clock. */
+  touch: () => void;
 }
 
 let current: Bound | undefined;
@@ -272,12 +279,16 @@ function openBrowser(storageState?: string): Promise<BrowserContext> {
   return withSandboxFallback(() => openBrowserOnce(storageState));
 }
 
+/** The pool dir each persistent browser_* context was launched on, for the registry (src/lifetime.ts). */
+const launchedOn = new WeakMap<BrowserContext, string>();
+
 async function openBrowserOnce(storageState?: string): Promise<BrowserContext> {
   const { launchOptions, contextOptions } = upstreamLaunch(storageState);
   if (!storageState) {
     const { context, dir } = await launchOnPool(BROWSER_POOL, (d) =>
       chromium.launchPersistentContext(d, { ...launchOptions, ...contextOptions }),
     );
+    launchedOn.set(context, dir);
     log(`browser_* browser up (profile=${dir})`);
     return context;
   }
@@ -300,31 +311,75 @@ async function openBrowserOnce(storageState?: string): Promise<BrowserContext> {
  * closed it, so it is closed here BEFORE the launch. That releases its profile
  * lock, and the pool hands the same slot back, keeping the profile's continuity.
  */
-export function browserOwner(storageState?: string, launch = launchBrowser) {
+export function browserOwner(storageState?: string, launch = launchBrowser, session: string | null = null) {
   let live: BrowserContext | undefined;
+  let handle: BrowserHandle | undefined;
   const closeBrowser = async (): Promise<void> => {
     const context = live;
+    const h = handle;
     live = undefined;
+    handle = undefined;
     if (!context) return;
     await context.close().catch(() => {});
     await context.browser()?.close().catch(() => {});
+    h?.done();
   };
   const getContext = async (): Promise<BrowserContext> => {
     await closeBrowser();
     live = await launch(storageState);
+    // Registered and idle-closed (src/lifetime.ts): the 2026-11-24 incident's
+    // browser_* browser had sat idle for hours under a session still open. Never
+    // while the queue is busy: a running call, a held lease, a waiter.
+    handle = trackBrowser({
+      kind: 'browser_*',
+      userDataDir: launchedOn.get(live),
+      session: session ?? undefined,
+      idleClose: true,
+      busy: () => !browserQueue.isIdle(),
+      close: recycleIdle,
+    });
     return live;
   };
-  return { getContext, closeBrowser };
+  return { getContext, closeBrowser, isLive: () => live !== undefined, touch: () => handle?.touch() };
 }
 
 async function connect(session: string | null, storageState?: string): Promise<Bound> {
-  const { getContext, closeBrowser } = browserOwner(storageState);
+  const { getContext, closeBrowser, isLive, touch } = browserOwner(storageState, launchBrowser, session);
   const server = await createConnection(upstreamConfig(), getContext);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: 'playwright-mcp-proxy', version: '0.4.0' });
   await client.connect(clientTransport);
-  return { server, client, session, closeBrowser };
+  return { server, client, session, storageState, closeBrowser, isLive, touch };
+}
+
+/** Restart the browser_* browser's idle clock. Called after every browser_* call (src/index.ts). */
+export function touchUpstream(): void {
+  current?.touch();
+}
+
+/**
+ * The idle close for browser_* (src/lifetime.ts calls it). Closing the Chrome
+ * alone is not enough: upstream notices a dead context only by failing the NEXT
+ * call on it. So the connection is replaced, exactly as a rebind replaces it, with
+ * a fresh one for the SAME session file: nothing launches until the next browser_*
+ * call, which then comes up with that session's storageState, so a session_attach
+ * binding survives the close. What does not survive is what lived only in the
+ * browser: open tabs, and when bound, cookies the site set after the capture.
+ *
+ * Takes a turn in the queue like a rebind, and is only ever started while the
+ * queue is idle, so it runs at once and never lands inside someone's lease.
+ */
+async function recycleIdle(): Promise<void> {
+  await browserQueue.run(
+    async () => {
+      const previous = current;
+      if (!previous?.isLive()) return;
+      current = await connect(previous.session, previous.storageState);
+      await disconnect(previous);
+    },
+    { label: 'idle close' },
+  );
 }
 
 /** Start the upstream browser. Call once at boot. */

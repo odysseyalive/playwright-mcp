@@ -48,6 +48,7 @@ import { classifyHealth, extractReadable, isBotManagerCookie, jarWorthKeeping } 
 import { bindSession } from '../upstream.js';
 import { openSessionContext, writeBackSessionJar, type SessionContext } from '../browser.js';
 import { browserQueue, leaseArg, LEASE_PROPERTY, type RunOptions } from '../queue.js';
+import { idleMs, killTree, trackBrowser, type BrowserHandle } from '../lifetime.js';
 import {
   STEALTH_LAUNCH,
   STEALTH_INIT,
@@ -514,8 +515,13 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   const out = sessionFilePath(opts.name);
   let browser: Browser | undefined;
   let button: DoneButton | undefined;
+  let tracker: BrowserHandle | undefined;
   try {
     browser = await chromium.launch({ headless: !opts.headed, ...STEALTH_LAUNCH });
+    // Registered so it is visible and dies with the server; NEVER idle-closed: a
+    // human is logging in, with no time limit (src/lifetime.ts).
+    const b = browser;
+    tracker = trackBrowser({ kind: 'capture', session: opts.name, close: () => b.close() });
     // Disguise the capture context (own cookie jar — never the web_fetch profile)
     // so bot-protected login pages don't flag the headless browser and fail the
     // capture. Identity stays isolated; only the anti-detection technique is shared.
@@ -687,6 +693,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
   } finally {
     button?.close(); // answers an unanswered press "not saved"
     await browser?.close().catch(() => {});
+    tracker?.done();
   }
 }
 
@@ -1646,6 +1653,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
   let child: ReturnType<typeof spawn> | undefined;
   let cdp: Browser | undefined;
   let button: DoneButton | undefined;
+  let tracker: BrowserHandle | undefined;
   try {
     // Only a dir we DRIVE in place is guarded: two Chromes cannot share one
     // user-data-dir. 'system' only READS the real dir, so the user's running Chrome
@@ -1693,6 +1701,24 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     });
     // temp/copy dirs are reap-eligible; a dedicated profile's Chrome is reaped, its dir kept
     if (child.pid && (prof.cleanup || prof.dedicated)) registerAttachRecord(child.pid, prof.dir, prof.dedicated);
+    // The server-wide registry too (src/lifetime.ts): visible in browser_status, and
+    // killed if this server shuts down mid-capture. Never idle-closed: the human
+    // has no time limit. A real profile driven in place is listed, never reaped.
+    if (child.pid) {
+      const pid = child.pid;
+      tracker = trackBrowser({
+        kind: opts.challenge ? 'solve' : 'capture',
+        pid,
+        userDataDir: prof.dir,
+        session: opts.name,
+        // SIGTERM first (killTree): a dedicated profile writes its cookie store on
+        // the way out, the same reason the `finally` below closes it gracefully.
+        close: () => killTree(pid),
+        // A real profile driven in place (no cleanup, not ours): another server's
+        // reaper must never kill the user's own Chrome, even if this server dies.
+        reapable: prof.cleanup || prof.dedicated === true,
+      });
+    }
     log(
       opts.challenge
         ? `attach challenge for "${opts.name}" — a real Chrome window opened; solve the CAPTCHA there and stay on the page` +
@@ -1803,6 +1829,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
       killGroup(child.pid); // kill the Chrome WE spawned (its own process group)
       unregisterAttachRecord(child.pid);
     }
+    tracker?.done();
     button?.close();
     if (prof.cleanup) fs.rmSync(prof.dir, { recursive: true, force: true }); // NEVER delete a real profile
   }
@@ -2732,7 +2759,9 @@ const attachDefinition: Tool = {
     'authenticated — the way to reuse a session in a LATER run without logging in again. ' +
     'session_login already does this for the session it captures; use this to switch between saved ' +
     'sessions, or to re-bind after a server restart. Pass name:null to drop back to the anonymous profile. ' +
-    'Rebinding swaps the browser underneath any open page, so re-navigate afterwards. ' +
+    'Rebinding swaps the browser underneath any open page, so re-navigate afterwards. The binding ' +
+    `outlives the browser: after ${Math.round(idleMs() / 60_000)} min idle the browser closes, and the next browser_* call relaunches ` +
+    'it with the same session (open tabs are gone; re-navigate). ' +
     'The rebind waits its turn in the browser queue, so it never lands in the middle of another ' +
     "caller's browser_* call or leased turn; pass your own lease to rebind inside your turn.",
   inputSchema: {

@@ -3,7 +3,9 @@
  *
  * Separate from the wrapped @playwright/mcp browser (that one drives debugging;
  * this one is disguised to pass as a real person while fetching/rendering pages).
- * One persistent lifecycle — launch once, reuse.
+ * One persistent lifecycle — launch once, reuse, and close after
+ * PLAYWRIGHT_MCP_BROWSER_IDLE_MS with no fetch on it (src/lifetime.ts; the next
+ * fetch relaunches). Every browser launched here is registered there.
  *
  * CONCURRENCY: the profile is drawn from a small numbered POOL, not one fixed dir.
  * Chromium holds a SingletonLock on a persistent profile for the life of the
@@ -34,6 +36,7 @@ import { chromium, type BrowserContext } from 'playwright';
 
 import { seedConsent } from './consent.js';
 import { keepSavedBotCookies, type Jar } from './extract.js';
+import { trackBrowser, type BrowserHandle } from './lifetime.js';
 import { humanCapturePath, ownerOnlyDir, reassertOwnerOnly } from './secrets.js';
 import {
   BROWSER_CHANNEL,
@@ -113,6 +116,34 @@ function selectProfile(pool: ProfilePool): string {
 
 let ctxPromise: Promise<BrowserContext> | undefined;
 let liveContext: BrowserContext | undefined;
+/** The shared context's registry handle (src/lifetime.ts) while it is up. */
+let liveHandle: BrowserHandle | undefined;
+/** A close in flight: the next launch waits for it, so the profile's lock is free again. */
+let closing: Promise<void> | undefined;
+
+/**
+ * Fetches using the shared context right now. Counted HERE, not from its pages:
+ * the persistent context keeps its default page for its whole life, so a page
+ * count is never zero. While this is above zero the context is never idle-closed.
+ */
+let users = 0;
+
+/**
+ * Take the shared context for one fetch. Call BEFORE getStealthContext() and
+ * call what it returns when the fetch is done with its page, so an idle close
+ * can never land between the two (src/tools/web-fetch.ts fetchOnce).
+ */
+export function useStealthContext(): () => void {
+  users += 1;
+  liveHandle?.touch();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    users -= 1;
+    liveHandle?.touch();
+  };
+}
 
 /**
  * Lazily launch (once) and return the shared stealth context. Persistent profile
@@ -137,11 +168,25 @@ export async function getStealthContext(): Promise<BrowserContext> {
 }
 
 async function launch(): Promise<BrowserContext> {
+  await closing;
   const { context, dir } = await launchOnPool(FETCH_POOL, openProfile);
   liveContext = context;
+  // Idle close (src/lifetime.ts): the 2026-11-24 incident's web_fetch profile had
+  // sat idle 11+ hours under a session that was still open. Closed after the idle
+  // time with no fetch on it; the next fetch relaunches on the same pool slot.
+  const handle = trackBrowser({
+    kind: 'web_fetch',
+    userDataDir: dir,
+    idleClose: true,
+    busy: () => users > 0,
+    close: () => closeBrowser({ keepTemp: true }),
+  });
+  liveHandle = handle;
   context.once('close', () => {
+    handle.done();
     if (liveContext !== context) return;
     liveContext = undefined;
+    liveHandle = undefined;
     ctxPromise = undefined;
     log('stealth context closed — next fetch will relaunch');
   });
@@ -391,12 +436,22 @@ export function pace(base = 350, jitterSeed = 0.5): Promise<void> {
  *  was created. Unconditional and stateless: the path is pid-keyed, so it is
  *  ours either way, and `force` makes it a no-op when we never fell back. A hard
  *  kill that skips this is the reaper's job, not a leak. */
-export async function closeBrowser(): Promise<void> {
+export async function closeBrowser({ keepTemp = false } = {}): Promise<void> {
   const pending = ctxPromise;
+  const handle = liveHandle;
   ctxPromise = undefined;
   liveContext = undefined;
-  if (pending) await pending.then((ctx) => ctx.close()).catch(() => {});
-  dropTempProfile(FETCH_POOL);
+  liveHandle = undefined;
+  const done = (async () => {
+    if (pending) await pending.then((ctx) => ctx.close()).catch(() => {});
+    handle?.done();
+  })();
+  closing = done;
+  await done;
+  if (closing === done) closing = undefined;
+  // An idle close keeps the temp fallback: the relaunch takes the first free
+  // slot again, and this pid's temp dir is still ours either way.
+  if (!keepTemp) dropTempProfile(FETCH_POOL);
 }
 
 /** Remove this process's temp fallback profile for `pool`, if one was ever made. */
@@ -534,27 +589,34 @@ export async function openSessionContext(name: string, file: string): Promise<Se
   if (dir) {
     const release = await lockReadProfile(dir);
     let context: BrowserContext | undefined;
+    let tracker: BrowserHandle | undefined;
     try {
       clearStaleSingletons(dir);
       if (isOccupied(dir)) throw new Error('another process is reading with it');
       context = await launchStealthProfile(dir);
-      await seedFromSession(context, dir, file);
+      // Registered for ownership, status and shutdown. Call-scoped, so never
+      // idle-closed: it closes when its one read is done.
       const ctx = context;
+      const handle = (tracker = trackBrowser({ kind: 'read-profile', userDataDir: dir, session: name, close: () => ctx.close() }));
+      await seedFromSession(context, dir, file);
       return {
         context: ctx,
         profile: dir,
         close: async () => {
           await ctx.close().catch(() => {});
+          handle.done();
           release();
         },
       };
     } catch (err) {
       await context?.close().catch(() => {});
+      tracker?.done();
       release();
       log(`session "${name}": read profile unavailable (${err instanceof Error ? err.message : String(err)}); reading ephemeral`);
     }
   }
   const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
+  const handle = trackBrowser({ kind: 'read-profile', session: name, close: () => browser.close() });
   try {
     const context = await browser.newContext({ ...stealthContextOptions, storageState: file });
     await context.addInitScript(STEALTH_INIT);
@@ -563,10 +625,12 @@ export async function openSessionContext(name: string, file: string): Promise<Se
       close: async () => {
         await context.close().catch(() => {});
         await browser.close().catch(() => {});
+        handle.done();
       },
     };
   } catch (err) {
     await browser.close().catch(() => {});
+    handle.done();
     throw err;
   }
 }

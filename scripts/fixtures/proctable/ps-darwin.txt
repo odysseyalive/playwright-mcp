@@ -1,0 +1,9 @@
+    1     0     1     0  12544 Mon Nov 23 08:00:01 2026     /sbin/launchd
+  612     1   612   501  48212 Mon Nov 23 08:01:12 2026     /Applications/Claude.app/Contents/MacOS/claude --resume 1234
+  700   612   700   501  91234 Tue Nov 24 09:15:02 2026     /usr/local/bin/node /Users/fm/.local/share/playwright-mcp/dist/index.js
+  701   700   701   501 210004 Tue Nov 24 09:16:40 2026     /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --disable-field-trial-config --headless --no-startup-window --user-data-dir=/Users/fm/.cache/playwright-mcp/profile --remote-debugging-pipe about:blank
+  702   701   701   501  80120 Tue Nov 24 09:16:41 2026     /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/131.0/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer --user-data-dir=/Users/fm/.cache/playwright-mcp/profile --lang=en-US
+  801     1   801   501 190500 Mon Nov 23 22:01:05 2026     /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless --user-data-dir=/var/folders/x1/abc/T/playwright_chromiumdev_profile-Q1w2E3 --remote-debugging-pipe about:blank
+  802   801   801   501  70300 Mon Nov 23 22:01:06 2026     /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/131.0/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process --user-data-dir=/var/folders/x1/abc/T/playwright_chromiumdev_profile-Q1w2E3
+  900     1   900   501 400100 Mon Nov 23 08:02:00 2026     /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+  950     1   950   502 190500 Mon Nov 23 22:01:05 2026     /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless --user-data-dir=/Users/fm/.cache/playwright-mcp/profile-2

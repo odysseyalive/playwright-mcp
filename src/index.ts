@@ -31,7 +31,16 @@ import { secretInventory } from './secrets.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
-import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser } from './upstream.js';
+import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser, touchUpstream } from './upstream.js';
+import {
+  browserStatus,
+  CLOSE_GRACE_MS,
+  closeAllBrowsers,
+  formatStatus,
+  setOwnerInfo,
+  startLifetime,
+  watchOwner,
+} from './lifetime.js';
 import { browserQueue, leaseArg, LEASE_PROPERTY } from './queue.js';
 import { queueTurn } from './tools/session.js';
 
@@ -212,6 +221,10 @@ const ALWAYS_DENIED = new Set([
   'session_scaffold_tests',
   'suite_scaffold',
   'suite_audit',
+  // Reads this host's process table and every server's registry: other sessions'
+  // client pids and session ids, profile paths. No human gate, and nothing an
+  // HTTP client needs to drive a browser (src/tools/browsers.ts).
+  'browser_status',
   // The movie_* family reads local files (a mock-up and its folder), writes and
   // deletes under the host's config dir, spawns ffmpeg, and can load a captured
   // session — host-fs power with no human gate, the same class as suite_scaffold.
@@ -389,6 +402,10 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
     'a random token, two limits, a fixed note, and the `holder` label. The label is model-written text ' +
     'echoed to other callers, never page content; cleanHolder keeps it to 64 printable characters. ' +
     'Errors are the queue’s own sentences built from labels this server chose and that same holder.',
+  browser_status:
+    'handler (src/tools/browsers.ts) serialises browserStatus() (src/lifetime.ts): pids, start ' +
+    'times, kinds, profile paths and session NAMES this server or a sibling wrote into the registry, ' +
+    'plus numbers read from /proc. No browser is touched and no page is read.',
   browser_lease_release:
     'releaseHandler (src/tools/lease.ts) returns BrowserQueue.release’s fixed notes (src/queue.ts) ' +
     'about the caller’s own token. No browser is touched.',
@@ -680,10 +697,15 @@ export function createOutwardServer(
       // call waited. `lease` is ours, so upstream never sees it.
       const { lease: _lease, ...forward } = args ?? {};
       const result = await browserQueue.run(async () => {
-        const out = await upstreamOf().callTool({ name, arguments: forward });
-        // Upstream's browser_close drops its hold on the browser but not the browser.
-        if (name === 'browser_close') await releaseBrowser();
-        return out;
+        try {
+          const out = await upstreamOf().callTool({ name, arguments: forward });
+          // Upstream's browser_close drops its hold on the browser but not the browser.
+          if (name === 'browser_close') await releaseBrowser();
+          return out;
+        } finally {
+          // The idle clock (src/lifetime.ts) runs from the END of the last call.
+          touchUpstream();
+        }
       }, queueTurn(ctx, name, leaseArg(args ?? {})));
       return withUntrustedNotice(withSessionBanner(result, boundSession(), remote), name);
     } catch (err) {
@@ -720,8 +742,14 @@ async function main() {
   //    outward Server (stdio + every HTTP session) is built from the factory.
   const { tools: upstreamTools } = await upstream.listTools();
 
+  // Every browser launched from here on is registered to this server and its
+  // client, closed when idle, and killed with it (src/lifetime.ts). Also reaps
+  // what dead servers left behind.
+  startLifetime({ version: VERSION });
+
   // 3a. Local stdio surface (Claude Code) — full toolset, byte-for-byte unchanged.
   const stdioServer = createOutwardServer(getUpstream, upstreamTools);
+  stdioServer.oninitialized = () => setOwnerInfo({ clientName: stdioServer.getClientVersion()?.name });
   await stdioServer.connect(new StdioServerTransport());
   log(`v${VERSION} ready (stdio, wrapping @playwright/mcp, headless chromium)`);
 
@@ -772,11 +800,28 @@ async function main() {
     // rebound by session_login/session_attach) and the stealth context web_fetch
     // uses. Concurrent so a slow close doesn't serialise behind the other;
     // allSettled because shutdown must not be derailed by either one failing.
-    await Promise.allSettled([closeUpstream(), closeBrowser()]);
+    // Bounded: a close that hangs must not keep the server, and its browsers, up.
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.allSettled([closeUpstream(), closeBrowser()]),
+      new Promise<void>((r) => (timer = setTimeout(r, CLOSE_GRACE_MS))),
+    ]);
+    clearTimeout(timer);
+    // Then everything else this server launched (a read, a movie, a capture
+    // window), and a process-group kill for whatever is still up after the grace.
+    await closeAllBrowsers();
     process.exit(0);
   };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  // Every way the client can leave: SIGTERM/SIGINT/SIGHUP (Playwright's own
+  // SIGHUP handler closes its browsers but takes Node's default exit away, so
+  // this one is needed), stdin ending, the transport closing, and the client
+  // process dying without a word. The SDK's stdio transport ignores stdin EOF,
+  // and Chrome's pipes keep the event loop alive, so before this a server
+  // outlived its client with its browsers up (2026-11-24). An HTTP-serving
+  // instance does not read stdin or its parent as its client: Docker's CMD has
+  // neither.
+  const leave = watchOwner(() => void shutdown(), { stdio: !remote });
+  stdioServer.onclose = () => leave('the stdio transport closed');
 }
 
 // Run only when invoked as the entry point — importing this module (e.g. tests
@@ -786,8 +831,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.stdout.write(`${VERSION}\n`);
     process.exit(0);
   }
-  main().catch((err) => {
-    log('fatal:', err);
-    process.exit(1);
-  });
+  // For the human: every playwright-mcp browser on this machine, with its owner,
+  // age, idle time and memory (src/lifetime.ts). Read-only; it reaps nothing.
+  if (process.argv[2] === '--browsers') {
+    browserStatus().then((rows) => {
+      process.stdout.write(process.argv[3] === '--json' ? `${JSON.stringify(rows, null, 1)}\n` : formatStatus(rows));
+      process.exit(0);
+    });
+  } else {
+    main().catch((err) => {
+      log('fatal:', err);
+      process.exit(1);
+    });
+  }
 }

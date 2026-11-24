@@ -59,6 +59,7 @@ import {
 import { sessionScaffoldTool } from './tools/scaffold.js';
 import { suiteScaffoldTool, suiteAuditTool, suiteMethodologyTool } from './tools/suite.js';
 import { leaseAcquireTool, leaseReleaseTool } from './tools/lease.js';
+import { browserStatusTool } from './tools/browsers.js';
 import {
   movieScriptSaveTool,
   movieScriptListTool,
@@ -79,6 +80,7 @@ const registry: CustomTool[] = [
   suiteMethodologyTool,
   leaseAcquireTool,
   leaseReleaseTool,
+  browserStatusTool,
   movieScriptSaveTool,
   movieScriptListTool,
   movieRecordTool,

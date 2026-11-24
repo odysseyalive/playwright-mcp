@@ -228,6 +228,15 @@ export class BrowserQueue {
     throw new BrowserQueueError(`${UNKNOWN_TOKEN} Nothing was released.`);
   }
 
+  /**
+   * Nothing running, no lease held, nobody waiting: the only state in which the
+   * browser_* browser may be idle-closed (src/lifetime.ts). A held lease counts
+   * as use even between its calls, so a lease keeps the browser up until it ends.
+   */
+  isIdle(): boolean {
+    return !this.running && !this.lease && this.waiting.length === 0;
+  }
+
   /** True while `token` is the live lease. */
   isLive(token: string | undefined): boolean {
     return token !== undefined && this.lease?.token === token;
