@@ -10,7 +10,7 @@ An MCP server that wraps `@playwright/mcp` and adds sixteen tools of its own for
 
 Claude's built-in WebFetch returns page text. That's it.
 
-When this server takes over that job, every fetch also comes back with structured citation metadata (author, date, publisher in CSL-JSON, plus the page's lead image from `og:image` or `twitter:image` when it has one, so a product listing comes back with its photo), a page-health classification (paywall, soft-404, parked, login-wall, blocked), and CMS detection. Claude doesn't ask for any of that. It's already sitting there when Claude summarizes a page or pulls a quote.
+When this server takes over that job, every fetch also comes back with structured citation metadata (author, date, publisher in CSL-JSON, plus the page's lead image from `og:image` or `twitter:image` when it has one, so a product listing comes back with its photo), a page-health classification (paywall, soft-404, parked, login-wall, blocked, and unreachable when the network, DNS or host failed before any site answered, which is never reported as a wall), and CMS detection. Claude doesn't ask for any of that. It's already sitting there when Claude summarizes a page or pulls a quote.
 
 The other thing the built-in can't do is render. Single-page apps, JavaScript-heavy dashboards, pages behind consent walls. `web_fetch` runs a real headless Chromium with a stealth context, so it sees what a person would see.
 

@@ -283,7 +283,7 @@ test('robustness: extractors never throw on garbage input', () => {
 // eBay, 2026-11-23: a walled session read saved the cookies the wall had just
 // rewritten over the human's capture. Only a read that came back as content writes.
 test('jarWorthKeeping: a wall or a sign-in redirect never writes the session jar back', () => {
-  for (const s of ['blocked', 'login-wall']) assert.equal(jarWorthKeeping(s), false, s);
+  for (const s of ['blocked', 'login-wall', 'unreachable']) assert.equal(jarWorthKeeping(s), false, s);
   for (const s of ['ok', '404', 'paywall', 'parked', 'consent-wall']) assert.equal(jarWorthKeeping(s), true, s);
 });
 

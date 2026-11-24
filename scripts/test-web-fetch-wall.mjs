@@ -17,10 +17,13 @@ import path from 'node:path';
 
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const sessions = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-wall-'));
+// Removed on every exit, not only in the browser test's t.after: a browser-free run
+// (the gate's default) skipped that test and left one of these behind per run.
+process.on('exit', () => fs.rmSync(sessions, { recursive: true, force: true }));
 process.env.PLAYWRIGHT_MCP_SESSIONS = sessions;
 process.env.PLAYWRIGHT_MCP_READ_PROFILES = path.join(sessions, 'read-profiles');
 
-const { fetchUrl, wallSessionName, awaitWallSolve, notifyWallWindow, sessionWallAdvice, solvedStillWalledAdvice, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
+const { fetchUrl, isUnreachable, wallSessionName, awaitWallSolve, notifyWallWindow, sessionWallAdvice, solvedStillWalledAdvice, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
   '../dist/tools/web-fetch.js'
 );
 const { closeBrowser } = await import('../dist/browser.js');
@@ -155,6 +158,37 @@ test('notify: argv only, host as its own argument, skipped without a display, ne
   );
 });
 
+// eBay, 2026-11-24: the machine lost its network mid-scan, the fetch threw
+// net::ERR_INTERNET_DISCONNECTED, web_fetch called that 'blocked', and the scan
+// backed off for hours from a bot wall that was never there.
+test('isUnreachable: a network, DNS or connection failure is not a refusal', () => {
+  for (const code of [
+    'ERR_INTERNET_DISCONNECTED', 'ERR_NAME_NOT_RESOLVED', 'ERR_NAME_RESOLUTION_FAILED', 'ERR_ADDRESS_UNREACHABLE',
+    'ERR_CONNECTION_REFUSED', 'ERR_CONNECTION_RESET', 'ERR_CONNECTION_CLOSED', 'ERR_CONNECTION_TIMED_OUT',
+    'ERR_CONNECTION_FAILED', 'ERR_TIMED_OUT', 'ERR_NETWORK_CHANGED', 'ERR_NETWORK_IO_SUSPENDED', 'ERR_PROXY_CONNECTION_FAILED',
+  ]) {
+    const msg = `page.goto: net::${code} at https://www.ebay.com/itm/327465486746\nCall log:\n  - navigating to "https://www.ebay.com/itm/327465486746"`;
+    assert.equal(isUnreachable(new Error(msg)), true, code);
+  }
+  const timeout = new Error('page.goto: Timeout 20000ms exceeded.\nCall log:\n  - navigating to "https://x.test/"');
+  timeout.name = 'TimeoutError';
+  assert.equal(isUnreachable(timeout), true, 'TimeoutError');
+  assert.equal(isUnreachable('page.goto: Timeout 20000ms exceeded.'), true, 'timeout text');
+  // A refusal, a host that answered, or something that is not a net error at all.
+  for (const msg of [
+    'page.goto: net::ERR_ACCESS_DENIED at http://169.254.169.254/',
+    'page.goto: net::ERR_BLOCKED_BY_CLIENT at https://x.test/',
+    'page.goto: net::ERR_HTTP2_PROTOCOL_ERROR at https://www.ebay.com/itm/1',
+    'page.goto: net::ERR_SSL_PROTOCOL_ERROR at https://x.test/',
+    'page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://x.test/',
+    'page.goto: net::ERR_ABORTED at https://x.test/net::ERR_INTERNET_DISCONNECTED',
+    'Target page, context or browser has been closed',
+    '',
+  ]) {
+    assert.equal(isUnreachable(new Error(msg)), false, msg);
+  }
+});
+
 test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TEST_BROWSER=1' }, async (t) => {
   const server = http.createServer((req, res) => {
     if (req.url === '/private') {
@@ -272,6 +306,52 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     assert.match(r.error, /no clearance will fix/);
     assert.match(r.error, /session_login/);
     assert.ok(fs.existsSync(path.join(sessions, `${name}.json`)), 'the clearance is kept');
+  });
+
+  await t.test('a host that refuses the connection is unreachable: no wall, no window, no write-back, no cache', async () => {
+    // A port nothing listens on: the connection is refused before any site answers.
+    const closed = http.createServer();
+    await new Promise((r) => closed.listen(0, '127.0.0.1', r));
+    const port = closed.address().port;
+    await new Promise((r) => closed.close(r));
+    const gone = `http://127.0.0.1:${port}`;
+    // The clearance an earlier subtest saved for this host (one per host, not per port).
+    const clearance = path.join(sessions, `${wallSessionName(gone)}.json`);
+    const before = fs.existsSync(clearance) ? fs.readFileSync(clearance, 'utf8') : undefined;
+    // A display and a solver that would open the window, so a wall would show here.
+    process.env.DISPLAY = process.env.DISPLAY || ':0';
+    let solves = 0;
+    const solve = async () => {
+      solves++;
+      return { name: wallSessionName(gone), path: '', capturedAt: '', mode: 'challenge', ok: false };
+    };
+    const r = await fetchUrl({ url: `${gone}/itm/1` }, { trust: 'stdio' }, solve);
+    assert.equal(r.fetchStatus, 'unreachable');
+    assert.equal(solves, 0, 'no window opens');
+    assert.match(r.error, /not a bot wall/);
+    assert.doesNotMatch(r.error, /CAPTCHA|session_solve_challenge/);
+    assert.match(r.errorDetail, /ERR_CONNECTION_REFUSED/);
+    assert.equal(fs.existsSync(clearance) ? fs.readFileSync(clearance, 'utf8') : undefined, before, 'clearance untouched');
+    assert.equal(r.note, undefined, 'no "read with the saved clearance" note on a read that reached nothing');
+    // A session read of a host that is down leaves its jar as it was.
+    const file = path.join(sessions, 'downjar.json');
+    const jar = JSON.stringify({
+      cookies: [{ name: 'sid', value: 'human', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }],
+      origins: [],
+    });
+    fs.writeFileSync(file, jar, { mode: 0o600 });
+    const s = await fetchUrl({ url: `${gone}/itm/1`, session: 'downjar' }, { trust: 'stdio' });
+    assert.equal(s.fetchStatus, 'unreachable');
+    assert.equal(fs.readFileSync(file, 'utf8'), jar);
+    // Not cached: once the host is back, the next read sees it.
+    const back = http.createServer((_req, res) => res.writeHead(200, { 'content-type': 'text/html' }).end(PAGE));
+    await new Promise((r) => back.listen(port, '127.0.0.1', r));
+    try {
+      const again = await fetchUrl({ url: `${gone}/itm/1` }, { trust: 'stdio' }, solve);
+      assert.equal(again.fetchStatus, 'ok');
+    } finally {
+      await new Promise((r) => back.close(r));
+    }
   });
 
   await t.test('no ctx is an unknown surface: no reuse', async () => {

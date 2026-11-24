@@ -12,7 +12,17 @@
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 
-export type FetchStatus = 'ok' | 'paywall' | '404' | 'parked' | 'login-wall' | 'blocked' | 'consent-wall';
+export type FetchStatus =
+  | 'ok'
+  | 'paywall'
+  | '404'
+  | 'parked'
+  | 'login-wall'
+  | 'blocked'
+  | 'consent-wall'
+  // The network or the host could not be reached: no site answered, so nothing
+  // refused us. Never a wall (see isUnreachable in tools/web-fetch.ts).
+  | 'unreachable';
 export type ContentType = 'html' | 'pdf';
 
 export interface CslAuthor {
@@ -199,7 +209,8 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
  * web_fetch, and its Akamai cookies' expiries date them to that walled run.
  */
 export function jarWorthKeeping(status: FetchStatus): boolean {
-  return status !== 'blocked' && status !== 'login-wall';
+  // 'unreachable' too: no site answered, so the jar holds nothing the site said.
+  return status !== 'blocked' && status !== 'login-wall' && status !== 'unreachable';
 }
 
 /**

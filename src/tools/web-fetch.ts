@@ -148,7 +148,12 @@ export async function fetchUrl(
 
   const saved = fs.existsSync(sessionFilePath(wall));
   const first = await fetchOnce(saved ? { ...opts, session: wall } : opts);
-  if (!walled.has(first)) return saved ? withNote(first, `read with the saved bot-wall clearance "${wall}"`) : first;
+  // An unreachable read used no clearance: nothing answered to be shown one.
+  if (!walled.has(first)) {
+    return saved && first.fetchStatus !== 'unreachable'
+      ? withNote(first, `read with the saved bot-wall clearance "${wall}"`)
+      : first;
+  }
   if (!canShowWindow()) {
     return {
       ...first,
@@ -426,6 +431,9 @@ async function fetchOnce(opts: FetchOptions, wallAdvice?: string): Promise<Fetch
   let egressGuard: EgressGuardHandle | undefined;
   // Whether a session read may write its jar back; set once the result is known.
   let keepJar = false;
+  // Whether the navigation got an answer. A throw before that never reached the
+  // site, so it may be 'unreachable'; a throw after it reached one.
+  let navigated = false;
   try {
     if (opts.session) {
       if (egressRestricted()) {
@@ -507,6 +515,7 @@ async function fetchOnce(opts: FetchOptions, wallAdvice?: string): Promise<Fetch
     // already arrived in full. Same 20s budget; past it, extract what rendered.
     const deadline = Date.now() + FETCH_TIMEOUT_MS;
     const resp = await page.goto(url, { waitUntil: 'commit', timeout: FETCH_TIMEOUT_MS });
+    navigated = true;
     const loaded = await page
       .waitForLoadState('domcontentloaded', { timeout: Math.max(1, deadline - Date.now()) })
       .then(() => true, () => false);
@@ -642,7 +651,24 @@ async function fetchOnce(opts: FetchOptions, wallAdvice?: string): Promise<Fetch
     // PROVENANCE, not only in wording: the guard's reason is server-authored and
     // belongs in the envelope; anything else is a caught error from a navigation
     // the page steered, so it is quarantined instead.
+    //
+    // A navigation that never reached a site is 'unreachable', not 'blocked'. It used
+    // to be 'blocked' like every other throw, and a caller reads 'blocked' as a bot
+    // wall: 2026-11-24 an eBay scan's machine lost its network
+    // (net::ERR_INTERNET_DISCONNECTED), web_fetch said 'blocked', and the scan backed
+    // off for hours from a site that had refused nothing. Checked after the guard:
+    // a refused hop is ERR_ACCESS_DENIED, which is ours and stays 'blocked'.
     const refusedHop = egressGuard?.blocked();
+    if (!refusedHop && !navigated && isUnreachable(err)) {
+      return errorResult(
+        url,
+        'unreachable',
+        'the page could not be reached: the network or DNS failed, or the host did not answer. This is not ' +
+          'a bot wall and the site refused nothing; retry later. The browser error is quarantined below as `errorDetail`',
+        opts.links,
+        briefly(err),
+      );
+    }
     return refusedHop
       ? errorResult(url, 'blocked', refusedHop, opts.links)
       : errorResult(
@@ -693,6 +719,46 @@ async function pdfBytes(page: Page, resp: Response): Promise<Uint8Array | string
       ? 'the PDF host was refused by the egress guard'
       : 'the request for the PDF\'s bytes failed or timed out';
   }
+}
+
+/**
+ * Chromium's net errors for a network, DNS or connection failure: the request never
+ * got an answer from the site, so the site cannot have refused it.
+ *
+ * Left out on purpose, so they stay 'blocked': ERR_ACCESS_DENIED (the egress guard
+ * and the browser's own policy, ours to report), ERR_BLOCKED_BY_* (a refusal by
+ * name), and the TLS and HTTP/2 errors. Certificate errors never reach here, since
+ * every context sets ignoreHTTPSErrors; a handshake or protocol failure is a host
+ * that answered, and a bot manager can refuse a headless client right there (an
+ * HTTP/2 stream reset is a known one), so calling those "unreachable" would hide a wall.
+ */
+const UNREACHABLE_NET_ERRORS = new Set([
+  'ERR_INTERNET_DISCONNECTED',
+  'ERR_NAME_NOT_RESOLVED',
+  'ERR_NAME_RESOLUTION_FAILED',
+  'ERR_ADDRESS_UNREACHABLE',
+  'ERR_CONNECTION_REFUSED',
+  'ERR_CONNECTION_RESET',
+  'ERR_CONNECTION_CLOSED',
+  'ERR_CONNECTION_TIMED_OUT',
+  'ERR_CONNECTION_FAILED',
+  'ERR_TIMED_OUT',
+  'ERR_NETWORK_CHANGED',
+  'ERR_NETWORK_IO_SUSPENDED',
+  'ERR_PROXY_CONNECTION_FAILED',
+]);
+
+/**
+ * Whether a navigation's throw means the site was never reached. Playwright's
+ * TimeoutError counts: goto waits only for the response to COMMIT, so a timeout
+ * there is a host that never answered. Only the first net:: code is read; it comes
+ * before the URL in the message, and the URL is the part a redirect chose.
+ */
+export function isUnreachable(err: unknown): boolean {
+  if (err instanceof Error && err.name === 'TimeoutError') return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = /net::(ERR_[A-Z0-9_]+)/.exec(msg)?.[1];
+  return code ? UNREACHABLE_NET_ERRORS.has(code) : /^(page\.goto: )?Timeout \d+ms exceeded/.test(msg);
 }
 
 /** Playwright errors carry a whole browser log; keep the head of it, not all of it. */
@@ -749,7 +815,8 @@ const definition: Tool = {
     'On a CAPTCHA / bot wall (local only) a real Chrome window opens for the human to clear it and ' +
     'the fetch waits up to 90s, retrying once it clears; the clearance is saved as "wall-<host>" and ' +
     'reused by later fetches there. A wall that is still up returns fetchStatus:"blocked"; if a window ' +
-    'is still waiting for the human, the error says so, and a retry after they solve it succeeds.',
+    'is still waiting for the human, the error says so, and a retry after they solve it succeeds. ' +
+    'fetchStatus:"unreachable" means the network, DNS or host failed before any site answered: not a wall, retry later.',
   inputSchema: {
     type: 'object',
     properties: {
