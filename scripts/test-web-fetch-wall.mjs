@@ -20,7 +20,7 @@ const sessions = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-wall-'));
 process.env.PLAYWRIGHT_MCP_SESSIONS = sessions;
 process.env.PLAYWRIGHT_MCP_READ_PROFILES = path.join(sessions, 'read-profiles');
 
-const { fetchUrl, wallSessionName, awaitWallSolve, notifyWallWindow, sessionWallAdvice, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
+const { fetchUrl, wallSessionName, awaitWallSolve, notifyWallWindow, sessionWallAdvice, solvedStillWalledAdvice, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
   '../dist/tools/web-fetch.js'
 );
 const { closeBrowser } = await import('../dist/browser.js');
@@ -61,6 +61,17 @@ test('a wall in front of a named session says what happened and both ways back i
   assert.doesNotMatch(b, /opens a window/);
   assert.match(b, /cannot open from here/);
   assert.match(b, /session_solve_challenge/);
+});
+
+// eBay /itm/, 2026-11-24: the human's Chrome loaded the page, the window saved, the
+// headless retry was walled again, and the caller was told the clearance "may have lapsed".
+test('a wall that survives a fresh solve says the headless browser is refused, not that a clearance lapsed', () => {
+  const a = solvedStillWalledAdvice();
+  assert.doesNotMatch(a, /lapsed/);
+  assert.match(a, /real browser/);
+  assert.match(a, /no clearance will fix/);
+  assert.match(a, /session_login/);
+  assert.match(a, /web_fetch\(\{url, session: name\}\)/);
 });
 
 /** A solve the test finishes by hand. */
@@ -155,6 +166,11 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
       res.end('<html><head><title>Sign in</title></head><body><form><input type="password"></form><div class="g-recaptcha"></div></body></html>');
       return;
     }
+    // A page that refuses the headless browser whatever clearance it carries.
+    if (req.url?.startsWith('/refused')) {
+      res.end(WALL);
+      return;
+    }
     const cleared = /(^|;\s*)cleared=1/.test(req.headers.cookie ?? '');
     // Content re-mints the bot manager's cookie and rolls an auth one, as eBay's did.
     if (cleared) res.setHeader('set-cookie', ['bm_s=headless; Path=/', 'roll=2; Path=/']);
@@ -232,6 +248,30 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     const back = JSON.parse(fs.readFileSync(file, 'utf8')).cookies;
     assert.equal(back.find((c) => c.name === 'roll')?.value, '2', 'written back after a good read');
     assert.equal(back.find((c) => c.name === 'bm_s')?.value, 'human');
+  });
+
+  await t.test('walled again right after the window saved: says the headless browser is refused', async () => {
+    process.env.DISPLAY = process.env.DISPLAY || ':0';
+    const name = wallSessionName(base);
+    let solves = 0;
+    // Stands in for the window: a real browser got the page and saved a clearance.
+    const solve = async () => {
+      solves++;
+      const wall = name;
+      const state = {
+        cookies: [{ name: 'cleared', value: '1', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }],
+        origins: [],
+      };
+      fs.writeFileSync(path.join(sessions, `${wall}.json`), JSON.stringify(state), { mode: 0o600 });
+      return { name: wall, path: '', capturedAt: '', mode: 'challenge', ok: true };
+    };
+    const r = await fetchUrl({ url: `${base}/refused` }, { trust: 'stdio' }, solve);
+    assert.equal(solves, 1);
+    assert.equal(r.fetchStatus, 'blocked');
+    assert.doesNotMatch(r.error, /lapsed/);
+    assert.match(r.error, /no clearance will fix/);
+    assert.match(r.error, /session_login/);
+    assert.ok(fs.existsSync(path.join(sessions, `${name}.json`)), 'the clearance is kept');
   });
 
   await t.test('no ctx is an unknown surface: no reuse', async () => {

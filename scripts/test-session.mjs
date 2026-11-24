@@ -1005,7 +1005,7 @@ writeArtifact('offline-ok', {
   origins: [{ origin: 'https://app.example.com', localStorage: [{ name: 'tok', value: 'SECRET-LOCALSTORAGE' }] }],
 });
 
-test('session_status offline: reports present, covered domains, earliest expiry', async () => {
+test('session_status offline: reports present, covered domains, login expiry', async () => {
   const s = await sessionStatus({ name: 'offline-ok' });
   assert.equal(s.state, 'present'); // never 'fresh' — only a live probe can know that
   assert.equal(s.check, 'artifact');
@@ -1013,8 +1013,69 @@ test('session_status offline: reports present, covered domains, earliest expiry'
   assert.deepEqual(s.artifact.origins, ['https://app.example.com']);
   assert.equal(s.artifact.cookieCount, 2);
   assert.equal(s.artifact.sessionCookies, 0);
-  assert.equal(s.artifact.expiresAt, new Date(SOON * 1000).toISOString()); // earliest, not latest
+  // The sid's, not the earlier csrf's: a pre-login cookie is not the login (summariseArtifact).
+  assert.equal(s.artifact.expiresAt, new Date((SOON + HOUR) * 1000).toISOString());
+  assert.equal(s.artifact.expiryIgnored, 1);
   assert.equal(s.artifact.expired, false);
+});
+
+// eBay, 2026-11-24: a good login read expired:true three hours after capture, because
+// the earliest of its 79 cookies was hCaptcha's 30-minute __cf_bm, with eBay's own
+// 30-minute utag_main__* / cto_session behind it.
+test('session_status offline: short-lived bot and tracker cookies do not expire a good login', async () => {
+  const PAST = Math.floor(Date.now() / 1000) - HOUR;
+  const YEAR = Math.floor(Date.now() / 1000) + 365 * 24 * HOUR;
+  writeArtifact('offline-ebay-shape', {
+    cookies: [
+      { name: '__cf_bm', value: 'V', domain: '.hcaptcha.com', path: '/', expires: PAST },
+      { name: 'utag_main__ss', value: 'V', domain: '.ebay.com', path: '/', expires: PAST },
+      { name: 'cto_session', value: 'V', domain: '.ebay.com', path: '/', expires: PAST },
+      { name: 'ak_bmsc', value: 'V', domain: '.ebay.com', path: '/', expires: SOON },
+      { name: 's', value: 'V', domain: '.ebay.com', path: '/', expires: -1 },
+      { name: 'ebaysid', value: 'V', domain: '.ebay.com', path: '/', expires: YEAR },
+    ],
+    origins: [],
+  });
+  const s = await sessionStatus({ name: 'offline-ebay-shape' });
+  assert.equal(s.artifact.expired, false);
+  assert.equal(s.artifact.expiresAt, new Date(YEAR * 1000).toISOString());
+  assert.equal(s.artifact.expiryIgnored, 3, '__cf_bm, utag_main__ss, ak_bmsc');
+  assert.equal(s.artifact.sessionCookies, 1);
+  assert.equal(s.artifact.expiryNote, undefined);
+});
+
+test('session_status offline: a login whose own cookies are all past reads expired, whatever bots and trackers say', async () => {
+  const PAST = Math.floor(Date.now() / 1000) - HOUR;
+  const YEAR = Math.floor(Date.now() / 1000) + 365 * 24 * HOUR;
+  writeArtifact('offline-login-gone', {
+    cookies: [
+      { name: 'auth_token', value: 'V', domain: 'gone.test', path: '/', expires: PAST - HOUR },
+      { name: 'prefs', value: 'V', domain: 'gone.test', path: '/', expires: PAST },
+      { name: '_ga', value: 'V', domain: '.gone.test', path: '/', expires: YEAR },
+      { name: 'bm_s', value: 'V', domain: '.gone.test', path: '/', expires: YEAR },
+    ],
+    origins: [],
+  });
+  const s = await sessionStatus({ name: 'offline-login-gone' });
+  assert.equal(s.artifact.expired, true);
+  assert.equal(s.artifact.expiresAt, new Date(PAST * 1000).toISOString(), 'the latest of the login cookies');
+  assert.equal(s.artifact.expiryIgnored, 2);
+});
+
+test('session_status offline: a jar of bot cookies only has no login expiry, and says why', async () => {
+  writeArtifact('offline-bot-only', {
+    cookies: [
+      { name: 'cf_clearance', value: 'V', domain: '.botonly.test', path: '/', expires: 1_000_000 },
+      { name: '_abck', value: 'V', domain: '.botonly.test', path: '/', expires: SOON },
+    ],
+    origins: [],
+  });
+  const s = await sessionStatus({ name: 'offline-bot-only' });
+  assert.equal(s.artifact.expiresAt, null);
+  assert.equal(s.artifact.expired, false);
+  assert.equal(s.artifact.expiryIgnored, 2);
+  assert.match(s.artifact.expiryNote, /bot-manager/);
+  assert.doesNotMatch(s.artifact.expiryNote, /session cookies only/);
 });
 
 test('session_status offline: missing artifact is a clean verdict, not a throw', async () => {

@@ -129,7 +129,13 @@ export interface FetchOptions {
  * `wall-<host>`, and the retry reads with it. A fetch that finds the window already
  * open returns the same answer at once.
  */
-export async function fetchUrl(opts: FetchOptions, ctx?: ToolContext): Promise<FetchResult> {
+export async function fetchUrl(
+  opts: FetchOptions,
+  ctx?: ToolContext,
+  // Replaces opening the window, so the solved-then-still-walled path is testable
+  // without a human. The real opener stays below as the one solveChallenge call.
+  openWindow?: () => Promise<LoginResult>,
+): Promise<FetchResult> {
   const trusted = ctx?.trust === 'stdio' || ctx?.trust === 'local';
   const wall = wallSessionName(opts.url);
   // A caller-named session never opens the window (see above), so a wall it meets
@@ -160,12 +166,16 @@ export async function fetchUrl(opts: FetchOptions, ctx?: ToolContext): Promise<F
   const stop = startHeartbeat(ctx, `bot wall at ${host}`, wallHeartbeat);
   let waited: WallWait;
   try {
-    waited = await awaitWallSolve(wall, () => {
-      // The name, not the url: a query string can carry a token, and stderr is a log.
-      log(`${wall}: bot wall; opening a window for the human to clear it`);
-      notifyWallWindow(host);
-      return solveChallenge(wall, opts.url, { trust: ctx.trust }, undefined, windowMs);
-    });
+    waited = await awaitWallSolve(
+      wall,
+      openWindow ??
+        (() => {
+          // The name, not the url: a query string can carry a token, and stderr is a log.
+          log(`${wall}: bot wall; opening a window for the human to clear it`);
+          notifyWallWindow(host);
+          return solveChallenge(wall, opts.url, { trust: ctx.trust }, undefined, windowMs);
+        }),
+    );
   } finally {
     stop();
   }
@@ -191,8 +201,31 @@ export async function fetchUrl(opts: FetchOptions, ctx?: ToolContext): Promise<F
         'Retry web_fetch to open it again.',
     };
   }
-  const retry = await fetchOnce({ ...opts, session: wall });
+  // The `wall-<host>` file is kept even when this retry is walled too: it is what a
+  // real browser earned, it does no harm, and dropping it would not stop the next
+  // fetch from opening the window again either (no file means a wall means a window).
+  const retry = await fetchOnce({ ...opts, session: wall }, solvedStillWalledAdvice());
   return walled.has(retry) ? retry : withNote(retry, `bot wall cleared by the human; saved as "${wall}" for later fetches`);
+}
+
+/**
+ * The retry right after the human's window saved is walled again. That is not a
+ * clearance that lapsed: a real Chrome just got the page, so the site refuses THIS
+ * headless browser on this page, and no clearance changes that. MEASURED 2026-11-24
+ * 06:20Z on eBay /itm/ pages: the human's Chrome loaded them with no challenge, the
+ * window saved within seconds, the retry got the "SORRY" page and the caller was told
+ * the clearance "may have lapsed"; the same page read fine with web_fetch session:'ebay'.
+ *
+ * Server-authored only, with nothing from the URL in it: this text lands outside
+ * the quarantine.
+ */
+export function solvedStillWalledAdvice(): string {
+  return (
+    'A window opened, the page loaded in a real browser and its clearance was saved, but this headless ' +
+    'browser was refused again with that clearance: the site turns away this browser on this page, and ' +
+    'no clearance will fix that, so do not retry or re-solve. A logged-in session may get through: ' +
+    'capture one with session_login({name, loginUrl}) and read with web_fetch({url, session: name}).'
+  );
 }
 
 /** Results that rendered a bot wall. A set, not a field: it never reaches the model. */

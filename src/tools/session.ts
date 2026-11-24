@@ -44,7 +44,7 @@ import {
 } from '../secrets.js';
 import { storageStateDomains, wrapUntrusted } from '../exfil.js';
 import { startDoneButton, type DoneButton } from '../login-done.js';
-import { classifyHealth, extractReadable, jarWorthKeeping } from '../extract.js';
+import { classifyHealth, extractReadable, isBotManagerCookie, jarWorthKeeping } from '../extract.js';
 import { bindSession } from '../upstream.js';
 import { openSessionContext, writeBackSessionJar, type SessionContext } from '../browser.js';
 import { browserQueue, leaseArg, LEASE_PROPERTY, type RunOptions } from '../queue.js';
@@ -2235,11 +2235,16 @@ export interface ArtifactSummary {
   /** Origins the capture holds localStorage for (origin only, never its entries). */
   origins: string[];
   cookieCount: number;
-  /** Earliest FIXED cookie expiry, ISO. `null` when no cookie has one. */
+  /**
+   * LATEST fixed expiry among the cookies that could carry the login (see
+   * summariseArtifact), ISO: the login cannot outlive it. `null` when none has one.
+   */
   expiresAt: string | null;
   /** Cookies with no fixed expiry — storageState records those as `expires: -1`. */
   sessionCookies: number;
-  /** The earliest fixed expiry is already past. Advisory: the server may have rolled it forward. */
+  /** Fixed-expiry cookies left out of `expiresAt`: bot-manager and analytics/pre-login ones. */
+  expiryIgnored: number;
+  /** Every cookie that could carry the login is past its expiry. Advisory: the server may have rolled it forward. */
   expired: boolean;
   /** Plain-language reading of `expiresAt: null`, for a model that would otherwise guess. */
   expiryNote?: string;
@@ -2267,14 +2272,34 @@ export interface StatusResult {
  * constructed explicitly, so a cookie value can never ride along in the output.
  * Playwright records `expires` in Unix SECONDS, with -1 for a session cookie;
  * a naive min over that returns -1 and would report a nonsense 1969 date.
+ *
+ * WHICH expiry is the login's. This used to be the earliest fixed expiry of ANY
+ * cookie, and a jar holds dozens that are not the login. MEASURED 2026-11-24:
+ * ebay.json (79 cookies, a good login) read expired:true three hours after capture,
+ * because its earliest cookie was hCaptcha's 30-minute __cf_bm on .hcaptcha.com,
+ * with eBay's own 30-minute utag_main__* and cto_session next in line. An
+ * authenticated item page read fine at the same moment. The earliest of many
+ * cookies is always some tracker's, so the rule is now the other bound: the login
+ * is expired only when EVERY cookie that could carry it is past its expiry, and
+ * `expiresAt` is the latest of those, the point the login cannot outlive.
+ *
+ * "Could carry it" leaves out bot-manager cookies (isBotManagerCookie, the list
+ * keepSavedBotCookies uses) and analytics / pre-login cookies (isInfraCookieName,
+ * the list the capture's auth gate uses). Rejected alternatives, from that file:
+ * the `.human` capture held the same 30-minute trackers, so "only cookies the human
+ * captured" changes nothing; and a lifetime threshold has no clock to measure from,
+ * since storageState records no creation time and the file's mtime is the last
+ * write-back, not the capture. The cost of this bound is lateness: a long-lived
+ * third-party ad cookie keeps `expired` false after the site's own cookies have
+ * gone. That is the safe side; a dead login still shows as a login wall on the
+ * next read, while a false `expired` sends the human to log in again for nothing.
  */
 function summariseArtifact(state: unknown, now: number): ArtifactSummary {
   const s = (state ?? {}) as StorageState;
   const cookies = Array.isArray(s.cookies) ? s.cookies : [];
-  const fixed = cookies
-    .map((c) => (typeof c.expires === 'number' ? c.expires : -1))
-    .filter((e) => e > 0);
-  const earliest = fixed.length ? Math.min(...fixed) : null;
+  const fixed = cookies.filter((c) => typeof c.expires === 'number' && c.expires > 0);
+  const loginCarriers = fixed.filter((c) => !isBotManagerCookie(c.name ?? '') && !isInfraCookieName(c.name ?? ''));
+  const latest = loginCarriers.length ? Math.max(...loginCarriers.map((c) => c.expires as number)) : null;
   const origins = (Array.isArray(s.origins) ? s.origins : [])
     .map((o) => o?.origin)
     .filter((o): o is string => typeof o === 'string');
@@ -2282,11 +2307,15 @@ function summariseArtifact(state: unknown, now: number): ArtifactSummary {
     domains: [...storageStateDomains(state)].sort(),
     origins,
     cookieCount: cookies.length,
-    expiresAt: earliest === null ? null : new Date(earliest * 1000).toISOString(),
+    expiresAt: latest === null ? null : new Date(latest * 1000).toISOString(),
     sessionCookies: cookies.length - fixed.length,
-    expired: earliest !== null && earliest * 1000 <= now,
+    expiryIgnored: fixed.length - loginCarriers.length,
+    expired: latest !== null && latest * 1000 <= now,
   };
-  if (earliest === null && summary.sessionCookies > 0)
+  if (latest === null && summary.expiryIgnored > 0)
+    summary.expiryNote =
+      'only bot-manager / analytics cookies carry a fixed expiry; none of them is the login, so no login expiry is known';
+  else if (latest === null && summary.sessionCookies > 0)
     summary.expiryNote = 'session cookies only — no fixed expiry; they die with the capturing browser';
   return summary;
 }
@@ -2754,7 +2783,8 @@ const statusDefinition: Tool = {
     'Ask what a saved session covers, before spending a login on access you may already have. ' +
     'OMIT probeUrl for an instant OFFLINE check of the stored artifact — no browser, no network: ' +
     'reports whether the named session exists ("present" / "missing"), which registrable domains and ' +
-    'origins it carries identity for, and the earliest cookie expiry. Use it first when you are about ' +
+    'origins it carries identity for, and when its login cookies expire (bot-manager and analytics cookies ' +
+    'do not count). Use it first when you are about ' +
     'to propose a headed session_login: if the domains already cover your target, just call ' +
     'web_fetch({url, session}) or session_attach({name}) instead. ' +
     'PASS probeUrl to additionally live-probe an authenticated route; that reports fresh / stale / ' +
@@ -2773,7 +2803,7 @@ const statusDefinition: Tool = {
         type: 'string',
         description:
           'OPTIONAL. An authenticated route to live-probe. Omit it for the offline artifact check ' +
-          '(exists / covered domains / earliest expiry) with no browser launch.',
+          '(exists / covered domains / login expiry) with no browser launch.',
       },
       loginIndicator: { type: 'string', description: 'A selector/URL substring that means "logged out".' },
     },
