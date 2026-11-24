@@ -25,6 +25,7 @@
  * IMPORTANT: never log to stdout (MCP stdio stream). Use stderr.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,12 +33,15 @@ import path from 'node:path';
 import { chromium, type BrowserContext } from 'playwright';
 
 import { seedConsent } from './consent.js';
+import { keepSavedBotCookies, type Jar } from './extract.js';
+import { humanCapturePath, ownerOnlyDir, reassertOwnerOnly } from './secrets.js';
 import {
   BROWSER_CHANNEL,
   browserGlibcEnv,
   CHROME_MAJOR,
   STEALTH_ARGS,
   STEALTH_INIT,
+  STEALTH_LAUNCH,
   stealthContextOptions,
 } from './stealth.js';
 
@@ -216,7 +220,8 @@ function claimTempProfile(pool: ProfilePool, dir: string): string {
   return dir;
 }
 
-async function openProfile(dir: string): Promise<BrowserContext> {
+/** One headless stealth Chrome on a persistent profile: the fetch pool's, or a session's read profile. */
+async function launchStealthProfile(dir: string): Promise<BrowserContext> {
   const context = await chromium.launchPersistentContext(dir, {
     channel: BROWSER_CHANNEL,
     headless: true,
@@ -229,6 +234,11 @@ async function openProfile(dir: string): Promise<BrowserContext> {
     ...stealthContextOptions,
   });
   await context.addInitScript(STEALTH_INIT);
+  return context;
+}
+
+async function openProfile(dir: string): Promise<BrowserContext> {
+  const context = await launchStealthProfile(dir);
   await seedConsent(context);
   return context;
 }
@@ -396,4 +406,204 @@ export function dropTempProfile(pool: ProfilePool): void {
   } catch {
     /* best effort */
   }
+}
+
+// ── named-session reads ─────────────────────────────────────────────────────────
+
+/**
+ * Where web_fetch({session}) and the session_status probe read a named session:
+ * one persistent profile per name. PLAYWRIGHT_MCP_READ_PROFILES overrides it (the
+ * tests use it).
+ *
+ * WHY persistent. Every such read used to cold-launch a fresh headless Chrome with
+ * only the saved cookies in it: no cache, no localStorage or IndexedDB the site's
+ * scripts had written, no history with the site at all, every single time. That is
+ * a new device on every request, and eBay's bot defences (Akamai, Radware) treated
+ * it as one (2026-11-23). A profile per name keeps all of that between reads.
+ *
+ * WHY not the login profile session_login keeps for the same name
+ * (login-profiles/<name>, tools/session.ts dedicatedProfileDir). That one belongs
+ * to the human's headed captures, and the trust it carries is the reason it
+ * exists. A headless read in it would leave its own bot-manager state there, the
+ * very state that got eBay's jar flagged, and the next login would meet it.
+ * Playwright also launches Chrome with --password-store=basic while the login
+ * window is a plain Chrome on the desktop keyring, so the two would not even read
+ * each other's cookie store. So a sibling root, only ever driven headless.
+ */
+export function readProfilesDir(): string {
+  return (
+    process.env.PLAYWRIGHT_MCP_READ_PROFILES ??
+    path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'playwright-mcp', 'read-profiles')
+  );
+}
+
+/** The read profile for one session name, owner-only: it holds that session's logged-in jar. */
+function readProfileDir(name: string): string {
+  const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!safe || /^\.+$/.test(safe)) throw new Error(`session name ${JSON.stringify(name)} cannot name a read profile`);
+  const root = readProfilesDir();
+  const dir = path.join(root, safe);
+  for (const d of [root, dir]) {
+    ownerOnlyDir(d);
+    if (process.platform !== 'win32') fs.chmodSync(d, 0o700);
+  }
+  return dir;
+}
+
+/**
+ * One read at a time per profile in this process, from launch through write-back.
+ * Two Chromes cannot share a user-data-dir, and two write-backs of one session
+ * would race. A read waits for the one ahead of it rather than falling back, so
+ * every read of a name gets the profile.
+ */
+const readLocks = new Map<string, Promise<void>>();
+async function lockReadProfile(key: string): Promise<() => void> {
+  const ahead = readLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  const tail = ahead.then(() => mine);
+  readLocks.set(key, tail);
+  await ahead;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release();
+    if (readLocks.get(key) === tail) readLocks.delete(key);
+  };
+}
+
+/** Which saved jar a read profile was last seeded from or wrote back. Inside the profile, so it goes with it. */
+const SEED_STAMP = '.pwmcp-session-seed';
+const stampOf = (text: string) => createHash('sha256').update(text).digest('hex');
+
+/**
+ * Put the saved session into the profile. The FILE is the identity, never the
+ * profile: its cookies replace the profile's on every read, so a re-capture takes
+ * effect at once and whatever a headless read was handed by a bot defence and kept
+ * out of the file (keepSavedBotCookies) does not live on in the profile either.
+ * What carries over between reads is the rest: cache, localStorage, IndexedDB.
+ *
+ * Only when the file is one this profile has not seen (a new capture, or the first
+ * read) is its whole storageState applied, localStorage with it. setStorageState
+ * clears every origin's storage first, so doing that on every read would throw the
+ * carried-over state away.
+ */
+async function seedFromSession(context: BrowserContext, dir: string, file: string): Promise<void> {
+  const text = fs.readFileSync(file, 'utf8');
+  const state = JSON.parse(text) as Parameters<BrowserContext['setStorageState']>[0] & object;
+  let seen = '';
+  try {
+    seen = fs.readFileSync(path.join(dir, SEED_STAMP), 'utf8').trim();
+  } catch {
+    /* never seeded */
+  }
+  if (seen !== stampOf(text)) {
+    await context.setStorageState(state);
+    fs.writeFileSync(path.join(dir, SEED_STAMP), stampOf(text), { mode: 0o600 });
+    return;
+  }
+  await context.clearCookies();
+  await context.addCookies(state.cookies ?? []);
+}
+
+export interface SessionContext {
+  context: BrowserContext;
+  /** The read profile it runs on; undefined on the ephemeral fallback. */
+  profile?: string;
+  /** Close the browser and let the next read of this name in. Never throws. */
+  close(): Promise<void>;
+}
+
+/**
+ * A headless stealth context carrying the named session, for one read. Its
+ * persistent read profile when that can be had; otherwise, exactly as before, an
+ * ephemeral browser seeded from the file. The fallback covers a profile another
+ * process holds (a second MCP server on this account reading the same name) and
+ * any failure to launch or seed on the profile: a read never fails for want of it.
+ *
+ * Hold the result only for the one read, and call writeBackSessionJar before close().
+ */
+export async function openSessionContext(name: string, file: string): Promise<SessionContext> {
+  let dir: string | undefined;
+  try {
+    dir = readProfileDir(name);
+  } catch (err) {
+    log(`session "${name}": no read profile (${err instanceof Error ? err.message : String(err)}); reading ephemeral`);
+  }
+  if (dir) {
+    const release = await lockReadProfile(dir);
+    let context: BrowserContext | undefined;
+    try {
+      clearStaleSingletons(dir);
+      if (isOccupied(dir)) throw new Error('another process is reading with it');
+      context = await launchStealthProfile(dir);
+      await seedFromSession(context, dir, file);
+      const ctx = context;
+      return {
+        context: ctx,
+        profile: dir,
+        close: async () => {
+          await ctx.close().catch(() => {});
+          release();
+        },
+      };
+    } catch (err) {
+      await context?.close().catch(() => {});
+      release();
+      log(`session "${name}": read profile unavailable (${err instanceof Error ? err.message : String(err)}); reading ephemeral`);
+    }
+  }
+  const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
+  try {
+    const context = await browser.newContext({ ...stealthContextOptions, storageState: file });
+    await context.addInitScript(STEALTH_INIT);
+    return {
+      context,
+      close: async () => {
+        await context.close().catch(() => {});
+        await browser.close().catch(() => {});
+      },
+    };
+  } catch (err) {
+    await browser.close().catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Rolling write-back after a headless read that came back as content: the
+ * refreshed jar over the saved one, so each read prolongs the session instead of
+ * letting it age toward its capture-time expiry. Two things are never written:
+ *
+ *   - a bot-manager cookie from this read (keepSavedBotCookies): the saved ones,
+ *     earned by the human, stay as they are;
+ *   - over the human's own capture without a copy: the first write-back after a
+ *     capture keeps that capture once, as humanCapturePath(file).
+ *
+ * Throws on a failed write; callers treat the write-back as best-effort.
+ */
+export async function writeBackSessionJar(context: BrowserContext, file: string, profile?: string): Promise<void> {
+  const refreshed = (await context.storageState()) as Jar;
+  const savedText = fs.readFileSync(file, 'utf8');
+  let saved: Jar = {};
+  try {
+    saved = JSON.parse(savedText) as Jar;
+  } catch {
+    /* a corrupt file has no cookies worth keeping */
+  }
+  const human = humanCapturePath(file);
+  if (!fs.existsSync(human)) {
+    try {
+      fs.writeFileSync(human, savedText, { mode: 0o600, flag: 'wx' });
+      reassertOwnerOnly(human);
+    } catch {
+      /* another write-back made it first, or it cannot be made; the write-back goes on */
+    }
+  }
+  const text = JSON.stringify(keepSavedBotCookies(saved, refreshed));
+  fs.writeFileSync(file, text);
+  reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
+  // This profile now holds what the file says, so the next read reseeds cookies only.
+  if (profile) fs.writeFileSync(path.join(profile, SEED_STAMP), stampOf(text), { mode: 0o600 });
 }

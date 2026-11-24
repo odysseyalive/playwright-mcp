@@ -49,6 +49,16 @@ export function sessionFilePath(name: string): string {
   return path.join(sessionsDir(), `${safe}.json`);
 }
 
+/**
+ * The human's own capture of a session, kept once beside it before the first
+ * headless write-back rewrites the file (browser.ts writeBackSessionJar), and
+ * dropped by the next capture so that one gets its own. Not `.json`: nothing
+ * replays it as a session by accident. Restoring it is a plain copy over the file.
+ */
+export function humanCapturePath(sessionFile: string): string {
+  return `${sessionFile}.human`;
+}
+
 // ── owner-only restriction ────────────────────────────────────────────────────
 // A storageState artifact is an impersonation-grade credential, so it must be
 // readable by the owning account and nobody else. This section is the ONE place
@@ -313,12 +323,13 @@ export function secretInventory(): Record<string, string> {
   const dir = sessionsDir();
   if (fs.existsSync(dir)) {
     for (const file of fs.readdirSync(dir)) {
-      if (!file.endsWith('.json')) continue;
+      // The human-capture backup holds live values too (humanCapturePath).
+      if (!file.endsWith('.json') && !file.endsWith('.json.human')) continue;
       try {
         const state = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')) as {
           cookies?: { name?: string; value?: string }[];
         };
-        const session = file.replace(/\.json$/, '');
+        const session = file.replace(/\.json$/, ''); // a backup keeps its own label, so neither shadows the other
         for (const cookie of state.cookies ?? []) {
           if (cookie.name && cookie.value) inventory[`session:${session}/${cookie.name}`] = cookie.value;
         }

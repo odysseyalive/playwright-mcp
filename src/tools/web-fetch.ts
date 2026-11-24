@@ -13,10 +13,10 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 
-import { chromium, type Page, type Response } from 'playwright';
+import type { Page, Response } from 'playwright';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { getStealthContext, pace } from '../browser.js';
+import { getStealthContext, openSessionContext, pace, writeBackSessionJar } from '../browser.js';
 import { dismissConsent } from '../consent.js';
 import {
   egressRestricted,
@@ -27,8 +27,7 @@ import {
 } from '../egress.js';
 import { guardOutbound, sessionAllowsUrl, wrapUntrusted } from '../exfil.js';
 import { TtlCache, canonicalUrl } from '../cache.js';
-import { sessionFilePath, secretInventory, reassertOwnerOnly } from '../secrets.js';
-import { STEALTH_LAUNCH, STEALTH_INIT, stealthContextOptions } from '../stealth.js';
+import { sessionFilePath, secretInventory } from '../secrets.js';
 import type { ToolContext } from '../tools.js';
 import {
   solveChallenge,
@@ -95,8 +94,9 @@ export interface FetchOptions {
   quality?: 'fast' | 'research';
   /**
    * Named session_login artifact to read authenticated (paywalled) content with,
-   * e.g. "ft" or "nyt". Loaded into an EPHEMERAL stealth context with its own
-   * cookie jar — the authed identity never touches the shared scraping profile
+   * e.g. "ft" or "nyt". Read in that name's own persistent read profile (an
+   * ephemeral context when the profile is busy), seeded from the file, with its
+   * own cookie jar — the authed identity never touches the shared scraping profile
    * (the storageState-isolation rule). Local instance only (refused on remote).
    */
   session?: string;
@@ -132,6 +132,12 @@ export interface FetchOptions {
 export async function fetchUrl(opts: FetchOptions, ctx?: ToolContext): Promise<FetchResult> {
   const trusted = ctx?.trust === 'stdio' || ctx?.trust === 'local';
   const wall = wallSessionName(opts.url);
+  // A caller-named session never opens the window (see above), so a wall it meets
+  // has to say what happened and how to get back in. A `wall-<host>` name is a
+  // saved clearance, where "it may have lapsed" is the whole story.
+  if (opts.session && !opts.session.toLowerCase().startsWith(WALL_SESSION_PREFIX)) {
+    return fetchOnce(opts, sessionWallAdvice(opts.session, wall, trusted && canShowWindow()));
+  }
   if (!trusted || opts.session || !wall) return fetchOnce(opts);
 
   const saved = fs.existsSync(sessionFilePath(wall));
@@ -296,6 +302,34 @@ export function wallSessionName(url: string): string | undefined {
   }
 }
 
+/**
+ * What a wall in front of a caller-named session means, and the two ways back in.
+ * It used to say the session's "clearance may have lapsed", which sent the model
+ * looking for a clearance a login session never had. MEASURED 2026-11-23 on eBay:
+ * the login was good; headless reads had rewritten the session's Akamai and Radware
+ * cookies, and eBay answered every search with its 403 "SORRY" page.
+ *
+ * Server-authored only. `wall` comes from the URL the caller asked for, never the
+ * one the page redirected to, since this text lands outside the quarantine.
+ * `canOpenWindow` is false where a sessionless fetch could not open the window
+ * either (an HTTP surface, no display), so the advice never promises one.
+ */
+export function sessionWallAdvice(session: string, wall: string | undefined, canOpenWindow: boolean): string {
+  const name = JSON.stringify(session);
+  const publicRead = canOpenWindow
+    ? 'For a public page, retry web_fetch without `session`: that read uses the shared profile, opens a window ' +
+      `for the human to clear the wall, and saves the clearance as ${wall ? `"${wall}"` : '"wall-<host>"'} for later fetches.`
+    : 'For a public page, retry web_fetch without `session`; a wall there needs a window for the human, which ' +
+      'cannot open from here (no display, or not the local surface), so clear it with session_solve_challenge on a machine with a screen.';
+  return (
+    `Session ${name} was turned away by the site's bot manager. The login may still be good: this read ` +
+    "replays the session's bot-manager cookies from a headless browser, and the site may have flagged them. " +
+    'No window opens for a named session. To recover, capture it again with ' +
+    `session_login({name: ${name}, loginUrl: <the site's sign-in page>, attach: true}), which signs in from ` +
+    `playwright-mcp's own Chrome profile for that name. ${publicRead}`
+  );
+}
+
 /** A headed window needs a display; on Linux that is X or Wayland, elsewhere there always is one. */
 function canShowWindow(): boolean {
   return process.platform !== 'linux' || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
@@ -305,8 +339,11 @@ function withNote(r: FetchResult, note: string): FetchResult {
   return { ...r, note: r.note ? `${r.note}; ${note}` : note };
 }
 
-/** One render + extract, no wall handling. */
-async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
+/**
+ * One render + extract, no wall handling. `wallAdvice` replaces the default tail of
+ * a session read's wall error (see sessionWallAdvice).
+ */
+async function fetchOnce(opts: FetchOptions, wallAdvice?: string): Promise<FetchResult> {
   const url = canonicalUrl(opts.url);
   const linkScope: LinkScope = opts.linkScope ?? 'outbound';
   const cacheKey = `${url}|links=${opts.links ? 1 : 0}|scope=${linkScope}|session=${opts.session ?? ''}`;
@@ -339,9 +376,10 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
   }
 
   // Pick the render context. Anonymous → the shared persistent stealth profile.
-  // Authenticated (opts.session) → an EPHEMERAL context seeded with that session's
-  // storageState, so authed cookies live in their own jar and never bleed into
-  // the shared scraping profile (the storageState-isolation rule). Local-only:
+  // Authenticated (opts.session) → that name's own read profile, seeded from its
+  // storageState (browser.ts openSessionContext), so authed cookies live in their
+  // own jar and never bleed into the shared scraping profile (the
+  // storageState-isolation rule). Local-only:
   // a captured session is never loaded on the prompt-injectable remote surface.
   //
   // Acquiring the page is inside the try: a browser that will not start is a
@@ -385,33 +423,26 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
           opts.links,
         );
       }
-      const browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
-      // Registered before the context exists: if newContext/newPage throws, the
-      // catch below still has something that closes this chromium.
-      cleanup = async () => {
-        await browser.close().catch(() => {});
-      };
-      const context = await browser.newContext({ ...stealthContextOptions, storageState: file, ignoreHTTPSErrors: true });
-      await context.addInitScript(STEALTH_INIT);
+      // The session's own persistent read profile, or an ephemeral browser when
+      // that cannot be had (openSessionContext). Either way a jar of its own.
+      const session = await openSessionContext(opts.session, file);
+      // Registered before the page exists: if newPage throws, the catch below
+      // still has something that closes this browser.
+      cleanup = () => session.close();
+      const context = session.context;
       page = await context.newPage();
       cleanup = async () => {
-        // Rolling session write-back: sites extend cookie expiry on every authed
-        // request; persisting the refreshed jar means each read PROLONGS the
-        // session instead of letting the artifact age toward its original expiry.
-        // Only after a read that came back as content (jarWorthKeeping): a
-        // logged-out jar, or one a bot wall just rewrote, must never overwrite
-        // the captured one. A read that threw never sets `keepJar` at all.
+        // Rolling session write-back (writeBackSessionJar), only after a read that
+        // came back as content (jarWorthKeeping): a logged-out jar, or one a bot
+        // wall just rewrote, must never overwrite the captured one. A read that
+        // threw never sets `keepJar` at all.
         try {
           const landed = page.url();
-          if (keepJar && !looksLikeSignIn(landed)) {
-            await context.storageState({ path: file });
-            reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
-          }
+          if (keepJar && !looksLikeSignIn(landed)) await writeBackSessionJar(context, file, session.profile);
         } catch {
           /* write-back is best-effort; the read result is unaffected */
         }
-        await context.close().catch(() => {});
-        await browser.close().catch(() => {});
+        await session.close();
       };
     } else {
       const context = await getStealthContext();
@@ -552,7 +583,7 @@ async function fetchOnce(opts: FetchOptions): Promise<FetchResult> {
         result.error =
           `a bot check or CAPTCHA${vendor ? ` (${vendor})` : ''} was returned instead of page content. ` +
           (opts.session
-            ? `Session "${opts.session}" did not get past it; its clearance may have lapsed.`
+            ? (wallAdvice ?? `Session "${opts.session}" did not get past it; its clearance may have lapsed.`)
             : 'Have the human clear it once with ' +
               'session_solve_challenge({name, url}), then retry with web_fetch({url, session: name})');
       }
@@ -702,7 +733,7 @@ const definition: Tool = {
         type: 'string',
         description:
           'Named session_login artifact (e.g. "ft", "nyt") to read authenticated/paywalled content. ' +
-          'Loaded into an isolated ephemeral context; local instance only.',
+          'Read in an isolated browser profile of its own for that name, seeded from the saved file; local instance only.',
       },
       linkScope: {
         type: 'string',

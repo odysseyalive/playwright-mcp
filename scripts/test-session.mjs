@@ -19,6 +19,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-sess-'));
 process.env.PLAYWRIGHT_MCP_SESSIONS = path.join(TMP, 'sessions');
 process.env.PLAYWRIGHT_MCP_SECRETS = path.join(TMP, 'secrets.env');
 process.env.PLAYWRIGHT_MCP_LOGIN_PROFILES = path.join(TMP, 'login-profiles');
+process.env.PLAYWRIGHT_MCP_READ_PROFILES = path.join(TMP, 'read-profiles');
 fs.writeFileSync(
   process.env.PLAYWRIGHT_MCP_SECRETS,
   'DEMO_USER=demo\nDEMO_PASS=secret\nDEMO_BADPASS=wrong\n',
@@ -129,6 +130,25 @@ function startApp() {
     if (req.url === '/walled') {
       res.writeHead(403, { 'Content-Type': 'text/html', 'Set-Cookie': 'bm_s=flagged; Path=/; Max-Age=3600' });
       res.end('<!DOCTYPE html><html><head><title>Error Page</title></head><body><h1>SORRY</h1><p>Something went wrong on our end. Please go back and try again.</p></body></html>');
+      return;
+    }
+    // A logged-in page behind a bot manager: every response re-mints Akamai's cookies
+    // (as eBay's did for each headless read, 2026-11-23) and rolls an auth cookie
+    // forward, and the page's own script counts visits in localStorage.
+    if (req.url?.startsWith('/botapp')) {
+      if (!authed) {
+        res.writeHead(302, { Location: '/login' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/html',
+        'Set-Cookie': ['bm_s=headless; Path=/; Max-Age=3600', '_abck=headless; Path=/; Max-Age=3600', 'roll=2; Path=/; Max-Age=3600'],
+      });
+      res.end(
+        '<!DOCTYPE html><html><head><title>Account</title></head><body><h1>Welcome demo</h1>' +
+          '<script>localStorage.setItem("visits", String(Number(localStorage.getItem("visits") || 0) + 1))</script></body></html>',
+      );
       return;
     }
     if (req.method === 'POST' && req.url === '/login') {
@@ -705,6 +725,9 @@ const WALLED = [
   ['https://docs.example.com/guide', 'Access denied'],
   ['https://docs.example.com/cdn-cgi/challenge-platform/h/b', 'Guide'],
   ['https://www.google.com/sorry/index', 'Google'],
+  // eBay's Akamai wall, 2026-11-23: a 403 served in place on the search URL. The
+  // title is all /json/list shows of it, and a solve window once saved on it.
+  ['https://www.ebay.com/sch/i.html?_nkw=x', 'Error Page'],
 ];
 
 test('DRIFT GUARD: wallUp() is the ONLY definition of a wall — no second inline check exists', () => {
@@ -766,6 +789,12 @@ test('challenge: cleared only when the markers vanish on the SAME url (a solve n
   assert.equal(challengeCleared('http://127.0.0.1:9/x', 'http://127.0.0.1:8/x', 'Other port'), false);
   // Garbage in never reads as success.
   assert.equal(challengeCleared('not a url', walled, 'Guide'), false);
+  // eBay's "SORRY" page is still the wall, on the very url it walled; a page that
+  // only mentions an error page in a longer title is not.
+  const ebay = 'https://www.ebay.com/sch/i.html?_nkw=lamp';
+  assert.equal(challengeCleared(ebay, ebay, 'Error Page'), false);
+  assert.equal(challengeCleared(ebay, ebay, 'lamp | eBay'), true);
+  assert.equal(challengeCleared(walled, walled, 'How to write a 404 error page — Example Docs'), true);
 });
 
 test('challenge: clearanceSummary reports expiry, and WARNS when nothing was actually cleared', () => {
@@ -834,6 +863,98 @@ test('session_status: a bot wall is unreachable + walled, never fresh, and the j
   assert.equal(s.state, 'unreachable');
   assert.equal(s.walled, true);
   assert.equal(fs.readFileSync(file, 'utf8'), jar, 'the captured jar is left exactly as it was');
+});
+
+const jarCookie = (name, value) => ({
+  name,
+  value,
+  domain: '127.0.0.1',
+  path: '/',
+  expires: Math.floor(Date.now() / 1000) + 86_400,
+  httpOnly: false,
+  secure: false,
+  sameSite: 'Lax',
+});
+const cookieValue = (state, name) => state.cookies.find((c) => c.name === name)?.value;
+
+// eBay, 2026-11-23: every headless read re-minted the Akamai/Radware cookies, a read
+// that came back as content wrote them over the human's, and the flagged ones were
+// replayed from then on.
+test('session_status write-back: auth rolls forward, bot-manager cookies stay the human\'s, the capture is kept once', async () => {
+  const file = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'botjar.json');
+  const jar = JSON.stringify({ cookies: [jarCookie('sid', 'ok'), jarCookie('bm_s', 'human')], origins: [] });
+  fs.writeFileSync(file, jar, { mode: 0o600 });
+  const s = await sessionStatus({ name: 'botjar', probeUrl: `${base}/botapp`, loginIndicator: '/login' });
+  assert.equal(s.state, 'fresh');
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(cookieValue(after, 'roll'), '2', 'the refreshed auth cookie is written back');
+  assert.equal(cookieValue(after, 'sid'), 'ok');
+  assert.equal(cookieValue(after, 'bm_s'), 'human', 'a saved bot-manager cookie is never replaced');
+  assert.equal(cookieValue(after, '_abck'), undefined, 'nor is one the headless read was handed added');
+  const human = `${file}.human`;
+  assert.equal(fs.readFileSync(human, 'utf8'), jar, 'the human capture is kept before the first write-back');
+  assertOwnerOnly(human);
+  // The second read rolls the file again but keeps the FIRST copy, and reads in the
+  // same profile: its localStorage carried over.
+  await sessionStatus({ name: 'botjar', probeUrl: `${base}/botapp`, loginIndicator: '/login' });
+  assert.equal(fs.readFileSync(human, 'utf8'), jar);
+  const again = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(cookieValue(again, 'bm_s'), 'human');
+  const visits = again.origins.find((o) => o.origin === base)?.localStorage.find((i) => i.name === 'visits')?.value;
+  assert.equal(visits, '2');
+  assert.ok(
+    fs.existsSync(path.join(process.env.PLAYWRIGHT_MCP_READ_PROFILES, 'botjar', '.pwmcp-session-seed')),
+    'read in its own persistent read profile',
+  );
+});
+
+test('session_status: a re-capture replaces the profile\'s storage, and concurrent probes take turns', async () => {
+  const file = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'botjar.json');
+  // A new capture: different cookies and a localStorage of its own.
+  const recaptured = {
+    cookies: [jarCookie('sid', 'ok'), jarCookie('bm_s', 'human2')],
+    origins: [{ origin: base, localStorage: [{ name: 'visits', value: '40' }] }],
+  };
+  fs.writeFileSync(file, JSON.stringify(recaptured), { mode: 0o600 });
+  const both = await Promise.all([
+    sessionStatus({ name: 'botjar', probeUrl: `${base}/botapp`, loginIndicator: '/login' }),
+    sessionStatus({ name: 'botjar', probeUrl: `${base}/botapp`, loginIndicator: '/login' }),
+  ]);
+  assert.deepEqual(both.map((s) => s.state), ['fresh', 'fresh']);
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(cookieValue(after, 'bm_s'), 'human2');
+  const visits = after.origins.find((o) => o.origin === base)?.localStorage.find((i) => i.name === 'visits')?.value;
+  assert.equal(visits, '42', 'the new capture\'s storage, then one visit per probe, one probe at a time');
+});
+
+test('session_status: a read profile another process holds falls back to an ephemeral read', { skip: IS_WIN32 && 'POSIX SingletonLock symlink' }, async () => {
+  const file = path.join(process.env.PLAYWRIGHT_MCP_SESSIONS, 'held.json');
+  fs.writeFileSync(file, JSON.stringify({ cookies: [jarCookie('sid', 'ok')], origins: [] }), { mode: 0o600 });
+  const dir = path.join(process.env.PLAYWRIGHT_MCP_READ_PROFILES, 'held');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // A live lock, as a running Chrome leaves it: "<host>-<pid>" of a process that exists.
+  fs.symlinkSync(`${os.hostname()}-${process.pid}`, path.join(dir, 'SingletonLock'));
+  try {
+    const s = await sessionStatus({ name: 'held', probeUrl: `${base}/botapp`, loginIndicator: '/login' });
+    assert.equal(s.state, 'fresh');
+    assert.equal(fs.existsSync(path.join(dir, '.pwmcp-session-seed')), false, 'the held profile was not touched');
+    assert.equal(cookieValue(JSON.parse(fs.readFileSync(file, 'utf8')), 'roll'), '2', 'the ephemeral read still wrote back');
+  } finally {
+    fs.rmSync(path.join(dir, 'SingletonLock'), { force: true });
+  }
+});
+
+test('a new capture drops the copy kept of the last one', async () => {
+  const human = `${sessionFilePath('demo')}.human`;
+  fs.writeFileSync(human, '{"cookies":[],"origins":[]}', { mode: 0o600 });
+  const r = await sessionLogin({
+    name: 'demo',
+    loginUrl: `${base}/login`,
+    successSignal: 'h1',
+    credKeys: { user: 'DEMO_USER', pass: 'DEMO_PASS' },
+  });
+  assert.equal(r.ok, true, r.error ?? 'login ok');
+  assert.equal(fs.existsSync(human), false);
 });
 
 test('session_status: missing when no file exists', async () => {

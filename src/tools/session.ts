@@ -9,7 +9,8 @@
  * Spec: /session-method. Identity stays ISOLATED: the shared persistent
  * web_fetch scraping profile (src/browser.ts) never carries auth cookies. An
  * explicit authed read — web_fetch({ session }) — loads a captured storageState
- * into its OWN ephemeral context (separate cookie jar), so auth and the shared
+ * into its OWN context (that name's read profile, src/browser.ts
+ * openSessionContext, or an ephemeral one), so auth and the shared
  * scraping profile still never merge; only the stealth *disguise* (src/stealth.ts)
  * is shared. storageState files are secrets: owner-only (0o600 on POSIX, an
  * owner-only ACL on win32 — both applied by ownerOnlyFile in src/secrets.ts,
@@ -38,13 +39,14 @@ import {
   getSecret,
   ownerOnlyDir,
   ownerOnlyFile,
-  reassertOwnerOnly,
+  humanCapturePath,
   OwnerOnlyError,
 } from '../secrets.js';
 import { storageStateDomains, wrapUntrusted } from '../exfil.js';
 import { startDoneButton, type DoneButton } from '../login-done.js';
 import { classifyHealth, extractReadable, jarWorthKeeping } from '../extract.js';
 import { bindSession } from '../upstream.js';
+import { openSessionContext, writeBackSessionJar, type SessionContext } from '../browser.js';
 import { browserQueue, leaseArg, LEASE_PROPERTY, type RunOptions } from '../queue.js';
 import {
   STEALTH_LAUNCH,
@@ -351,6 +353,9 @@ function cancellation(err: unknown): LoginCancelledError | undefined {
  * only positive proof a challenge capture actually got something; their expiry is
  * the real lifetime of the artifact.
  */
+// The cookies that PROVE a wall was cleared. The wider set a headless write-back must
+// never replace (every bot-manager cookie, these included) is extract.ts's
+// isBotManagerCookie; the two answer different questions, so they stay two lists.
 const CLEARANCE_COOKIES = /^(cf_clearance|__cf_bm|datadome|_abck|bm_sz|reese84|visid_incap_|incap_ses_)/i;
 
 const DEFAULT_SELECTORS = {
@@ -402,6 +407,18 @@ function restrictCapturedArtifact(out: string): string {
       `session not saved — the captured file could not be restricted to your account (${why}), ` +
         'so it was deleted rather than left readable by others.',
     );
+  }
+}
+
+/**
+ * A new capture IS the human's capture, so the copy kept of the last one
+ * (humanCapturePath) goes, and the next headless write-back keeps this one instead.
+ */
+function dropHumanCapture(out: string): void {
+  try {
+    fs.rmSync(humanCapturePath(out), { force: true });
+  } catch {
+    /* a stale copy is only a stale copy; the capture stands */
   }
 }
 
@@ -605,6 +622,7 @@ export async function sessionLogin(opts: LoginOptions): Promise<LoginResult> {
     prepareSessionsDir();
     await context.storageState({ path: out });
     const restriction = restrictCapturedArtifact(out); // secret: never readable by another account
+    dropHumanCapture(out);
 
     // SPA truth gate. When the login completed with NO caller marker and the URL never
     // left the login page (the same-origin SPA path), a live-probe hit on a strong auth
@@ -775,8 +793,15 @@ export function leftLoginPage(currentUrl: string, loginUrl: string): boolean {
 // challenge path. DevTools /json/list exposes only type/url/title, so these two are
 // the entire signal available WITHOUT attaching over CDP — and we deliberately do
 // not attach mid-solve, because driving the page is what makes the wall loop.
+//
+// `^error page$` is eBay's Akamai wall (2026-11-23): a 403 served in place on the
+// search URL, titled exactly "Error Page", whose body reads "SORRY - Something went
+// wrong on our end". Neither the 403 nor the body reaches /json/list, so the title is
+// the one passive tell, and without it a solve window counted that page as cleared
+// and saved the flagged jar. Anchored: a real page that merely mentions an error
+// page in its title is not a wall.
 const WALL_TITLE =
-  /just a moment|attention required|checking your browser|verifying you are human|one moment,? please|please wait|access denied|are you a robot|security check/i;
+  /just a moment|attention required|checking your browser|verifying you are human|one moment,? please|please wait|access denied|are you a robot|security check|^\s*error page\s*$/i;
 const WALL_PATH = /\/(sorry|cdn-cgi\/challenge|challenge-platform|captcha|_incapsula_)/i;
 
 /**
@@ -1733,6 +1758,7 @@ export async function sessionAttach(opts: LoginOptions): Promise<LoginResult> {
     prepareSessionsDir();
     fs.writeFileSync(out, JSON.stringify(state));
     const restriction = restrictCapturedArtifact(out);
+    dropHumanCapture(out);
     const kind = opts.challenge ? 'challenge' : 'attach';
     log(
       `saved session "${opts.name}" → ${out} (${restriction}, ${kind}${prof.scope || opts.challenge ? ', domain-scoped' : ''}, ` +
@@ -2322,17 +2348,13 @@ async function statusVerdict(opts: StatusOptions): Promise<StatusResult> {
     return { name: opts.name, state: 'stale', checkedAt };
   }
 
-  let browser: Browser | undefined;
+  let session: SessionContext | undefined;
   try {
-    browser = await chromium.launch({ headless: true, ...STEALTH_LAUNCH });
     // Same disguise as capture: a naked headless probe can trip bot detection and
     // land on a challenge page, which would false-report a good session as 'stale'.
-    const context = await browser.newContext({
-      ...stealthContextOptions,
-      storageState: file,
-      ignoreHTTPSErrors: true,
-    });
-    await context.addInitScript(STEALTH_INIT);
+    // And the same read profile web_fetch reads this name in (openSessionContext).
+    session = await openSessionContext(opts.name, file);
+    const context = session.context;
     const page = await context.newPage();
     let resp;
     try {
@@ -2363,9 +2385,9 @@ async function statusVerdict(opts: StatusOptions): Promise<StatusResult> {
       // and the site answered with refreshed cookies. Persisting them turns a
       // periodic status check into a KEEPALIVE — the session's expiry rolls
       // forward on every probe instead of aging toward its capture-time expiry.
+      // Bot-manager cookies are not rolled forward (writeBackSessionJar).
       try {
-        await context.storageState({ path: file });
-        reassertOwnerOnly(file); // never throws; a failure is a stderr warning, not silence
+        await writeBackSessionJar(context, file, session.profile);
       } catch {
         /* best-effort; the verdict stands either way */
       }
@@ -2375,7 +2397,7 @@ async function statusVerdict(opts: StatusOptions): Promise<StatusResult> {
     // Browser/context failure — environmental, not a session verdict.
     return { name: opts.name, state: 'unreachable', checkedAt };
   } finally {
-    await browser?.close().catch(() => {});
+    await session?.close();
   }
 }
 

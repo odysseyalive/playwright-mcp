@@ -15,9 +15,11 @@ import {
   harvestLinks,
   extractPdfText,
   jarWorthKeeping,
+  isBotManagerCookie,
+  keepSavedBotCookies,
   wallVendor,
 } from '../dist/extract.js';
-import { stealthContextOptions, STEALTH_INIT } from '../dist/stealth.js';
+import { stealthContextOptions, STEALTH_INIT, STEALTH_ARGS, SCREEN, WINDOW } from '../dist/stealth.js';
 
 const FX = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'web-fetch');
 const html = (name) => readFileSync(join(FX, name), 'utf8');
@@ -257,6 +259,40 @@ test('robustness: extractors never throw on garbage input', () => {
 test('jarWorthKeeping: a wall or a sign-in redirect never writes the session jar back', () => {
   for (const s of ['blocked', 'login-wall']) assert.equal(jarWorthKeeping(s), false, s);
   for (const s of ['ok', '404', 'paywall', 'parked', 'consent-wall']) assert.equal(jarWorthKeeping(s), true, s);
+});
+
+// eBay, 2026-11-23: the names its Akamai and Radware defences set on a real read,
+// each of which a headless write-back used to replace with its own.
+test('isBotManagerCookie: every bot-manager cookie eBay set, and no app cookie that resembles one', () => {
+  const bot = ['_abck', 'bm_s', 'bm_so', 'bm_lso', 'bm_sv', 'bm_mi', 'bm_sz', 'ak_bmsc',
+    '__uzma', '__uzmb', '__uzmc', '__uzmd', '__uzme', '__uzmf', '__uzmaj2', '__ssds', '__ssuzjsr2',
+    'cf_clearance', '__cf_bm', 'datadome', 'reese84', 'visid_incap_123', 'incap_ses_9_123', '_px3', '_pxvid'];
+  for (const n of bot) assert.equal(isBotManagerCookie(n), true, n);
+  const app = ['sid', 'ebay', 'nonsession', 'dp1', 's', 'bmw', 'xbm_s', 'abck', 'cf_session', 'px', 'session_px', 'ds2', 'shs'];
+  for (const n of app) assert.equal(isBotManagerCookie(n), false, n);
+});
+
+test('keepSavedBotCookies: auth rolls forward; a bot-manager cookie is never replaced, dropped or added', () => {
+  const c = (name, value, domain = '.ebay.com') => ({ name, value, domain, path: '/' });
+  const saved = { cookies: [c('sid', 'old'), c('_abck', 'human'), c('bm_sv', 'human')], origins: [] };
+  const refreshed = {
+    cookies: [c('sid', 'rolled'), c('_abck', 'headless'), c('bm_mi', 'headless'), c('dp1', 'new')],
+    origins: [{ origin: 'https://www.ebay.com', localStorage: [] }],
+  };
+  const merged = keepSavedBotCookies(saved, refreshed);
+  const by = Object.fromEntries(merged.cookies.map((k) => [k.name, k.value]));
+  assert.deepEqual(by, { sid: 'rolled', dp1: 'new', _abck: 'human', bm_sv: 'human' });
+  assert.deepEqual(merged.origins, refreshed.origins, 'storage comes from the read');
+  // A corrupt or empty saved jar contributes no bot cookies, and nothing is invented.
+  assert.deepEqual(keepSavedBotCookies({}, refreshed).cookies.map((k) => k.name), ['sid', 'dp1']);
+});
+
+// Measured 2026-11-23: a pinned 1366x768 viewport made screen, outer and inner one size.
+test('stealth: a 1080p screen, a window under it, and no emulated viewport', () => {
+  assert.equal(stealthContextOptions.viewport, null);
+  assert.ok(SCREEN.width >= WINDOW.width && SCREEN.height > WINDOW.height, 'the screen is bigger than the window');
+  assert.ok(STEALTH_ARGS.includes(`--window-size=${WINDOW.width},${WINDOW.height}`));
+  assert.ok(STEALTH_ARGS.includes(`--screen-info={${SCREEN.width}x${SCREEN.height}}`));
 });
 
 // A session is replayed in the browser that looks like the real Chrome it was

@@ -18,8 +18,9 @@ import path from 'node:path';
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const sessions = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-wall-'));
 process.env.PLAYWRIGHT_MCP_SESSIONS = sessions;
+process.env.PLAYWRIGHT_MCP_READ_PROFILES = path.join(sessions, 'read-profiles');
 
-const { fetchUrl, wallSessionName, awaitWallSolve, notifyWallWindow, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
+const { fetchUrl, wallSessionName, awaitWallSolve, notifyWallWindow, sessionWallAdvice, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
   '../dist/tools/web-fetch.js'
 );
 const { closeBrowser } = await import('../dist/browser.js');
@@ -44,6 +45,22 @@ test('wall- names are reserved: a login saved as one would be replayed unasked',
       assert.match(r.content[0].text, /reserved/);
     }
   }
+});
+
+// eBay, 2026-11-23: a named session walled by eBay's "SORRY" page was told its
+// "clearance may have lapsed". It had no clearance; its bot cookies were flagged.
+test('a wall in front of a named session says what happened and both ways back in', () => {
+  const a = sessionWallAdvice('ebay', 'wall-www.ebay.com', true);
+  assert.doesNotMatch(a, /lapsed/);
+  assert.match(a, /session_login\(\{name: "ebay", loginUrl: [^)]*attach: true\}\)/);
+  assert.match(a, /without `session`/);
+  assert.match(a, /opens a window/);
+  assert.match(a, /"wall-www\.ebay\.com"/, 'the clearance name the fetch will actually save');
+  // Where no window can open, it does not promise one.
+  const b = sessionWallAdvice('ebay', 'wall-www.ebay.com', false);
+  assert.doesNotMatch(b, /opens a window/);
+  assert.match(b, /cannot open from here/);
+  assert.match(b, /session_solve_challenge/);
 });
 
 /** A solve the test finishes by hand. */
@@ -138,7 +155,10 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
       res.end('<html><head><title>Sign in</title></head><body><form><input type="password"></form><div class="g-recaptcha"></div></body></html>');
       return;
     }
-    res.end(/(^|;\s*)cleared=1/.test(req.headers.cookie ?? '') ? PAGE : WALL);
+    const cleared = /(^|;\s*)cleared=1/.test(req.headers.cookie ?? '');
+    // Content re-mints the bot manager's cookie and rolls an auth one, as eBay's did.
+    if (cleared) res.setHeader('set-cookie', ['bm_s=headless; Path=/', 'roll=2; Path=/']);
+    res.end(cleared ? PAGE : WALL);
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -198,13 +218,20 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     const r = await fetchUrl({ url: `${base}/e`, session: 'walljar' }, { trust: 'stdio' });
     assert.equal(r.fetchStatus, 'blocked');
     assert.equal(fs.readFileSync(file, 'utf8'), jar);
-    // ...while a read that comes back as content still rolls the jar forward.
+    // A named session's wall says how to get back in, and names this host's clearance.
+    assert.doesNotMatch(r.error, /lapsed/);
+    assert.match(r.error, /session_login/);
+    assert.ok(r.error.includes(`"${wallSessionName(base)}"`) || /cannot open from here/.test(r.error));
+    // ...while a read that comes back as content still rolls the jar forward, except
+    // for the bot manager's cookie, which stays the saved one.
     const ok = JSON.parse(jar);
-    ok.cookies.push({ ...ok.cookies[0], name: 'cleared', value: '1' });
+    ok.cookies.push({ ...ok.cookies[0], name: 'cleared', value: '1' }, { ...ok.cookies[0], name: 'bm_s', value: 'human' });
     fs.writeFileSync(file, JSON.stringify(ok), { mode: 0o600 });
     const r2 = await fetchUrl({ url: `${base}/f`, session: 'walljar' }, { trust: 'stdio' });
     assert.equal(r2.fetchStatus, 'ok');
-    assert.notEqual(fs.readFileSync(file, 'utf8'), JSON.stringify(ok), 'written back after a good read');
+    const back = JSON.parse(fs.readFileSync(file, 'utf8')).cookies;
+    assert.equal(back.find((c) => c.name === 'roll')?.value, '2', 'written back after a good read');
+    assert.equal(back.find((c) => c.name === 'bm_s')?.value, 'human');
   });
 
   await t.test('no ctx is an unknown surface: no reuse', async () => {

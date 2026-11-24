@@ -200,6 +200,67 @@ export function jarWorthKeeping(status: FetchStatus): boolean {
   return status !== 'blocked' && status !== 'login-wall';
 }
 
+/**
+ * Bot-manager cookies, by vendor: the browser's standing with the site's bot
+ * defence, not the login. Anchored to the names each vendor sets, so an app cookie
+ * that merely contains "bm" or "px" is never caught.
+ *
+ * WHY they are kept out of a write-back even after a good read. MEASURED 2026-11-23
+ * on eBay: ebay.json held a good login, but every headless read re-minted Akamai's
+ * bm_s / bm_so / bm_lso / bm_sv / bm_mi / _abck / ak_bmsc and Radware's __uzma… /
+ * __ssds / __ssuzjsr… over the ones the human's own Chrome had earned, and a read
+ * that came back as content wrote them all back. Once flagged they were replayed on
+ * every read, and eBay answered search and item pages with its 403 "SORRY" page.
+ * jarWorthKeeping only stops the write after a wall, which is too late: the read
+ * that flagged them could itself come back clean.
+ *
+ * Wider than CLEARANCE_COOKIES in tools/session.ts, which names only the cookies
+ * that PROVE a wall was cleared (clearanceSummary). Every one of those is here too.
+ */
+const BOT_MANAGER_COOKIE = new RegExp(
+  [
+    '^_abck$|^bm_[a-z]+$|^ak_bmsc$', // Akamai Bot Manager
+    '^__uzm[a-z0-9]*$|^__ssds$|^__ssuzjsr\\w*$', // Radware / ShieldSquare (__uzma…__uzmf, __uzmaj2…)
+    '^cf_clearance$|^__cf_bm$|^_cfuvid$', // Cloudflare
+    '^datadome$', // DataDome
+    '^reese84$|^visid_incap_\\w+$|^incap_ses_\\w+$|^nlbi_\\w+$', // Imperva / Incapsula
+    '^_px\\w*$|^pxcts$', // HUMAN / PerimeterX
+  ].join('|'),
+  'i',
+);
+
+export function isBotManagerCookie(name: string): boolean {
+  return BOT_MANAGER_COOKIE.test(name);
+}
+
+export interface JarCookie {
+  name?: string;
+  domain?: string;
+  path?: string;
+  [k: string]: unknown;
+}
+export interface Jar {
+  cookies?: JarCookie[];
+  origins?: unknown[];
+  [k: string]: unknown;
+}
+
+/**
+ * The jar a headless read writes back: the refreshed one, except that every
+ * bot-manager cookie is the one already saved. A refreshed value never replaces a
+ * saved one, and a bot cookie the saved jar lacks is never added: whatever a
+ * headless browser earned with the bot defence is not the human's to keep.
+ * Everything else (the auth cookies the site just rolled forward, localStorage)
+ * comes from the refreshed jar, as before.
+ */
+export function keepSavedBotCookies(saved: Jar, refreshed: Jar): Jar {
+  const bot = (c: JarCookie) => isBotManagerCookie(c.name ?? '');
+  return {
+    ...refreshed,
+    cookies: [...(refreshed.cookies ?? []).filter((c) => !bot(c)), ...(saved.cookies ?? []).filter(bot)],
+  };
+}
+
 // ── Readable content ─────────────────────────────────────────────────────────
 
 export interface Readable {

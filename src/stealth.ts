@@ -8,9 +8,10 @@
  * about IDENTITY — separate BrowserContext, profile, and cookie jar so authed
  * cookies never ride along with scraping and the scraping profile's fingerprint
  * never bleeds into an authed capture. The disguise *technique* (UA, launch
- * args, webdriver erasure, viewport) is anti-bot hardening, not an
+ * args, webdriver erasure, window and screen size) is anti-bot hardening, not an
  * identity; every context is entitled to it. web_fetch keeps its own persistent
- * profile; session.ts uses ephemeral contexts — they never share a cookie jar.
+ * profile; a named session is read in a profile of its own (browser.ts
+ * openSessionContext) or an ephemeral context — they never share a cookie jar.
  *
  * Stealth is manual only — NO playwright-extra/stealth plugin (it wraps
  * Playwright and is a dedupe/compat hazard against the exact-pinned playwright
@@ -350,15 +351,44 @@ function detectChromeMajor(): number {
 export const CHROME_MAJOR = detectChromeMajor();
 export const STEALTH_UA = `Mozilla/5.0 (${PLATFORM_TOKEN}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 
-export const VIEWPORT = { width: 1366, height: 768 };
+/**
+ * The desktop a stealth browser reports: a 1080p screen, and Chrome maximized on
+ * it under a 30px panel. Fixed, not read from the host: the host's own display is
+ * not what a headless server has, and a fixed common one is the same on every run.
+ *
+ * WHY not a viewport. MEASURED 2026-11-23, Chrome 158 headless: the old pinned
+ * 1366x768 viewport made screen, availHeight, outer and inner all 1366x768, a size
+ * no real window has (a real one loses its tab strip and toolbar from outer to
+ * inner, and a screen is bigger than the window on it). Playwright's `screen`
+ * option fixed the screen but not that: under viewport emulation outerHeight still
+ * equals innerHeight. Without emulation (viewport:null in stealthContextOptions),
+ * --window-size sets the window and Chrome itself takes its own browser UI off it:
+ * screen 1920x1080, outer 1920x1050, inner 1920x963, all native, nothing patched in
+ * JavaScript. --screen-info sets the screen (headless otherwise reports 800x600).
+ * The bundled headless shell (hosts without Chrome) reports the same screen and
+ * window but has no browser UI, so its inner stays equal to outer.
+ *
+ * WebGL is left alone: headless renders it on SwiftShader. `--enable-gpu
+ * --use-angle=gl` reached this host's real Intel GPU without root on the same
+ * day, but it depends on a GPU being there, so it is not a default.
+ */
+export const SCREEN = { width: 1920, height: 1080 };
+export const WINDOW = { width: 1920, height: 1050 };
 
 /**
- * Launch args reused by every launch: strip the automation tell, and load mixed
- * content (an https dev page pulling http assets) the way a "Chrome (dev)"
- * launcher with --allow-running-insecure-content does. The certificate half of
- * that launcher is `ignoreHTTPSErrors` in stealthContextOptions below.
+ * Launch args reused by every launch: strip the automation tell, size the window
+ * and screen (SCREEN above), and load mixed content (an https dev page pulling
+ * http assets) the way a "Chrome (dev)" launcher with
+ * --allow-running-insecure-content does. The certificate half of that launcher is
+ * `ignoreHTTPSErrors` in stealthContextOptions below.
  */
-export const STEALTH_ARGS = ['--disable-blink-features=AutomationControlled', '--allow-running-insecure-content'];
+export const STEALTH_ARGS = [
+  '--disable-blink-features=AutomationControlled',
+  '--allow-running-insecure-content',
+  `--window-size=${WINDOW.width},${WINDOW.height}`,
+  '--window-position=0,0',
+  `--screen-info={${SCREEN.width}x${SCREEN.height}}`,
+];
 
 /**
  * Launch options for a stealth browser: the REAL installed Google Chrome
@@ -428,6 +458,8 @@ export const STEALTH_INIT = `
  */
 export const stealthContextOptions: BrowserContextOptions = {
   userAgent: STEALTH_UA,
-  viewport: VIEWPORT,
+  // The window's own size, not an emulated one (see SCREEN). A caller that needs a
+  // fixed size (movie_record's clips) still passes its own viewport.
+  viewport: null,
   ignoreHTTPSErrors: true,
 };
