@@ -8,8 +8,15 @@
 // `bwrap --disable-userns`, which gives Chromium the same refusal.
 //
 // Browser-free by default: the launches are stand-ins that throw Chromium's own
-// messages. With PLAYWRIGHT_MCP_TEST_BROWSER=1 and bubblewrap installed, the last
-// case runs the installer's real check with user namespaces denied.
+// messages. With PLAYWRIGHT_MCP_TEST_SANDBOX_REFUSAL=1 and bubblewrap installed,
+// the last case runs the installer's real check with user namespaces denied.
+// That case is NOT under PLAYWRIGHT_MCP_TEST_BROWSER=1, because Chrome's refusal
+// IS an abort: "FATAL:setuid_sandbox_host.cc:172 ... Rather than run without
+// sandboxing I'm aborting now", SIGABRT on every run. MEASURED 2026-11-24: each
+// browser-gated `npm test` left a systemd-coredump record and a desktop "Process
+// crashed" notification for /opt/google/chrome/chrome, which read as a real crash.
+// The core limit cannot be set to 1 (the value the kernel skips a piped
+// core_pattern for) when the hard limit is 0, so the case runs only when asked.
 // The refusal is remembered for the life of the process, so the cases run in
 // order and this file runs alone (node --test gives each file its own process).
 import test from 'node:test';
@@ -87,8 +94,8 @@ test('once refused, a further refusal is rethrown rather than retried forever', 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BWRAP = spawnSync('bwrap', ['--version']).status === 0;
 const REAL =
-  process.env.PLAYWRIGHT_MCP_TEST_BROWSER !== '1'
-    ? 'set PLAYWRIGHT_MCP_TEST_BROWSER=1 to launch a real browser'
+  process.env.PLAYWRIGHT_MCP_TEST_SANDBOX_REFUSAL !== '1'
+    ? 'set PLAYWRIGHT_MCP_TEST_SANDBOX_REFUSAL=1 to launch a real browser (Chrome aborts on purpose: one crash record)'
     : !BWRAP
       ? 'needs bubblewrap (bwrap) to deny user namespaces'
       : !SANDBOXED_BY_DEFAULT
