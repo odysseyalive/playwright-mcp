@@ -728,6 +728,9 @@ const WALLED = [
   // eBay's Akamai wall, 2026-11-23: a 403 served in place on the search URL. The
   // title is all /json/list shows of it, and a solve window once saved on it.
   ['https://www.ebay.com/sch/i.html?_nkw=x', 'Error Page'],
+  // Imperva's block page, gs1uk.org 2026-11-25: served in place on the page asked
+  // for, so only its title tells a solve window that the wall is still up.
+  ['https://docs.example.com/guide', 'Pardon Our Interruption'],
 ];
 
 test('DRIFT GUARD: wallUp() is the ONLY definition of a wall — no second inline check exists', () => {

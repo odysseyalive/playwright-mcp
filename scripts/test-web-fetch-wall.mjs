@@ -23,9 +23,20 @@ process.on('exit', () => fs.rmSync(sessions, { recursive: true, force: true }));
 process.env.PLAYWRIGHT_MCP_SESSIONS = sessions;
 process.env.PLAYWRIGHT_MCP_READ_PROFILES = path.join(sessions, 'read-profiles');
 
-const { fetchUrl, isUnreachable, wallSessionName, awaitWallSolve, notifyWallWindow, sessionWallAdvice, solvedStillWalledAdvice, WALL_WAIT_MS, WALL_WINDOW_MS } = await import(
-  '../dist/tools/web-fetch.js'
-);
+const {
+  fetchUrl,
+  isUnreachable,
+  wallSessionName,
+  awaitWallSolve,
+  notifyWallWindow,
+  sessionWallAdvice,
+  solvedStillWalledAdvice,
+  awaitingHumanAdvice,
+  pendingWalls,
+  WALL_WAIT_MS,
+  WALL_WINDOW_MS,
+  WALL_NOTIFY_EVERY_MS,
+} = await import('../dist/tools/web-fetch.js');
 const { closeBrowser } = await import('../dist/browser.js');
 
 const WALL = '<html><body>Please enable JavaScript to view the page content.Your support ID is: 1.</body></html>';
@@ -87,7 +98,8 @@ function deferredSolve() {
 test('wall wait: bounded, the window outlives it, and a second fetch never joins it', async () => {
   // atergolupi.com, 2026-11-08: an unattended fetch waited 3.5 hours on its window.
   assert.equal(WALL_WAIT_MS, 90_000);
-  assert.equal(WALL_WINDOW_MS, 30 * 60_000);
+  // ...while the window itself waits 4 hours (2026-11-25): research runs unattended.
+  assert.equal(WALL_WINDOW_MS, 4 * 3_600_000);
   const solve = deferredSolve();
   let opened = 0;
   const open = () => {
@@ -142,6 +154,11 @@ test('notify: argv only, host as its own argument, skipped without a display, ne
   assert.ok(Array.isArray(calls[0].args));
   assert.ok(calls[0].args.some((a) => a.includes('www.kvraudio.com')));
   assert.ok(calls[0].opts.timeout > 0);
+  // For a human who is away: critical, so it stays up, and it says who needs them.
+  assert.ok(calls[0].args.includes('--urgency=critical'));
+  assert.ok(calls[0].args.includes('www.kvraudio.com needs you: a research fetch is waiting on a bot check'));
+  // Options end before the text, so a host can never read as a flag.
+  assert.ok(calls[0].args.indexOf('--') < calls[0].args.findIndex((a) => a.includes('www.kvraudio.com')));
   // No display, or not Linux: nothing is spawned.
   notifyWallWindow('x.test', { execFile: fake, env: {}, platform: 'linux' });
   notifyWallWindow('x.test', { execFile: fake, env: { DISPLAY: ':0' }, platform: 'darwin' });
@@ -156,6 +173,71 @@ test('notify: argv only, host as its own argument, skipped without a display, ne
       platform: 'linux',
     }),
   );
+});
+
+test('notify: at most one per host every few minutes; a new window always notifies', () => {
+  const sent = [];
+  const fake = (file, args, opts, done) => {
+    sent.push(args);
+    done(null);
+    return {};
+  };
+  const deps = (now, extra = {}) => ({ execFile: fake, env: { DISPLAY: ':0' }, platform: 'linux', now, ...extra });
+  const t0 = 1_000_000;
+  // Skipped sends (no display) never use up the slot.
+  assert.equal(notifyWallWindow('throttle.test', { ...deps(t0), env: {} }), false);
+  assert.equal(notifyWallWindow('throttle.test', deps(t0)), true);
+  assert.equal(notifyWallWindow('throttle.test', deps(t0 + 1_000)), false, 'a flood of fetches to one host');
+  assert.equal(notifyWallWindow('throttle.test', deps(t0 + WALL_NOTIFY_EVERY_MS - 1)), false);
+  assert.equal(notifyWallWindow('other.throttle.test', deps(t0 + 1_000)), true, 'per host');
+  assert.equal(notifyWallWindow('throttle.test', deps(t0 + 2_000, { force: true })), true, 'a window just opened');
+  assert.equal(notifyWallWindow('throttle.test', deps(t0 + 2_000 + WALL_NOTIFY_EVERY_MS)), true, 'after the interval');
+  assert.equal(sent.length, 4);
+  assert.ok(WALL_NOTIFY_EVERY_MS >= 60_000 && WALL_NOTIFY_EVERY_MS <= 15 * 60_000);
+});
+
+// gs1uk.org, 2026-11-25: research dropped a walled page. The user: "he's happy to
+// solve captchas himself; what he doesn't want is research silently losing a page."
+test('awaiting-human advice: says the human has a window, not to drop the source, and how to retry', () => {
+  assert.equal(
+    awaitingHumanAdvice('www.gs1uk.org', 'wall-www.gs1uk.org', WALL_WINDOW_MS),
+    'A bot check at www.gs1uk.org is waiting for the user to solve it in a window on their screen (it stays ' +
+      'open up to 4 hours). Do NOT drop this source: report this URL to your parent agent or the user, and ' +
+      'retry web_fetch later, or once the user says it is cleared. The clearance is saved as ' +
+      '"wall-www.gs1uk.org" and the retry reads with it.',
+  );
+  // The local HTTP surface's window is the 300s cap, and says so.
+  assert.match(awaitingHumanAdvice('x.test', 'wall-x.test', 300_000), /up to 5 minutes\)/);
+});
+
+test('pendingWalls: a waiting window is listed with its fetches, then shown cleared, then gone', async () => {
+  const solve = deferredSolve();
+  const wall = 'wall-pending.test';
+  assert.deepEqual(await awaitWallSolve(wall, () => solve.promise, 10), { state: 'waiting' });
+  assert.deepEqual(await awaitWallSolve(wall, () => solve.promise, 10), { state: 'busy' });
+  assert.deepEqual(await awaitWallSolve(wall, () => solve.promise, 10), { state: 'busy' });
+  const row = pendingWalls().find((r) => r.host === 'pending.test');
+  assert.ok(row, 'listed while it waits');
+  assert.equal(row.session, wall);
+  assert.equal(row.cleared, false);
+  assert.equal(row.fetchesWaiting, 3);
+  assert.ok(Date.parse(row.openedAt) <= Date.now());
+  assert.ok(row.waitingSec >= 0);
+  solve.finish(true);
+  await solve.promise;
+  await new Promise((r) => setImmediate(r));
+  const done = pendingWalls().find((r) => r.host === 'pending.test');
+  assert.equal(done.cleared, true, 'cleared: the agent may retry now');
+  assert.ok(done.clearedAt);
+  assert.equal(pendingWalls(Date.now() + 3_600_000).find((r) => r.host === 'pending.test'), undefined, 'then dropped');
+  // A window closed without clearing is nothing left to wait on.
+  const cancel = deferredSolve();
+  await awaitWallSolve('wall-cancel.test', () => cancel.promise, 10);
+  assert.ok(pendingWalls().some((r) => r.host === 'cancel.test'));
+  cancel.finish(false);
+  await cancel.promise;
+  await new Promise((r) => setImmediate(r));
+  assert.ok(!pendingWalls().some((r) => r.host === 'cancel.test'));
 });
 
 // eBay, 2026-11-24: the machine lost its network mid-scan, the fetch threw
@@ -233,6 +315,63 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     const r = await fetchUrl({ url: `${base}/b` }, { trust: 'stdio' });
     assert.equal(r.fetchStatus, 'blocked');
     if (process.platform === 'linux') assert.match(r.error, /no display/);
+  });
+
+  await t.test('a window waiting on the human is awaiting-human, first open and busy alike; the clear is reused', async () => {
+    process.env.DISPLAY = process.env.DISPLAY || ':0';
+    const name = wallSessionName(base);
+    const clearance = path.join(sessions, `${name}.json`);
+    fs.rmSync(clearance, { force: true });
+    const solve = deferredSolve();
+    let opened = 0;
+    const notified = [];
+    const sent = [];
+    // The real throttle, with a fake notify-send: nothing reaches the user's desktop.
+    const notify = (host, o) => {
+      notified.push(host);
+      notifyWallWindow(host, { ...o, execFile: (_f, a, _o, done) => (sent.push(a), done(null), {}), env: { DISPLAY: ':0' }, platform: 'linux' });
+    };
+    const seams = { boundMs: 50, notify };
+    const open = () => {
+      opened++;
+      return solve.promise;
+    };
+    const advice = awaitingHumanAdvice('127.0.0.1', name, WALL_WINDOW_MS);
+    // First open: the bound runs out with the window still up.
+    const first = await fetchUrl({ url: `${base}/w1` }, { trust: 'stdio' }, open, seams);
+    assert.equal(first.fetchStatus, 'awaiting-human');
+    assert.equal(first.error, advice);
+    // Busy: another fetch finds the window open, gets the same answer at once, and nudges the human.
+    const t0 = Date.now();
+    const second = await fetchUrl({ url: `${base}/w2` }, { trust: 'stdio' }, open, seams);
+    assert.ok(Date.now() - t0 < WALL_WAIT_MS);
+    assert.equal(second.fetchStatus, 'awaiting-human');
+    assert.equal(second.error, advice);
+    const third = await fetchUrl({ url: `${base}/w3` }, { trust: 'stdio' }, open, seams);
+    assert.equal(third.fetchStatus, 'awaiting-human');
+    assert.equal(opened, 1, 'one window per host');
+    assert.deepEqual(notified, ['127.0.0.1', '127.0.0.1'], 'each busy fetch asks to notify');
+    assert.equal(sent.length, 1, 'and the throttle lets one through');
+    const row = pendingWalls().find((r) => r.host === '127.0.0.1');
+    assert.equal(row?.fetchesWaiting, 3);
+    assert.equal(row?.cleared, false);
+    // The human clears it: the window saves the clearance, and the next fetch reads with it.
+    fs.writeFileSync(
+      clearance,
+      JSON.stringify({
+        cookies: [{ name: 'cleared', value: '1', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }],
+        origins: [],
+      }),
+      { mode: 0o600 },
+    );
+    solve.finish(true);
+    await solve.promise;
+    await new Promise((r) => setImmediate(r));
+    assert.equal(pendingWalls().find((r) => r.host === '127.0.0.1')?.cleared, true);
+    const after = await fetchUrl({ url: `${base}/w1` }, { trust: 'stdio' }, open, seams);
+    assert.equal(after.fetchStatus, 'ok');
+    assert.match(after.text, /PICTURE THIS PRODUCTION/);
+    assert.equal(opened, 1);
   });
 
   await t.test('a saved clearance for the host is reused', async () => {

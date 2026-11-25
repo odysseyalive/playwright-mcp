@@ -124,10 +124,16 @@ export interface FetchOptions {
  *
  * Unlike session_solve_challenge, nobody asked this call to wait for a person, and
  * an unattended fetch once sat on a window for 3.5 hours (atergolupi.com,
- * 2026-11-08). So the fetch waits WALL_WAIT_MS, then returns 'blocked' saying a
- * window is waiting. The window outlives the call: a clear after that still saves
- * `wall-<host>`, and the retry reads with it. A fetch that finds the window already
- * open returns the same answer at once.
+ * 2026-11-08). So the fetch waits WALL_WAIT_MS, then returns 'awaiting-human'
+ * saying a window is waiting. The window outlives the call: a clear after that still
+ * saves `wall-<host>`, and the retry reads with it. A fetch that finds the window
+ * already open returns the same answer at once.
+ *
+ * 'awaiting-human', not 'blocked': the user, 2026-11-25, "he's happy to solve
+ * captchas himself; what he doesn't want is research silently losing a page". A
+ * plain 'blocked' read the same as a hard 403, and an agent (a background subagent
+ * most of all) dropped the source. 'blocked' is kept for a wall no window can open
+ * for (no display, the cloud surface) and for refusals.
  */
 export async function fetchUrl(
   opts: FetchOptions,
@@ -135,6 +141,9 @@ export async function fetchUrl(
   // Replaces opening the window, so the solved-then-still-walled path is testable
   // without a human. The real opener stays below as the one solveChallenge call.
   openWindow?: () => Promise<LoginResult>,
+  // The wait bound and the desktop notice, so the awaiting-human paths are testable
+  // in milliseconds and without a real notification on the user's screen.
+  seams: WallSeams = {},
 ): Promise<FetchResult> {
   const trusted = ctx?.trust === 'stdio' || ctx?.trust === 'local';
   const wall = wallSessionName(opts.url);
@@ -168,6 +177,7 @@ export async function fetchUrl(
   // long as the window is, which is the hang this bound exists to end. This call
   // heartbeats only for the wait it does itself.
   const windowMs = ctx.trust === 'stdio' ? WALL_WINDOW_MS : CAPPED_HUMAN_WAIT_MS;
+  const notify = seams.notify ?? notifyWallWindow;
   const stop = startHeartbeat(ctx, `bot wall at ${host}`, wallHeartbeat);
   let waited: WallWait;
   try {
@@ -177,23 +187,25 @@ export async function fetchUrl(
         (() => {
           // The name, not the url: a query string can carry a token, and stderr is a log.
           log(`${wall}: bot wall; opening a window for the human to clear it`);
-          notifyWallWindow(host);
+          notify(host, { force: true });
           return solveChallenge(wall, opts.url, { trust: ctx.trust }, undefined, windowMs);
         }),
+      seams.boundMs,
     );
   } finally {
     stop();
   }
+  // A fetch that finds the window already up nudges the human again: the first
+  // notice may have gone by while they were away. Throttled per host, so a
+  // research run fanning out over one walled site does not stack them up.
+  if (waited.state === 'busy') notify(host, {});
+  // Got its page within the bound: not one of the fetches still waiting.
+  if (waited.state === 'done') settledFetch(wall);
   if (waited.state !== 'done') {
     return {
       ...first,
-      error:
-        'a bot check was returned instead of page content. ' +
-        (waited.state === 'busy'
-          ? `A window an earlier fetch opened is waiting for you at ${host}`
-          : `A window is waiting for you at ${host}`) +
-        `: solve it there, then retry web_fetch. It stays open up to ${Math.round(windowMs / 60_000)} ` +
-        `minutes; once cleared, the clearance is saved as "${wall}" and the retry reads with it.`,
+      fetchStatus: 'awaiting-human',
+      error: awaitingHumanAdvice(host, wall, windowMs),
     };
   }
   const solved = waited.result;
@@ -211,6 +223,30 @@ export async function fetchUrl(
   // fetch from opening the window again either (no file means a wall means a window).
   const retry = await fetchOnce({ ...opts, session: wall }, solvedStillWalledAdvice());
   return walled.has(retry) ? retry : withNote(retry, `bot wall cleared by the human; saved as "${wall}" for later fetches`);
+}
+
+/**
+ * What a caller is told while a window waits on the human: the `error` of an
+ * 'awaiting-human' result. Written for an agent that may be a background subagent
+ * with no human of its own to ask, so it says what not to do (drop the source) as
+ * plainly as what to do. gs1uk.org, 2026-11-25: a walled page reported as content
+ * was dropped from a research run, and the user never saw the window.
+ *
+ * Server-authored only: `host` and `wall` come from the URL the caller asked for,
+ * never the one the page redirected to, since this text lands outside the quarantine.
+ */
+export function awaitingHumanAdvice(host: string, wall: string, windowMs: number): string {
+  const hours = windowMs / 3_600_000;
+  const open =
+    hours >= 1
+      ? `${Number.isInteger(hours) ? hours : hours.toFixed(1)} hour${hours === 1 ? '' : 's'}`
+      : `${Math.round(windowMs / 60_000)} minutes`;
+  return (
+    `A bot check at ${host} is waiting for the user to solve it in a window on their screen (it stays open ` +
+    `up to ${open}). Do NOT drop this source: report this URL to your parent agent or the user, and retry ` +
+    'web_fetch later, or once the user says it is cleared. The clearance is saved as ' +
+    `"${wall}" and the retry reads with it.`
+  );
 }
 
 /**
@@ -242,8 +278,22 @@ export const WALL_WAIT_MS = 90_000;
  * How long that window stays open unattended on stdio. Its capture's own deadline,
  * so the capture's cleanup closes Chrome and nothing else has to track it. The HTTP
  * surfaces keep their 300s cap (resolveHumanWait).
+ *
+ * Four hours, up from 30 minutes (2026-11-25): research runs unattended, and a
+ * window that closed before the human came back lost the page all the same. Only
+ * the window waits that long; each fetch still waits WALL_WAIT_MS. The window is a
+ * 'solve' browser in src/lifetime.ts, so it is never idle-closed or made room for,
+ * and it is closed with its server: it never outlives the session that opened it.
  */
-export const WALL_WINDOW_MS = 30 * 60_000;
+export const WALL_WINDOW_MS = 4 * 3_600_000;
+
+/** Test seams for fetchUrl's wall handling. */
+export interface WallSeams {
+  /** Replaces WALL_WAIT_MS. */
+  boundMs?: number;
+  /** Replaces notifyWallWindow. */
+  notify?: (host: string, opts: { force?: boolean }) => void;
+}
 
 function wallHeartbeat(what: string, elapsedMs: number): string {
   return (
@@ -254,6 +304,64 @@ function wallHeartbeat(what: string, elapsedMs: number): string {
 
 /** One window per host. The promise never rejects (see awaitWallSolve). */
 const solving = new Map<string, Promise<LoginResult>>();
+
+/**
+ * The windows waiting on the human, for browser_status. Kept beside `solving`
+ * rather than read off it, since a promise says nothing about when it started or
+ * who met it. A cleared one stays listed for CLEARED_LISTED_MS, so an agent
+ * polling for it sees "cleared, retry now" rather than the entry just vanishing;
+ * a cancelled or failed one goes at once, since there is nothing left to wait on.
+ */
+interface PendingWall {
+  openedAt: number;
+  lastFetchAt: number;
+  fetches: number;
+  clearedAt?: number;
+}
+const pending = new Map<string, PendingWall>();
+const CLEARED_LISTED_MS = 10 * 60_000;
+
+/** A fetch that met the window was answered in the same call: it waits on nothing now. */
+function settledFetch(wall: string): void {
+  const p = pending.get(wall);
+  if (p && p.fetches > 0) p.fetches -= 1;
+}
+
+export interface PendingWallRow {
+  host: string;
+  /** The saved clearance a retry reads with. */
+  session: string;
+  openedAt: string;
+  /** Seconds the human has been waited on: until now, or until they cleared it. */
+  waitingSec: number;
+  lastFetchAt: string;
+  cleared: boolean;
+  clearedAt?: string;
+  /** Fetches that came back 'awaiting-human' on this window (or are in their wait now): each should be retried. */
+  fetchesWaiting: number;
+}
+
+/** This server's bot-wall windows, oldest first. `now` is injectable for tests. */
+export function pendingWalls(now = Date.now()): PendingWallRow[] {
+  const rows: PendingWallRow[] = [];
+  for (const [wall, p] of pending) {
+    if (p.clearedAt !== undefined && now - p.clearedAt > CLEARED_LISTED_MS) {
+      pending.delete(wall);
+      continue;
+    }
+    rows.push({
+      host: wall.slice(WALL_SESSION_PREFIX.length),
+      session: wall,
+      openedAt: new Date(p.openedAt).toISOString(),
+      waitingSec: Math.round(((p.clearedAt ?? now) - p.openedAt) / 1000),
+      lastFetchAt: new Date(p.lastFetchAt).toISOString(),
+      cleared: p.clearedAt !== undefined,
+      ...(p.clearedAt !== undefined ? { clearedAt: new Date(p.clearedAt).toISOString() } : {}),
+      fetchesWaiting: p.fetches,
+    });
+  }
+  return rows.sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+}
 
 export type WallWait =
   /** A window for this host was already open; nothing new was started. */
@@ -273,7 +381,17 @@ export function awaitWallSolve(
   open: () => Promise<LoginResult>,
   boundMs = WALL_WAIT_MS,
 ): Promise<WallWait> {
-  if (solving.has(wall)) return Promise.resolve({ state: 'busy' });
+  if (solving.has(wall)) {
+    const p = pending.get(wall);
+    if (p) {
+      p.fetches += 1;
+      p.lastFetchAt = Date.now();
+    }
+    return Promise.resolve({ state: 'busy' });
+  }
+  const opened = Date.now();
+  const entry: PendingWall = { openedAt: opened, lastFetchAt: opened, fetches: 1 };
+  pending.set(wall, entry);
   const p = Promise.resolve()
     .then(open)
     .catch((err): LoginResult => ({
@@ -284,6 +402,14 @@ export function awaitWallSolve(
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     }))
+    .then((result) => {
+      // Only this window's entry: a later one for the same host replaces it.
+      if (pending.get(wall) === entry) {
+        if (result.ok) entry.clearedAt = Date.now();
+        else pending.delete(wall);
+      }
+      return result;
+    })
     .finally(() => solving.delete(wall));
   solving.set(wall, p);
   let timer: NodeJS.Timeout | undefined;
@@ -304,22 +430,55 @@ type ExecFileLike = (
 ) => { on?(event: 'error', fn: () => void): unknown; unref?(): void };
 
 /**
+ * The least time between two notices for one host. A fetch that finds the window
+ * already open re-notifies (the first notice may have gone by while the human was
+ * away), and a research run can send dozens of fetches to one walled site.
+ */
+export const WALL_NOTIFY_EVERY_MS = 5 * 60_000;
+const lastNotice = new Map<string, number>();
+
+/**
  * Tell the human a window is waiting, since the fetch that opened it may be running
  * unattended. Fire-and-forget: argv only, never a shell; skipped without a display
- * or without notify-send; never throws and never delays the fetch. The 'waiting'
- * tool result is the signal for everyone else.
+ * or without notify-send; never throws and never delays the fetch. The
+ * 'awaiting-human' tool result is the signal for everyone else.
+ *
+ * Critical urgency, which notification daemons keep on screen until dismissed (the
+ * freedesktop spec: critical notices should not expire on their own): the human
+ * this is for is away. Linux only, as before: no notice is sent on macOS or Windows.
+ *
+ * At most one per host per WALL_NOTIFY_EVERY_MS, unless `force` (a window just
+ * opened). Only a notice actually sent starts the clock, so a skipped one (no
+ * display) never uses up the slot. Returns whether it sent.
  */
 export function notifyWallWindow(
   host: string,
-  deps: { execFile?: ExecFileLike; env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform } = {},
-): void {
+  deps: {
+    execFile?: ExecFileLike;
+    env?: NodeJS.ProcessEnv;
+    platform?: NodeJS.Platform;
+    now?: number;
+    force?: boolean;
+  } = {},
+): boolean {
   const env = deps.env ?? process.env;
-  if ((deps.platform ?? process.platform) !== 'linux') return;
-  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return;
+  if ((deps.platform ?? process.platform) !== 'linux') return false;
+  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return false;
+  const now = deps.now ?? Date.now();
+  const last = lastNotice.get(host);
+  if (!deps.force && last !== undefined && now - last < WALL_NOTIFY_EVERY_MS) return false;
+  lastNotice.set(host, now);
   try {
     const child = (deps.execFile ?? (execFile as unknown as ExecFileLike))(
       'notify-send',
-      ['--app-name=playwright-mcp', 'A bot check is waiting for you', `web_fetch opened a window at ${host}. Solve it there, then retry.`],
+      [
+        '--app-name=playwright-mcp',
+        '--urgency=critical',
+        // The host comes from a URL: never let one that starts with "-" read as an option.
+        '--',
+        `${host} needs you: a research fetch is waiting on a bot check`,
+        'Solve it in the window playwright-mcp opened. The fetch reuses the clearance once it is cleared.',
+      ],
       { timeout: 5_000 },
       () => {}, // a missing notify-send or a failed send is not the fetch's business
     );
@@ -328,6 +487,7 @@ export function notifyWallWindow(
   } catch {
     /* never the reason a fetch fails */
   }
+  return true;
 }
 
 /** The saved clearance for a host's wall. Per host, since that is what a clearance cookie covers. */
@@ -819,8 +979,9 @@ const definition: Tool = {
     'fetchStatus:"consent-wall" rather than being handed back as page content. ' +
     'On a CAPTCHA / bot wall (local only) a real Chrome window opens for the human to clear it and ' +
     'the fetch waits up to 90s, retrying once it clears; the clearance is saved as "wall-<host>" and ' +
-    'reused by later fetches there. A wall that is still up returns fetchStatus:"blocked"; if a window ' +
-    'is still waiting for the human, the error says so, and a retry after they solve it succeeds. ' +
+    'reused by later fetches there. While the window still waits for the human, fetchStatus is ' +
+    '"awaiting-human": do NOT drop that source; report the URL to your parent agent or the user and retry ' +
+    'later, which reads with the clearance. fetchStatus:"blocked" is a wall no window can open for, or a refusal. ' +
     'fetchStatus:"unreachable" means the network, DNS or host failed before any site answered: not a wall, retry later.',
   inputSchema: {
     type: 'object',

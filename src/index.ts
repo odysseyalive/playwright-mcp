@@ -31,7 +31,15 @@ import { secretInventory } from './secrets.js';
 import { closeBrowser } from './browser.js';
 import { startRemoteServer, type RemoteHandle } from './remote.js';
 import { buildGitHubAuth, type RemoteAuth } from './auth.js';
-import { initUpstream, getUpstream, closeUpstream, boundSession, releaseBrowser, touchUpstream } from './upstream.js';
+import {
+  armFileGuard,
+  initUpstream,
+  getUpstream,
+  closeUpstream,
+  boundSession,
+  releaseBrowser,
+  touchUpstream,
+} from './upstream.js';
 import {
   browserStatus,
   CLOSE_GRACE_MS,
@@ -43,6 +51,8 @@ import {
 } from './lifetime.js';
 import { browserQueue, leaseArg, LEASE_PROPERTY } from './queue.js';
 import { queueTurn } from './tools/session.js';
+import { argsRefusal, fileUrlPath } from './file-roots.js';
+import { isLoopbackUrl, loopbackWaitMs, withLoopbackWait } from './loopback-wait.js';
 
 // package.json is the one place the version lives. dist/index.js and
 // src/index.ts both sit one level below it, so the same relative path serves
@@ -129,8 +139,8 @@ function buildInstructions(
         (noTimeLimit ? 'with no time limit, ' : 'within this surface\'s bounded 300000ms default, ') +
         'then saves and binds the cleared session as session_login does, for browser_* and ' +
         'web_fetch({url, session}). Short-lived (minutes); re-solve when it lapses. web_fetch does this itself: ' +
-        'a fetch that hits a wall opens that window and waits up to 90s, then returns blocked, saying a window ' +
-        'is waiting at that host. Ask the human to solve it, then retry; the clearance is reused as wall-<host>.',
+        'a walled fetch opens that window, waits up to 90s, then returns awaiting-human. NEVER drop that source: ' +
+        'report the URL to your parent/the user, retry later; the clearance is reused as wall-<host>.',
     );
   }
   if (names.has('session_scaffold_tests')) {
@@ -405,7 +415,8 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
   browser_status:
     'handler (src/tools/browsers.ts) serialises browserStatus() (src/lifetime.ts): pids, start ' +
     'times, kinds, profile paths and session NAMES this server or a sibling wrote into the registry, ' +
-    'plus numbers read from /proc. No browser is touched and no page is read.',
+    'plus numbers read from /proc, and pendingWalls() (src/tools/web-fetch.ts): hosts parsed from ' +
+    'URLs callers asked web_fetch for, times and counts, never page content. No browser is touched and no page is read.',
   browser_lease_release:
     'releaseHandler (src/tools/lease.ts) returns BrowserQueue.release’s fixed notes (src/queue.ts) ' +
     'about the caller’s own token. No browser is touched.',
@@ -520,6 +531,30 @@ function outboundUrlArg(args: Record<string, unknown> | undefined): string | und
 const QUEUED_NOTE =
   '(playwright-mcp: queued — waits its turn on the shared browser, one call at a time; pass `lease` from ' +
   'browser_lease_acquire to keep a multi-step turn.)';
+
+/**
+ * Appended to upstream tools whose file limits are now this server's, not
+ * upstream's (src/file-roots.ts), so the description says where files may go.
+ * Keyed by argument, like the check itself; the surface decides the wording.
+ */
+function fileNote(t: { name: string; inputSchema: { properties?: Record<string, unknown> } }, trust: SurfaceTrust): string {
+  const props = t.inputSchema.properties ?? {};
+  const notes: string[] = [];
+  const scratch = trust === 'stdio' ? ' or the Claude session scratchpad (/tmp/claude-<uid>/<project>/<session>/scratchpad)' : '';
+  if ('filename' in props || 'paths' in props)
+    notes.push(`(playwright-mcp: files must resolve, symlinks followed, inside the project${scratch}.)`);
+  if (t.name === 'browser_navigate') {
+    if (trust === 'stdio')
+      notes.push('(playwright-mcp: a file:// URL opens when the file is inside the project or the session scratchpad.)');
+    const wait = loopbackWaitMs();
+    if (wait > 0)
+      notes.push(
+        `(playwright-mcp: a refused localhost/127.0.0.1/[::1] connection is retried for up to ${wait / 1000}s ` +
+          'while a just-started server comes up.)',
+      );
+  }
+  return notes.join(' ');
+}
 
 /** Just the notification shape this server sends — narrower than the SDK union on purpose. */
 type ProgressSend = (notification: {
@@ -646,7 +681,7 @@ export function createOutwardServer(
     // belongs to the upstream client.
     const leased = tools.filter((t) => allow(t.name)).map((t) => ({
       ...t,
-      description: `${t.description ?? ''} ${QUEUED_NOTE}`.trim(),
+      description: [t.description ?? '', fileNote(t, trust), QUEUED_NOTE].filter(Boolean).join(' ').trim(),
       inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, lease: LEASE_PROPERTY } },
     }));
     return { tools: [...leased, ...visibleCustom] };
@@ -679,6 +714,17 @@ export function createOutwardServer(
           name,
         );
 
+      // Files and file: URLs (src/file-roots.ts). Upstream's own check is switched
+      // off (src/upstream.ts), so this is the only one, on every surface.
+      const fileRefusal = argsRefusal(args, trust);
+      if (fileRefusal) {
+        return {
+          content: [{ type: 'text', text: `Error in ${name}: ${fileRefusal}` }],
+          isError: true,
+        };
+      }
+      const opensFile = typeof args?.url === 'string' && fileUrlPath(args.url) !== undefined;
+
       // Same outbound guard web_fetch runs, on the same shared ledger — so
       // browser_navigate cannot be used to route around it (DEC-2026-07-29).
       const target = outboundUrlArg(args);
@@ -698,7 +744,13 @@ export function createOutwardServer(
       const { lease: _lease, ...forward } = args ?? {};
       const result = await browserQueue.run(async () => {
         try {
-          const out = await upstreamOf().callTool({ name, arguments: forward });
+          if (opensFile) await armFileGuard();
+          const call = () => upstreamOf().callTool({ name, arguments: forward });
+          // A dev server started a moment ago may not be listening yet (src/loopback-wait.ts).
+          const out =
+            name === 'browser_navigate' && typeof forward.url === 'string' && isLoopbackUrl(forward.url)
+              ? await withLoopbackWait(call, { signal: ctx.signal })
+              : await call();
           // Upstream's browser_close drops its hold on the browser but not the browser.
           if (name === 'browser_close') await releaseBrowser();
           return out;

@@ -353,6 +353,33 @@ test('cap: past PLAYWRIGHT_MCP_MAX_BROWSERS a launch closes the least recently u
   }
 });
 
+// 2026-11-25: web_fetch's bot-wall window now waits up to 4 hours for a human who is
+// away. Registered as session.ts registers it (no idleClose given), it must never be
+// idle-closed or picked to make room, however long it sits.
+test('a bot-wall solve window, registered with the defaults, is never idle-closed or made room for', async () => {
+  process.env.PLAYWRIGHT_MCP_MAX_BROWSERS = '1';
+  const solve = fakeBrowser({ kind: 'solve', idleClose: undefined, session: 'wall-gs1uk.test' });
+  const other = fakeBrowser({ kind: 'read-profile', idleClose: false });
+  try {
+    assert.equal(trackedBrowsers().find((b) => b.id === solve.handle.id).idleClose, false);
+    assert.equal(await sweepIdle(later(5 * 3600_000)), 0, 'five hours of fake time');
+    await lifetime.makeRoom(other.handle.id, later(5 * 3600_000));
+    assert.equal(solve.closes.length, 0);
+  } finally {
+    delete process.env.PLAYWRIGHT_MCP_MAX_BROWSERS;
+    solve.handle.done();
+    other.handle.done();
+  }
+});
+
+test('--browsers lists a waiting bot-wall window by host', () => {
+  const row = { serverPid: 10, serverAlive: true, kind: 'solve', pid: 11, alive: true, session: 'wall-gs1uk.test', ageSec: 600 };
+  const out = lifetime.formatStatus([row, { ...row, kind: 'capture', session: 'ebay', pid: 12 }]);
+  assert.match(out, /Bot walls waiting for you to solve:\n  gs1uk\.test  open 10m \(server 10\)/);
+  assert.doesNotMatch(out, /^  ebay/m, 'a login capture is not a bot wall');
+  assert.doesNotMatch(lifetime.formatStatus([{ ...row, alive: false }]), /Bot walls/, 'a window already gone');
+});
+
 // ── the registry file ────────────────────────────────────────────────────────
 
 test('registry: one owner-only file per server, written atomically, listing its browsers and client', { skip: process.platform === 'win32' && 'POSIX modes' }, () => {
@@ -650,7 +677,9 @@ test('idle: both browsers close after the idle time and relaunch on the next cal
     await s.init();
     const dirs = await launchBoth(s, w);
     await assertAllGone(dirs, 8_000);
-    assert.deepEqual(entriesOf(w, s.child.pid), [], 'the registry lists nothing once both are closed');
+    // Chrome is gone a few ms before the server knows it: context.close() resolves
+    // after the process exits, and only then does done() drop the entry (src/upstream.ts).
+    await waitFor(() => entriesOf(w, s.child.pid).length === 0, 2_000, 'the registry to list nothing once both are closed');
     // Transparent relaunch: the next call just works.
     const url = await fixtureUrl('/article');
     assert.ok(/fixture text/.test((await s.call('web_fetch', { url })).text), 'web_fetch relaunched');

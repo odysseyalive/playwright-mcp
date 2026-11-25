@@ -87,6 +87,51 @@ test('wallVendor: names LiteSpeed, and stays quiet on an unknown wall', () => {
   assert.equal(wallVendor(html('blocked.html')), undefined);
 });
 
+// gs1uk.org, 2026-11-25: Imperva's "Pardon Our Interruption" page came back 'ok'
+// with the bot page as the text, which ran past the size guard on the page's own
+// inline CSS and JS, and the research that fetched it dropped the source.
+test('fetchStatus: Imperva "Pardon Our Interruption" is a wall however long its inline script and CSS', () => {
+  const h = html('imperva-pardon.html');
+  // The text as it came back that day: the body with its <style> and <script> text in it.
+  const counted = h.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  assert.ok(counted.length >= 1500, `long enough to pass the size guard (${counted.length} chars)`);
+  assert.equal(classifyHealth(h, 200, counted), 'blocked');
+  assert.equal(wallVendor(h), 'Imperva (Incapsula)');
+  // Readability's own text is short; the wall is a wall either way.
+  assert.equal(classifyHealth(h, 200, extractReadable(h, 'https://www.gs1uk.org/').text), 'blocked');
+  // Each markup marker alone holds on a long page: the whole title, the incident iframe.
+  const pad = `<p>${'Filler. '.repeat(300)}</p>`;
+  const long = 'x'.repeat(2400);
+  assert.equal(classifyHealth(`<html><head><title>Pardon Our Interruption...</title></head><body>${pad}</body></html>`, 200, long), 'blocked');
+  const iframe = '<iframe src="/_Incapsula_Resource?CWUDNSAI=9&incident_id=1-2"></iframe>';
+  assert.equal(classifyHealth(`<html><head><title>x</title></head><body>${iframe}${pad}</body></html>`, 200, long), 'blocked');
+  // The older page's incident sentence is prose: short, a wall; quoted on a long page, not.
+  const incident = '<p>Request unsuccessful. Incapsula incident ID: 1234-5678</p>';
+  assert.equal(classifyHealth(`<html><body>${incident}</body></html>`, 200, 'Request unsuccessful.'), 'blocked');
+  assert.equal(classifyHealth(`<html><head><title>Forum</title></head><body>${incident}${pad}</body></html>`, 200, long), 'ok');
+});
+
+test('fetchStatus: a long article about bots, on a site Imperva protects, stays ok', () => {
+  // Imperva injects its tracker script into ordinary pages it protects, so the bare
+  // resource name is no wall; nor is the block page's wording quoted in prose.
+  const article =
+    'Bot traffic now makes up nearly half of all web requests, and a bot manager has to tell a person from a ' +
+    'script in milliseconds. One reader wrote in after a retailer showed her a page titled "Pardon Our ' +
+    'Interruption" that said it must think you were a bot; she had only been moving fast. '.repeat(1) +
+    'Vendors tune these systems to keep false positives low, but no bot defence is perfect. '.repeat(20);
+  const h =
+    '<html><head><title>Why the web thinks you are a bot</title>' +
+    '<script src="/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e6fffd425f7e032f3"></script></head>' +
+    `<body><article><h1>Why the web thinks you are a bot</h1><p>${article}</p></article></body></html>`;
+  const { text } = extractReadable(h, 'https://news.example.test/bots');
+  assert.ok(text.length >= 1500, `a full article (${text.length} chars)`);
+  assert.equal(classifyHealth(h, 200, text), 'ok');
+  assert.equal(wallVendor(h), undefined);
+  // Nor an article titled after the block page.
+  const titled = h.replace(/<title>[^<]*<\/title>/, '<title>Pardon Our Interruption: why sites think you are a bot</title>');
+  assert.equal(classifyHealth(titled, 200, text), 'ok');
+});
+
 test('readable: a results table whose rows all link out is kept, one row per line', () => {
   // egov.sos.state.or.us search, 2026-10-30: Readability kept the header table and
   // dropped the results, so `text` was "Business Entity Names returned for: ..." only.
@@ -283,7 +328,7 @@ test('robustness: extractors never throw on garbage input', () => {
 // eBay, 2026-11-23: a walled session read saved the cookies the wall had just
 // rewritten over the human's capture. Only a read that came back as content writes.
 test('jarWorthKeeping: a wall or a sign-in redirect never writes the session jar back', () => {
-  for (const s of ['blocked', 'login-wall', 'unreachable']) assert.equal(jarWorthKeeping(s), false, s);
+  for (const s of ['blocked', 'awaiting-human', 'login-wall', 'unreachable']) assert.equal(jarWorthKeeping(s), false, s);
   for (const s of ['ok', '404', 'paywall', 'parked', 'consent-wall']) assert.equal(jarWorthKeeping(s), true, s);
 });
 

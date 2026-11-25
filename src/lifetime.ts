@@ -927,7 +927,15 @@ export function formatStatus(rows: StatusRow[]): string {
   ]);
   const widths = head.map((h, i) => Math.max(h.length, ...body.map((row) => row[i].length)));
   const line = (cells: string[]) => cells.map((c, i) => (i === cells.length - 1 ? c : c.padEnd(widths[i]))).join('  ');
-  return [line(head), ...body.map(line)].join('\n') + '\n';
+  // The bot-wall windows web_fetch opened (2026-11-25), called out on their own:
+  // each is a page some research is waiting on the human for. Read off the 'solve'
+  // rows and their `wall-<host>` session name, since this runs in a process of its
+  // own and cannot see a server's in-memory list (browser_status's pendingWalls).
+  const walls = rows
+    .filter((r) => r.kind === 'solve' && r.alive && r.session?.startsWith('wall-'))
+    .map((r) => `  ${r.session!.slice('wall-'.length)}  open ${dur(r.ageSec)} (server ${r.serverPid})`);
+  const waiting = walls.length ? ['', 'Bot walls waiting for you to solve:', ...walls] : [];
+  return [line(head), ...body.map(line), ...waiting].join('\n') + '\n';
 }
 
 // ── the owner watch ─────────────────────────────────────────────────────────

@@ -807,8 +807,13 @@ export function leftLoginPage(currentUrl: string, loginUrl: string): boolean {
 // the one passive tell, and without it a solve window counted that page as cleared
 // and saved the flagged jar. Anchored: a real page that merely mentions an error
 // page in its title is not a wall.
+//
+// `pardon our interruption` is Imperva's block page (gs1uk.org, 2026-11-25). Its
+// URL is the page asked for, so WALL_PATH never sees it, and without the title a
+// window opened for web_fetch would count it cleared on its first poll and save
+// the jar Imperva had just flagged.
 const WALL_TITLE =
-  /just a moment|attention required|checking your browser|verifying you are human|one moment,? please|please wait|access denied|are you a robot|security check|^\s*error page\s*$/i;
+  /just a moment|attention required|checking your browser|verifying you are human|one moment,? please|please wait|access denied|are you a robot|security check|pardon our interruption|^\s*error page\s*$/i;
 const WALL_PATH = /\/(sorry|cdn-cgi\/challenge|challenge-platform|captcha|_incapsula_)/i;
 
 /**
@@ -2116,7 +2121,7 @@ const NOTES: Record<CaptureState, string> = {
   waiting:
     'a capture is IN PROGRESS: a window is open and the human is logging in. A session_login or ' +
     'session_solve_challenge window has no deadline; a bot-wall window web_fetch opened on its own ' +
-    'closes itself after 30 minutes. Poll this tool again rather than starting a second login, and ' +
+    'closes itself after 4 hours. Poll this tool again rather than starting a second login, and ' +
     'never tell the user it failed.',
   saved: 'the capture COMPLETED and the session was saved, even if the tool call that started it was abandoned.',
   cancelled: 'the human closed the window before the login finished. Nothing was saved; start a new capture.',

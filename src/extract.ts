@@ -19,6 +19,10 @@ export type FetchStatus =
   | 'parked'
   | 'login-wall'
   | 'blocked'
+  // A bot wall with a window open on the human's screen for them to clear. Not a
+  // refusal: the page is reachable once they solve it, so the caller keeps the
+  // source and retries (see awaitingHumanAdvice in tools/web-fetch.ts).
+  | 'awaiting-human'
   | 'consent-wall'
   // The network or the host could not be reached: no site answered, so nothing
   // refused us. Never a wall (see isUnreachable in tools/web-fetch.ts).
@@ -53,14 +57,18 @@ export interface Citation {
  * nobody needed. Markup-only signatures belong in WALL_VENDORS, not here.
  */
 const BLOCK_TELL =
-  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify(ing)? (that )?you are (a )?human|checking your browser|access denied|your support id is/i;
+  /unusual traffic|are you a robot|not a robot|bot verification|captcha|verify(ing)? (that )?you are (a )?human|checking your browser|access denied|your support id is|pardon our interruption|think you were a bot/i;
 /**
  * Who served the wall, when the markup says so. Only signatures seen on a real
  * fetch are listed; an unrecognised wall is still 'blocked', just unnamed. A
  * match is also evidence of a wall on its own (classifyHealth), so each one has
  * to be a mark of the challenge page, never of a site the vendor merely protects.
+ *
+ * The third field, `anyLength`, lets a match count as a wall however much text the
+ * page has. Only for a marker no article prose carries: F5's is a sentence, matched
+ * in raw HTML, so a long page quoting it must still pass the size guard.
  */
-const WALL_VENDORS: [RegExp, string][] = [
+const WALL_VENDORS: [RegExp, string, anyLength?: true][] = [
   // egov.sos.state.or.us, 2026-10-30: "Please enable JavaScript to view the
   // page content. Your support ID is: <digits>." (F5 ASM / Advanced WAF).
   [/your support id is/i, 'F5 BIG-IP bot defense'],
@@ -70,6 +78,20 @@ const WALL_VENDORS: [RegExp, string][] = [
   // DataDome serves its interstitial from this host, and only the interstitial does.
   // Listed when the raw-HTML "captcha" match that used to catch it went away.
   [/captcha-delivery\.com/i, 'DataDome'],
+  // gs1uk.org, 2026-11-25: Imperva's "Pardon Our Interruption" page came back
+  // fetchStatus 'ok', its inline CSS and JS pushing the text past the size guard,
+  // and the research that fetched it dropped the source. Not bare
+  // `_Incapsula_Resource`: Imperva injects a script by that name into ordinary pages
+  // it protects. Only the incident form is the block page's own. The title is the
+  // whole title, so an article headed "Pardon Our Interruption: ..." is not one.
+  [
+    /<title[^>]*>\s*pardon our interruption[\s.!]*<\/title>|_incapsula_resource\?[^"'\s>]*incident_id=/i,
+    'Imperva (Incapsula)',
+    true,
+  ],
+  // Imperva's older block page says this in its text. A sentence, so a page that
+  // quotes it at length still passes the size guard.
+  [/incapsula incident id/i, 'Imperva (Incapsula)'],
 ];
 
 /**
@@ -122,6 +144,12 @@ const RAW_TEXT_ELEMENTS = ['script', 'style', 'template'];
 export function wallVendor(html: string): string | undefined {
   const head = html.slice(0, 60_000);
   return WALL_VENDORS.find(([tell]) => tell.test(head))?.[1];
+}
+
+/** A vendor wall whose marker holds however long the page is (the `anyLength` entries). */
+function strongWallVendor(html: string): boolean {
+  const head = html.slice(0, 60_000);
+  return WALL_VENDORS.some(([tell, , anyLength]) => anyLength && tell.test(head));
 }
 const LOGIN_TELL = /sign in to continue|log ?in to continue|please sign in|you must be logged in/i;
 const PAYWALL_TELL = /subscribe to (read|continue)|subscribers only|this article is for subscribers|create a free account to (read|continue)|metered/i;
@@ -183,6 +211,9 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
   // Two kinds of evidence: wall prose a person would read, or a vendor's
   // challenge markup (wallVendor) for walls that show no prose at all.
   if (!substantial && (BLOCK_TELL.test(visibleText(html).slice(0, 60_000)) || wallVendor(html))) return 'blocked';
+  // A challenge page that is long only because of its own inline CSS and JS (Imperva
+  // at gs1uk.org) is no article: a marker of the block page itself settles it.
+  if (strongWallVendor(html)) return 'blocked';
   if (PARKED_TELL.test(head)) return 'parked';
 
   const title = /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1] ?? '';
@@ -210,7 +241,8 @@ export function classifyHealth(html: string, httpStatus = 200, bodyText?: string
  */
 export function jarWorthKeeping(status: FetchStatus): boolean {
   // 'unreachable' too: no site answered, so the jar holds nothing the site said.
-  return status !== 'blocked' && status !== 'login-wall' && status !== 'unreachable';
+  // 'awaiting-human' is a wall like 'blocked', with a window open for the human.
+  return status !== 'blocked' && status !== 'awaiting-human' && status !== 'login-wall' && status !== 'unreachable';
 }
 
 /**

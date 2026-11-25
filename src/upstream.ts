@@ -69,6 +69,7 @@ import {
 } from './stealth.js';
 import { egressRestricted, installContextEgressGuard, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
 import { browserQueue, type RunOptions } from './queue.js';
+import { fileUrlAllowed } from './file-roots.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -87,6 +88,8 @@ interface Bound {
   isLive: () => boolean;
   /** A browser_* call just used it: restart its idle clock. */
   touch: () => void;
+  /** Put the file: guard on the live browser, if one is up. */
+  guardFiles: () => Promise<void>;
 }
 
 let current: Bound | undefined;
@@ -247,6 +250,12 @@ export function upstreamConfig() {
       initScript: [stealthInitFile()],
     },
     secrets: loadSecrets(),
+    // Upstream's file guard is all or nothing: off, it refused every file: URL and
+    // every path outside the cwd, the session scratchpad included; on, it allows the
+    // whole disk. The real check is src/file-roots.ts, which every surface's call
+    // handler runs before a call reaches here (src/index.ts), so this is safe only
+    // because nothing reaches this connection except through that handler (i19).
+    allowUnrestrictedFileAccess: true,
     // Remote instance: upstream's own host block, a coarse second layer under the
     // context guard `launchBrowser` installs (SSRF backstop; OS-level is primary).
     ...(egressRestricted() ? { network: { blockedOrigins: BLOCKED_ORIGIN_PATTERNS } } : {}),
@@ -277,6 +286,37 @@ export async function launchBrowser(storageState?: string): Promise<BrowserConte
 
 function openBrowser(storageState?: string): Promise<BrowserContext> {
   return withSandboxFallback(() => openBrowserOnce(storageState));
+}
+
+/**
+ * The page side of the file: rule (src/file-roots.ts). Once a file: page is open,
+ * its own links reach other file: URLs: a link to file:///etc/hostname was
+ * followed, measured 2026-11-24, and so would an <img> of one be, into a
+ * screenshot. The call handler only sees the URL a tool names, so every file:
+ * request the browser makes is judged here too, by the same roots.
+ *
+ * Armed lazily, by the first file: URL the handler lets through, and from then
+ * on for every browser this process launches. Any route makes Playwright
+ * intercept every request, and its docs say routing turns the HTTP cache off,
+ * which would change what a localhost dev page does for everyone who never opens
+ * a file.
+ */
+let fileGuardArmed = false;
+const fileGuarded = new WeakSet<BrowserContext>();
+
+async function installFileGuard(context: BrowserContext): Promise<void> {
+  if (fileGuarded.has(context)) return;
+  await context.route(
+    (url) => url.protocol === 'file:',
+    (route) => (fileUrlAllowed(route.request().url()) ? route.fallback() : route.abort('accessdenied')),
+  );
+  fileGuarded.add(context);
+}
+
+/** A file: URL is about to be opened: guard every file: request from here on. */
+export async function armFileGuard(): Promise<void> {
+  fileGuardArmed = true;
+  await current?.guardFiles();
 }
 
 /** The pool dir each persistent browser_* context was launched on, for the registry (src/lifetime.ts). */
@@ -338,19 +378,24 @@ export function browserOwner(storageState?: string, launch = launchBrowser, sess
       busy: () => !browserQueue.isIdle(),
       close: recycleIdle,
     });
+    // After the registration, so a failed install leaves a browser the idle close still owns.
+    if (fileGuardArmed) await installFileGuard(live);
     return live;
   };
-  return { getContext, closeBrowser, isLive: () => live !== undefined, touch: () => handle?.touch() };
+  const guardFiles = async (): Promise<void> => {
+    if (live) await installFileGuard(live);
+  };
+  return { getContext, closeBrowser, guardFiles, isLive: () => live !== undefined, touch: () => handle?.touch() };
 }
 
 async function connect(session: string | null, storageState?: string): Promise<Bound> {
-  const { getContext, closeBrowser, isLive, touch } = browserOwner(storageState, launchBrowser, session);
+  const { getContext, closeBrowser, guardFiles, isLive, touch } = browserOwner(storageState, launchBrowser, session);
   const server = await createConnection(upstreamConfig(), getContext);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: 'playwright-mcp-proxy', version: '0.4.0' });
   await client.connect(clientTransport);
-  return { server, client, session, storageState, closeBrowser, isLive, touch };
+  return { server, client, session, storageState, closeBrowser, guardFiles, isLive, touch };
 }
 
 /** Restart the browser_* browser's idle clock. Called after every browser_* call (src/index.ts). */
