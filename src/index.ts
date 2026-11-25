@@ -38,6 +38,7 @@ import {
   closeUpstream,
   boundSession,
   releaseBrowser,
+  shedStdioFiles,
   touchUpstream,
 } from './upstream.js';
 import {
@@ -744,6 +745,9 @@ export function createOutwardServer(
       const { lease: _lease, ...forward } = args ?? {};
       const result = await browserQueue.run(async () => {
         try {
+          // A remote or local-HTTP caller never sees a browser stdio has opened
+          // local files in (src/upstream.ts shedStdioFiles, 2026-11-24).
+          if (trust !== 'stdio') await shedStdioFiles();
           if (opensFile) await armFileGuard();
           const call = () => upstreamOf().callTool({ name, arguments: forward });
           // A dev server started a moment ago may not be listening yet (src/loopback-wait.ts).

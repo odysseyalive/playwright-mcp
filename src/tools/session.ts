@@ -2246,6 +2246,8 @@ export function queueTurn(ctx: ToolContext | undefined, label: string, lease?: s
   return {
     label,
     lease,
+    // The page-side file: guard reads the turn's tier from the queue (i19).
+    trust: ctx?.trust,
     signal: ctx?.signal,
     onWait: () => startHeartbeat(ctx, label, (what, ms) => browserQueue.waitMessage(what, ms)),
   };

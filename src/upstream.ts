@@ -47,7 +47,7 @@
  */
 
 import { createConnection } from '@playwright/mcp';
-import { chromium, type BrowserContext, type LaunchOptions } from 'playwright';
+import { chromium, type BrowserContext, type LaunchOptions, type Route } from 'playwright';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createHash } from 'node:crypto';
@@ -69,7 +69,7 @@ import {
 } from './stealth.js';
 import { egressRestricted, installContextEgressGuard, BLOCKED_ORIGIN_PATTERNS } from './egress.js';
 import { browserQueue, type RunOptions } from './queue.js';
-import { fileUrlAllowed } from './file-roots.js';
+import { fileUrlPath, pageFileAllowed } from './file-roots.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp]', ...args);
 
@@ -90,6 +90,8 @@ interface Bound {
   touch: () => void;
   /** Put the file: guard on the live browser, if one is up. */
   guardFiles: () => Promise<void>;
+  /** Whether the live browser has loaded a file: URL, or shows one now. */
+  holdsFiles: () => boolean;
 }
 
 let current: Bound | undefined;
@@ -300,15 +302,36 @@ function openBrowser(storageState?: string): Promise<BrowserContext> {
  * intercept every request, and its docs say routing turns the HTTP cache off,
  * which would change what a localhost dev page does for everyone who never opens
  * a file.
+ *
+ * Judged by whose TURN it is (pageFileAllowed), not as stdio for everyone: the
+ * HTTP surfaces share this browser, and until 2026-11-24 a remote caller after a
+ * stdio file: page could follow its links as stdio (automated review of f4fdef6).
+ * Every file: load the guard lets through marks the context in `fileLoaded`, so
+ * shedStdioFiles knows the browser has disk content in it.
  */
 let fileGuardArmed = false;
 const fileGuarded = new WeakSet<BrowserContext>();
+const fileLoaded = new WeakSet<BrowserContext>();
+
+/** The URL of the page a request came from, or undefined when it cannot be told (a worker). */
+function requestingPage(route: Route): string | undefined {
+  try {
+    return route.request().frame().page().url();
+  } catch {
+    return undefined;
+  }
+}
 
 async function installFileGuard(context: BrowserContext): Promise<void> {
   if (fileGuarded.has(context)) return;
   await context.route(
     (url) => url.protocol === 'file:',
-    (route) => (fileUrlAllowed(route.request().url()) ? route.fallback() : route.abort('accessdenied')),
+    (route) => {
+      if (!pageFileAllowed(route.request().url(), browserQueue.turnTrust(), requestingPage(route)))
+        return route.abort('accessdenied');
+      fileLoaded.add(context);
+      return route.fallback();
+    },
   );
   fileGuarded.add(context);
 }
@@ -385,17 +408,69 @@ export function browserOwner(storageState?: string, launch = launchBrowser, sess
   const guardFiles = async (): Promise<void> => {
     if (live) await installFileGuard(live);
   };
-  return { getContext, closeBrowser, guardFiles, isLive: () => live !== undefined, touch: () => handle?.touch() };
+  // The page URLs are a second belt under `fileLoaded`, for a file: page that
+  // somehow came up without the route seeing it: refuse when unsure.
+  const holdsFiles = (): boolean =>
+    !!live && (fileLoaded.has(live) || live.pages().some((p) => fileUrlPath(p.url()) !== undefined));
+  return {
+    getContext,
+    closeBrowser,
+    guardFiles,
+    holdsFiles,
+    isLive: () => live !== undefined,
+    touch: () => handle?.touch(),
+  };
 }
 
 async function connect(session: string | null, storageState?: string): Promise<Bound> {
-  const { getContext, closeBrowser, guardFiles, isLive, touch } = browserOwner(storageState, launchBrowser, session);
+  const { getContext, closeBrowser, guardFiles, holdsFiles, isLive, touch } = browserOwner(
+    storageState,
+    launchBrowser,
+    session,
+  );
   const server = await createConnection(upstreamConfig(), getContext);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: 'playwright-mcp-proxy', version: '0.4.0' });
   await client.connect(clientTransport);
-  return { server, client, session, storageState, closeBrowser, guardFiles, isLive, touch };
+  return { server, client, session, storageState, closeBrowser, guardFiles, holdsFiles, isLive, touch };
+}
+
+/**
+ * Swap in a fresh connection for the SAME session file and close the old one,
+ * browser included. Nothing launches until the next browser_* call. Callers hold
+ * a turn in the browser queue.
+ */
+async function replaceConnection(previous: Bound): Promise<void> {
+  current = await connect(previous.session, previous.storageState);
+  await disconnect(previous);
+}
+
+/**
+ * A non-stdio turn is about to use the browser: if a stdio call left disk content
+ * in it, start that caller on a fresh browser instead. Called INSIDE the turn
+ * (src/index.ts), after the queue has recorded its tier.
+ *
+ * Why the whole browser, not just the file: tabs (2026-11-24, automated review of
+ * f4fdef6). The page-side guard stops a remote caller from LOADING a file: URL,
+ * but a file: page stdio already opened needs no load to leak: a remote
+ * browser_snapshot or browser_take_screenshot reads it as it stands, and so do
+ * upstream's per-tab console and network logs. Closing the file: tabs would not
+ * reach a file: entry in another tab's history, which a remote
+ * browser_navigate_back might bring back from the back-forward cache without a
+ * request the route sees (not measured; a fresh browser makes it moot). Measured
+ * 2026-11-24 with this replacement switched off: a cloud browser_snapshot read
+ * the stdio page's text, while a cloud click on its in-root link was turned into
+ * chrome-error:// by the route. A fresh browser has none of it. What it costs: stdio's
+ * open tabs, and when bound, cookies the site set after the capture, the same
+ * loss as an idle close, paid only after stdio opened a file and a remote caller
+ * came next.
+ */
+export async function shedStdioFiles(): Promise<void> {
+  const previous = current;
+  if (!previous?.holdsFiles()) return;
+  await replaceConnection(previous);
+  log('browser_* browser replaced: a non-stdio turn followed a stdio one that opened local files');
 }
 
 /** Restart the browser_* browser's idle clock. Called after every browser_* call (src/index.ts). */
@@ -420,8 +495,7 @@ async function recycleIdle(): Promise<void> {
     async () => {
       const previous = current;
       if (!previous?.isLive()) return;
-      current = await connect(previous.session, previous.storageState);
-      await disconnect(previous);
+      await replaceConnection(previous);
     },
     { label: 'idle close' },
   );

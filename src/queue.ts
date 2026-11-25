@@ -46,6 +46,8 @@
 
 import { randomBytes } from 'node:crypto';
 
+import type { SurfaceTrust } from './index.js';
+
 /** What the queue needs from time. Defaults to the real one. */
 export interface QueueClock {
   now(): number;
@@ -77,6 +79,22 @@ export interface WaitOptions {
 export interface RunOptions extends WaitOptions {
   /** The caller's lease token, if it holds one. */
   lease?: string;
+  /**
+   * The trust tier of the surface the call came in on. Read by the page-side
+   * file: guard (src/upstream.ts) through turnTrust(); a turn without one (idle
+   * close, a bare rebind) counts as not stdio.
+   */
+  trust?: SurfaceTrust;
+}
+
+/** Whose turn the browser is on, for the page-side file: guard (src/file-roots.ts pageFileAllowed). */
+export interface TurnTrust {
+  /** A turn is running right now. */
+  running: boolean;
+  /** Its surface's tier, when it said; undefined while running means "not stdio". */
+  trust?: SurfaceTrust;
+  /** The tier of the turn that ran last, for requests a page makes between turns. */
+  lastTrust?: SurfaceTrust;
 }
 
 export interface AcquireOptions extends Omit<WaitOptions, 'label'> {
@@ -154,7 +172,9 @@ const realClock: QueueClock = {
 
 export class BrowserQueue {
   private readonly waiting: Waiter[] = [];
-  private running: { label: string; startedAt: number; lease?: string } | undefined;
+  private running: { label: string; startedAt: number; lease?: string; trust?: SurfaceTrust } | undefined;
+  /** The tier of the last turn that ran, undefined when it named none. */
+  private lastTrust: SurfaceTrust | undefined;
   private lease: Lease | undefined;
   /** token → the sentence saying how it ended. Insertion-ordered, so the oldest is dropped first. */
   private readonly ended = new Map<string, string>();
@@ -180,11 +200,12 @@ export class BrowserQueue {
           lease: opts.lease,
           dispatch: () => {
             const lease = this.lease?.token === opts.lease ? this.lease : undefined;
-            this.running = { label: opts.label, startedAt: this.clock.now(), lease: opts.lease };
+            this.running = { label: opts.label, startedAt: this.clock.now(), lease: opts.lease, trust: opts.trust };
             if (lease) this.pauseIdle(lease);
             void (async () => fn())()
               .then(resolve, reject)
               .finally(() => {
+                this.lastTrust = opts.trust;
                 this.running = undefined;
                 // The lease may have ended (released, max lifetime) while this ran.
                 if (lease && this.lease === lease) this.touch(lease);
@@ -235,6 +256,11 @@ export class BrowserQueue {
    */
   isIdle(): boolean {
     return !this.running && !this.lease && this.waiting.length === 0;
+  }
+
+  /** Whose turn it is, and whose it was (src/upstream.ts installFileGuard). */
+  turnTrust(): TurnTrust {
+    return { running: !!this.running, trust: this.running?.trust, lastTrust: this.lastTrust };
   }
 
   /** True while `token` is the live lease. */

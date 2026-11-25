@@ -44,6 +44,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { SurfaceTrust } from './index.js';
+import type { TurnTrust } from './queue.js';
 
 /** Who and where, injectable so a test can stand in for another uid or tmp dir. */
 export interface RootEnv {
@@ -207,9 +208,40 @@ export function urlRefusal(url: string, trust: SurfaceTrust, env: RootEnv = curr
   return why && `Access to "file:" URL refused: ${why}`;
 }
 
-/** For the page-side guard (src/upstream.ts): may the browser load this file: URL at all? */
-export function fileUrlAllowed(url: string): boolean {
-  return urlRefusal(url, 'stdio') === null;
+/**
+ * For the page-side guard (src/upstream.ts): may the browser load this file:
+ * URL, given whose turn it is?
+ *
+ * Until 2026-11-24 this asked only the stdio rule, whoever held the browser. But
+ * the stdio surface and the HTTP surfaces drive ONE browser through one queue,
+ * and the call handler only sees the URL a tool names: a remote caller taking the
+ * turn after a stdio call that left a file: page open could click that page's
+ * links, or let it load subresources, and read the project as if it were stdio
+ * (automated review of f4fdef6, MEDIUM). So the answer now follows the turn:
+ *   - a stdio turn is running: the stdio roots, as before;
+ *   - any other turn is running, including one that named no tier (an idle
+ *     close, a bare rebind): no;
+ *   - no turn is running, which is a page's own script or a late load: only if
+ *     the last turn was stdio AND the request comes from a file: page inside the
+ *     roots, i.e. one that stdio call opened. Anything that cannot say which page
+ *     asked (a worker) is refused.
+ * Refuse when unsure: a stdio page that loses a late load is a reload away from
+ * working; a remote caller that wins one has read the disk.
+ */
+export function pageFileAllowed(
+  url: string,
+  turn: TurnTrust,
+  fromPage: string | undefined,
+  env: RootEnv = currentRootEnv(),
+): boolean {
+  if (urlRefusal(url, 'stdio', env) !== null) return false;
+  if (turn.running) return turn.trust === 'stdio';
+  return (
+    turn.lastTrust === 'stdio' &&
+    fromPage !== undefined &&
+    fileUrlPath(fromPage) !== undefined &&
+    urlRefusal(fromPage, 'stdio', env) === null
+  );
 }
 
 /** Argument names this module checks on every upstream tool. */

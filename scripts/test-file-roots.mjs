@@ -14,6 +14,11 @@
 //   - a loopback server that starts listening late is reached; a refused
 //     non-loopback host is not retried.
 //
+// And since 2026-11-24 (automated review of f4fdef6): a file: page a stdio call
+// opened is gone before a cloud or local-HTTP caller's turn, so it can neither
+// read it nor follow its links, and the page-side guard judges every file: load
+// by whose turn it is, not as stdio for everyone.
+//
 // The rule and the wiring run browser-free, against a stub upstream. The real
 // chrome claims sit at the bottom behind PLAYWRIGHT_MCP_TEST_BROWSER=1, on a
 // fixture profile root and cwd: this checkout's profile hash belongs to live
@@ -30,7 +35,8 @@ import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { argsRefusal, pathRefusal, urlRefusal, PATH_ARGS } from '../dist/file-roots.js';
+import { argsRefusal, pageFileAllowed, pathRefusal, urlRefusal, PATH_ARGS } from '../dist/file-roots.js';
+import { BrowserQueue, browserQueue } from '../dist/queue.js';
 import { isLoopbackUrl, refusedConnection, withLoopbackWait } from '../dist/loopback-wait.js';
 import { createOutwardServer } from '../dist/index.js';
 
@@ -79,6 +85,10 @@ function world() {
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(project, 'inside.html'), '<title>inside</title><a id="out" href="file:///etc/hostname">x</a>');
   fs.writeFileSync(path.join(outside, 'secret.html'), '<title>secret</title>');
+  // Two pages inside the root, one linking to the other, each with a marker no
+  // other page shows: what a remote caller must never read.
+  fs.writeFileSync(path.join(project, 'home.html'), '<title>home</title><p>HOME-MARK-91c</p><a href="linked.html">in</a>');
+  fs.writeFileSync(path.join(project, 'linked.html'), '<title>linked</title><p>LINKED-MARK-7f3</p>');
   fs.symlinkSync(outside, path.join(project, 'escape'));
   const tmp = path.join(top, 'tmp');
   const claude = path.join(tmp, `claude-${UID}`);
@@ -160,6 +170,38 @@ test('rule: PLAYWRIGHT_MCP_FILE_ROOTS adds a root on stdio and nowhere else', { 
   assert.equal(pathRefusal(secret, 'stdio', env), null);
   assert.match(pathRefusal(secret, 'local', env), /outside/);
   assert.match(pathRefusal(secret, 'cloud', env), /outside/);
+});
+
+test('rule: the page-side guard follows the turn: stdio by the roots, any other turn never, between turns only a stdio file: page', { skip: POSIX_SKIP }, () => {
+  const w = world();
+  const home = pathToFileURL(path.join(w.project, 'home.html')).href;
+  const linked = pathToFileURL(path.join(w.project, 'linked.html')).href;
+  const secret = pathToFileURL(path.join(w.outside, 'secret.html')).href;
+  const allowed = (url, turn, from) => pageFileAllowed(url, turn, from, w.env);
+  assert.ok(allowed(linked, { running: true, trust: 'stdio' }, home));
+  assert.ok(!allowed(secret, { running: true, trust: 'stdio' }, home), 'out of the roots, even for stdio');
+  for (const trust of ['local', 'cloud', undefined]) {
+    assert.ok(!allowed(linked, { running: true, trust, lastTrust: 'stdio' }, home), `${trust ?? 'no tier'} turn`);
+  }
+  // Between turns: a page's own script or a late load.
+  assert.ok(allowed(linked, { running: false, lastTrust: 'stdio' }, home), "stdio's own file: page");
+  assert.ok(!allowed(linked, { running: false, lastTrust: 'stdio' }, 'https://example.test/'), 'not a file: page');
+  assert.ok(!allowed(linked, { running: false, lastTrust: 'stdio' }, secret), 'a file: page outside the roots');
+  assert.ok(!allowed(linked, { running: false, lastTrust: 'stdio' }, undefined), 'no page to tell (a worker)');
+  for (const lastTrust of ['local', 'cloud', undefined]) {
+    assert.ok(!allowed(linked, { running: false, lastTrust }, home), `after a ${lastTrust ?? 'no-tier'} turn`);
+  }
+});
+
+test('queue: turnTrust reports the running turn\'s tier and keeps the last one', async () => {
+  const q = new BrowserQueue({ idleMs: 1e6, maxLeaseMs: 1e6, maxWaitMs: 1e6 });
+  assert.deepEqual(q.turnTrust(), { running: false, trust: undefined, lastTrust: undefined });
+  await q.run(async () => assert.deepEqual(q.turnTrust(), { running: true, trust: 'stdio', lastTrust: undefined }), { label: 'a', trust: 'stdio' });
+  assert.deepEqual(q.turnTrust(), { running: false, trust: undefined, lastTrust: 'stdio' });
+  await q.run(async () => assert.equal(q.turnTrust().trust, 'cloud'), { label: 'b', trust: 'cloud' });
+  assert.equal(q.turnTrust().lastTrust, 'cloud');
+  await q.run(async () => assert.deepEqual(q.turnTrust(), { running: true, trust: undefined, lastTrust: 'cloud' }), { label: 'idle close' });
+  assert.equal(q.turnTrust().lastTrust, undefined, 'a turn that names no tier is not stdio');
 });
 
 test('rule: argsRefusal reads filename, every entry of paths, and url', { skip: POSIX_SKIP }, () => {
@@ -314,15 +356,23 @@ async function realServer(w) {
   const up = await import('../dist/upstream.js');
   const upstreamClient = await up.initUpstream();
   const { tools } = await upstreamClient.listTools();
-  const server = createOutwardServer(up.getUpstream, tools);
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  await server.connect(b);
-  const client = new Client({ name: 'test', version: '0' });
-  await client.connect(a);
+  // Every surface on the one upstream, as main() wires stdio and HTTP.
+  const clients = [];
+  const surface = async (options) => {
+    const server = createOutwardServer(up.getUpstream, tools, options);
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await server.connect(b);
+    const client = new Client({ name: 'test', version: '0' });
+    await client.connect(a);
+    clients.push(client);
+    return (name, args) => client.callTool({ name, arguments: args });
+  };
   return {
-    call: (name, args) => client.callTool({ name, arguments: args }),
+    up,
+    call: await surface({}),
+    surface,
     close: async () => {
-      await client.close().catch(() => {});
+      for (const client of clients) await client.close().catch(() => {});
       await up.closeUpstream();
       process.chdir(startCwd);
       delete process.env.CLAUDE_CODE_TMPDIR;
@@ -331,6 +381,12 @@ async function realServer(w) {
 }
 
 const text = (r) => r.content.map((b) => b.text ?? '').join('\n');
+
+/** A snapshot's tree: upstream writes it to a file and links it, or inlines it. */
+function tree(w, r) {
+  const yml = /\((\.playwright-mcp\/[^)]+\.yml)\)/.exec(text(r))?.[1];
+  return yml ? fs.readFileSync(path.join(w.project, yml), 'utf8') : text(r);
+}
 
 test('real: file:// inside the project opens; outside, through a symlink, /etc/passwd and a link out stay blocked', { skip: REAL_SKIP || POSIX_SKIP }, async () => {
   const w = world();
@@ -353,12 +409,77 @@ test('real: file:// inside the project opens; outside, through a symlink, /etc/p
     // only the page-side guard does. Upstream writes the snapshot to a file; the
     // link's ref is read from there.
     const back = await s.call('browser_snapshot', {});
-    const yml = /\((\.playwright-mcp\/[^)]+\.yml)\)/.exec(text(back))?.[1];
-    const tree = yml ? fs.readFileSync(path.join(w.project, yml), 'utf8') : text(back);
-    const ref = /link "x" \[ref=(\w+)\]/.exec(tree)?.[1];
+    const ref = /link "x" \[ref=(\w+)\]/.exec(tree(w, back))?.[1];
     assert.ok(ref, 'the link is in the snapshot');
     const click = await s.call('browser_click', { element: 'x link', target: ref });
     assert.doesNotMatch(text(click), /Page URL: file:\/\/\/etc\/hostname/, text(click));
+  } finally {
+    await s.close();
+  }
+});
+
+test('real: a cloud or local-HTTP turn after a stdio file: page sees none of it; stdio still opens and follows in-root links', { skip: REAL_SKIP || POSIX_SKIP }, async () => {
+  const w = world();
+  const s = await realServer(w);
+  const home = pathToFileURL(path.join(w.project, 'home.html')).href;
+  const leaked = /HOME-MARK|LINKED-MARK|file:\/\//;
+  try {
+    for (const trust of ['cloud', 'local']) {
+      const remote = await s.surface({ trust });
+      // stdio opens a page from disk, then moves the tab on, so the file: page is
+      // only in its history.
+      const opened = await s.call('browser_navigate', { url: home });
+      assert.match(tree(w, opened), /HOME-MARK/, text(opened));
+      await s.call('browser_navigate', { url: 'about:blank' });
+      await s.call('browser_tabs', { action: 'new' });
+      await s.call('browser_navigate', { url: home });
+      await s.call('browser_navigate', { url: 'about:blank' });
+      // No tab shows a file: URL now, so it is the guard's record of the load,
+      // not the page URLs, that makes the next turn start on a fresh browser.
+
+      const snap = await remote('browser_snapshot', {});
+      assert.doesNotMatch(tree(w, snap), leaked, `${trust}: snapshot`);
+      const tabs = await remote('browser_tabs', { action: 'list' });
+      assert.doesNotMatch(text(tabs), leaked, `${trust}: tabs`);
+      const back = await remote('browser_navigate_back', {});
+      assert.doesNotMatch(text(back), leaked, `${trust}: history`);
+      assert.doesNotMatch(tree(w, await remote('browser_snapshot', {})), leaked, `${trust}: snapshot after back`);
+      const nav = await remote('browser_navigate', { url: home });
+      assert.ok(nav.isError, `${trust}: file: navigation is refused`);
+      assert.doesNotMatch(text(nav), /HOME-MARK/);
+    }
+
+    // stdio afterwards: the page opens again and its in-root link is followed.
+    const again = await s.call('browser_navigate', { url: home });
+    assert.ok(!again.isError, text(again));
+    const ref = /link "in" \[ref=(\w+)\]/.exec(tree(w, await s.call('browser_snapshot', {})))?.[1];
+    assert.ok(ref, 'the in-root link is in the snapshot');
+    const click = await s.call('browser_click', { element: 'in link', target: ref });
+    assert.match(text(click), /linked\.html/, text(click));
+    assert.match(tree(w, await s.call('browser_snapshot', {})), /LINKED-MARK/);
+  } finally {
+    await s.close();
+  }
+});
+
+test('real: the page-side guard refuses a stdio page\'s in-root link to every turn but stdio', { skip: REAL_SKIP || POSIX_SKIP }, async () => {
+  const w = world();
+  const s = await realServer(w);
+  const home = pathToFileURL(path.join(w.project, 'home.html')).href;
+  try {
+    // Straight onto the queue, past the outward server, so the fresh browser a
+    // non-stdio call gets never happens: what is left is the route alone.
+    for (const trust of ['cloud', 'local', undefined, 'stdio']) {
+      await s.call('browser_navigate', { url: home });
+      const ref = /link "in" \[ref=(\w+)\]/.exec(tree(w, await s.call('browser_snapshot', {})))?.[1];
+      assert.ok(ref, 'the in-root link is in the snapshot');
+      const click = await browserQueue.run(
+        () => s.up.getUpstream().callTool({ name: 'browser_click', arguments: { element: 'in link', target: ref } }),
+        { label: 'test click', trust },
+      );
+      const reached = /Page URL: file:\S*linked\.html/.test(text(click));
+      assert.equal(reached, trust === 'stdio', `${trust ?? 'no tier'}: ${text(click)}`);
+    }
   } finally {
     await s.close();
   }
