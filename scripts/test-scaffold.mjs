@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { scaffold } from '../dist/scaffold.js';
+import { addE2eScripts, E2E_SCRIPTS, scaffold } from '../dist/scaffold.js';
 import { sessionScaffoldTool } from '../dist/tools/scaffold.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +20,7 @@ const EXPECTED = [
   'playwright.config.ts',
   path.join('tests', 'auth.setup.ts'),
   path.join('tests', 'example.spec.ts'),
+  path.join('tests', 'e2e-slot.mjs'),
   'README.md',
 ];
 
@@ -136,4 +137,58 @@ test('tool reports collisions as an error result, never throws', async () => {
   } finally {
     fs.rmSync(out, { recursive: true, force: true });
   }
+});
+
+// ── the e2e slot (2026-11-25) ───────────────────────────────────────────────────
+
+test('the npm scripts go through the slot runner; only absent keys are added', () => {
+  withTmp((out) => {
+    fs.writeFileSync(path.join(out, 'package.json'), JSON.stringify({ name: 'x', scripts: { 'test:e2e': 'my own' } }, null, 4) + '\n');
+    const note = addE2eScripts(out);
+    const pkg = JSON.parse(fs.readFileSync(path.join(out, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['test:e2e'], 'my own', "the project's own script is left as it is");
+    assert.equal(pkg.scripts['test:e2e:direct'], E2E_SCRIPTS['test:e2e:direct']);
+    assert.match(note, /added "test:e2e:direct"/);
+    assert.match(note, /Left your own "test:e2e"/);
+    assert.match(fs.readFileSync(path.join(out, 'package.json'), 'utf8'), /^\{\n {4}"/, 'the file keeps its indent');
+    assert.equal(E2E_SCRIPTS['test:e2e'], 'node tests/e2e-slot.mjs');
+  });
+  withTmp((out) => {
+    assert.match(addE2eScripts(out), /No package\.json/);
+    assert.ok(!fs.existsSync(path.join(out, 'package.json')), 'none is created');
+  });
+});
+
+test('the tool adds the scripts and tells the caller how to run through the slot', async () => {
+  const out = mkTmp();
+  try {
+    fs.writeFileSync(path.join(out, 'package.json'), '{"name":"x"}\n');
+    const res = await sessionScaffoldTool.handler({ session: 's', outDir: out });
+    const text = res.content[0].text;
+    assert.match(text, /npm run test:e2e/);
+    assert.match(text, /--detach/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(out, 'package.json'), 'utf8')).scripts['test:e2e'], 'node tests/e2e-slot.mjs');
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('the generated slot runner finds the state directory exactly as src/e2e-slot.ts does', () => {
+  withTmp((out) => {
+    scaffold({ session: 'default', out });
+    const runner = fs.readFileSync(path.join(out, 'tests', 'e2e-slot.mjs'), 'utf8');
+    const source = fs.readFileSync(path.join(REPO, 'src', 'e2e-slot.ts'), 'utf8');
+    const body = (text) => /function slotDir\(\)[^{]*\{([\s\S]*?)\n\}/.exec(text)?.[1].replace(/\s+/g, ' ');
+    assert.ok(body(runner), 'runner has slotDir()');
+    assert.equal(body(runner), body(source), 'slotDir() drifted between the runner and src/e2e-slot.ts');
+  });
+});
+
+test('the generated runner falls back to a direct run where there is no playwright-mcp', () => {
+  withTmp((out) => {
+    scaffold({ session: 'default', out });
+    const runner = fs.readFileSync(path.join(out, 'tests', 'e2e-slot.mjs'), 'utf8');
+    assert.match(runner, /process\.env\.CI \? undefined : wrapper\(\)/);
+    assert.match(runner, /running without the slot/);
+  });
 });

@@ -22,7 +22,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
 import { customTools, callCustomTool, isCustomTool, type ToolContext } from './tools.js';
@@ -54,6 +54,9 @@ import { browserQueue, leaseArg, LEASE_PROPERTY } from './queue.js';
 import { queueTurn } from './tools/session.js';
 import { argsRefusal, fileUrlPath } from './file-roots.js';
 import { isLoopbackUrl, loopbackWaitMs, withLoopbackWait } from './loopback-wait.js';
+import { formatSlotStatus, slotStatus, writeWrapperPointer } from './e2e-slot.js';
+import { slotMain } from './slot-cli.js';
+import { formatRenderStatus, renderNote, renderStatus, takeRender } from './render-lane.js';
 
 // package.json is the one place the version lives. dist/index.js and
 // src/index.ts both sit one level below it, so the same relative path serves
@@ -394,17 +397,21 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
     'loginUrl, so nothing a site wrote can ride in on it.',
   session_scaffold_tests:
     'The handler in src/tools/scaffold.ts reports the template-relative paths scaffold() wrote plus ' +
-    'fixed next-step prose. Its only runtime imports are node:path and ../scaffold.js: no browser, ' +
+    'fixed next-step prose, and addE2eScripts\u2019 line naming the npm script keys it added to or found in the ' +
+    'project\u2019s own package.json. Its only runtime imports are node:path and ../scaffold.js: no browser, ' +
     'no page, nothing fetched.',
   suite_scaffold:
     'scaffoldHandler (src/tools/suite.ts) reports scaffold()’s written paths and fixed next-step ' +
-    'prose over SUITE_TEMPLATE_DIR — this server’s own shipped templates, not fetched content.',
+    'prose over SUITE_TEMPLATE_DIR — this server’s own shipped templates, not fetched content — plus ' +
+    'addE2eScripts’ line about the project’s own package.json script keys.',
   suite_audit:
     'The two site-authored spans are fenced by wrapUntrusted at their interpolation points in ' +
     'auditHandler (src/tools/suite.ts): stderrTail on the no-report throw, and each failure’s ' +
     'f.error inside its dossier, immediately ahead of ADJUDICATION_RUBRIC. The dossier fields left ' +
     'unfenced (test, location, status, attachments) come from the Playwright reporter and the ' +
-    'project’s own spec files, not from the site under test.',
+    'project’s own spec files, not from the site under test. The e2e slot line (src/e2e-slot.ts) is ' +
+    'this server’s own sentence around ticket fields other local processes wrote (a session id, a cwd ' +
+    'and command clamped to 200 printable characters), never page content.',
   suite_methodology:
     'methodologyHandler (src/tools/suite.ts) returns this server’s shipped playbook files, selected ' +
     'by the fixed TOPIC_FILES map under SUITE_TEMPLATE_DIR — no caller-supplied path, no page.',
@@ -417,7 +424,9 @@ export const CUSTOM_TOOL_EXEMPTIONS: Record<string, string> = {
     'handler (src/tools/browsers.ts) serialises browserStatus() (src/lifetime.ts): pids, start ' +
     'times, kinds, profile paths and session NAMES this server or a sibling wrote into the registry, ' +
     'plus numbers read from /proc, and pendingWalls() (src/tools/web-fetch.ts): hosts parsed from ' +
-    'URLs callers asked web_fetch for, times and counts, never page content. No browser is touched and no page is read.',
+    'URLs callers asked web_fetch for, times and counts, never page content. Its e2eSlot field is slotStatus() ' +
+    '(src/e2e-slot.ts) and renderLane is renderStatus() (src/render-lane.ts): ticket and claim files other local processes wrote — pids, timestamps, a session id, and a cwd and ' +
+    'command clamped to 200 printable characters — never page content. No browser is touched and no page is read.',
   browser_lease_release:
     'releaseHandler (src/tools/lease.ts) returns BrowserQueue.release’s fixed notes (src/queue.ts) ' +
     'about the caller’s own token. No browser is touched.',
@@ -743,7 +752,19 @@ export function createOutwardServer(
       // client is resolved INSIDE the turn: a rebind may have swapped it while this
       // call waited. `lease` is ours, so upstream never sees it.
       const { lease: _lease, ...forward } = args ?? {};
+      let renderWait: string | undefined;
       const result = await browserQueue.run(async () => {
+        // The machine-wide render slot (src/render-lane.ts) is taken INSIDE this
+        // server's queue turn, never around it. Taken outside, a call would hold a
+        // machine slot while it waited on its own server's queue, which a lease or
+        // another call waiting for a machine slot can hold: with one render slot
+        // during a suite, two servers' calls deadlock that way. Inside, a call
+        // holds its turn while it waits for a machine slot, and every machine slot
+        // is held by a call already inside its own turn that needs nothing more
+        // from anyone: no cycle. It is released when this call ends, not with the
+        // lease, so a lease idle between calls holds no machine slot.
+        const turn = await takeRender(name, { signal: ctx.signal, progress: ctx.progress });
+        renderWait = renderNote(turn);
         try {
           // A remote or local-HTTP caller never sees a browser stdio has opened
           // local files in (src/upstream.ts shedStdioFiles, 2026-11-24).
@@ -759,11 +780,14 @@ export function createOutwardServer(
           if (name === 'browser_close') await releaseBrowser();
           return out;
         } finally {
+          turn.release();
           // The idle clock (src/lifetime.ts) runs from the END of the last call.
           touchUpstream();
         }
       }, queueTurn(ctx, name, leaseArg(args ?? {})));
-      return withUntrustedNotice(withSessionBanner(result, boundSession(), remote), name);
+      const shown = withUntrustedNotice(withSessionBanner(result, boundSession(), remote), name);
+      if (renderWait && Array.isArray(shown.content)) shown.content = [...shown.content, { type: 'text', text: renderWait }];
+      return shown;
     } catch (err) {
       return {
         content: [
@@ -802,6 +826,9 @@ async function main() {
   // client, closed when idle, and killed with it (src/lifetime.ts). Also reaps
   // what dead servers left behind.
   startLifetime({ version: VERSION });
+  // Tell a generated project's tests/e2e-slot.mjs where this install's wrapper is
+  // (src/e2e-slot.ts): nothing of ours is on PATH, and a clone runs wherever it is.
+  writeWrapperPointer(fileURLToPath(new URL('./slot-bin.js', import.meta.url)));
 
   // 3a. Local stdio surface (Claude Code) — full toolset, byte-for-byte unchanged.
   const stdioServer = createOutwardServer(getUpstream, upstreamTools);
@@ -889,11 +916,24 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   }
   // For the human: every playwright-mcp browser on this machine, with its owner,
   // age, idle time and memory (src/lifetime.ts). Read-only; it reaps nothing.
+  // The machine-wide e2e slot is listed after them (src/e2e-slot.ts): which
+  // suite holds it, for how long, and who is queued.
   if (process.argv[2] === '--browsers') {
-    browserStatus().then((rows) => {
-      process.stdout.write(process.argv[3] === '--json' ? `${JSON.stringify(rows, null, 1)}\n` : formatStatus(rows));
+    Promise.all([browserStatus(), slotStatus(), renderStatus()]).then(([rows, slot, render]) => {
+      process.stdout.write(
+        // --json keeps its shape (the rows); the slot's JSON is --slot-status --json.
+        process.argv[3] === '--json'
+          ? `${JSON.stringify(rows, null, 1)}\n`
+          : `${formatStatus(rows)}\n${formatSlotStatus(slot)}${formatRenderStatus(render)}`,
+      );
       process.exit(0);
     });
+  } else if (process.argv[2] === '--slot' || process.argv[2] === '--slot-status') {
+    // `--slot [options] -- <command…>` runs a command holding the slot (src/slot-cli.ts);
+    // `--slot-status` prints the holder and the queue. Same code as playwright-mcp-slot.
+    slotMain(process.argv[2] === '--slot' ? process.argv.slice(3) : ['--status', ...process.argv.slice(3)]).then((code) =>
+      process.exit(code),
+    );
   } else {
     main().catch((err) => {
       log('fatal:', err);

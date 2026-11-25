@@ -125,3 +125,59 @@ export function scaffold({
   }
   return written;
 }
+
+/**
+ * The npm scripts a scaffolded suite runs through. `test:e2e` goes through the
+ * machine-wide e2e slot (src/e2e-slot.ts) by way of the generated
+ * tests/e2e-slot.mjs, which needs no path baked into the project; it runs
+ * directly under CI or where playwright-mcp is absent. `test:e2e:direct` skips
+ * the slot outright. Added 2026-11-25 after concurrent suites from several agent
+ * sessions locked up a 4-core laptop.
+ */
+export const E2E_SCRIPTS: Readonly<Record<string, string>> = {
+  'test:e2e': 'node tests/e2e-slot.mjs',
+  'test:e2e:direct': 'playwright test',
+};
+
+/**
+ * Add E2E_SCRIPTS to the target's package.json, keys that are absent only: a
+ * script the project already has is its own and stays as it is. No package.json
+ * means nothing is written. Returns one line for the scaffold result.
+ */
+export function addE2eScripts(out: string): string {
+  const file = path.join(out, 'package.json');
+  const lines = Object.entries(E2E_SCRIPTS).map(([k, v]) => `"${k}": "${v}"`).join(', ');
+  if (!fs.existsSync(file)) return `No package.json in ${out}: add these scripts when you create one: ${lines}.`;
+  let raw: string;
+  let pkg: { scripts?: Record<string, string> };
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+    pkg = JSON.parse(raw);
+  } catch (err) {
+    return `package.json was not changed (${err instanceof Error ? err.message : String(err)}); add these scripts by hand: ${lines}.`;
+  }
+  pkg.scripts ??= {};
+  const added: string[] = [];
+  const kept: string[] = [];
+  for (const [k, v] of Object.entries(E2E_SCRIPTS)) {
+    if (pkg.scripts[k] === undefined) {
+      pkg.scripts[k] = v;
+      added.push(k);
+    } else if (pkg.scripts[k] !== v) kept.push(k);
+  }
+  if (added.length) {
+    const indent = /^\{\s*\n([ \t]+)"/.exec(raw)?.[1] ?? '  ';
+    fs.writeFileSync(file, JSON.stringify(pkg, null, indent) + (raw.endsWith('\n') ? '\n' : ''));
+  }
+  return (
+    (added.length ? `package.json: added ${added.map((k) => `"${k}"`).join(', ')}.` : 'package.json: the e2e scripts were already there.') +
+    (kept.length ? ` Left your own ${kept.map((k) => `"${k}"`).join(', ')} as it is; the slot runner is: ${lines}.` : '')
+  );
+}
+
+/** The run lines both scaffold tools hand back. */
+export const E2E_RUN_NOTE =
+  'Run it as `npm run test:e2e -- [specs] [--workers=1]`: it waits its turn in the machine-wide e2e slot, one suite ' +
+  'at a time across every session, and caps workers at half the cores. For a long run add --detach first ' +
+  '(`npm run test:e2e -- --detach [specs]`): it returns at once with a log path, whose last line becomes `done <code>`. ' +
+  '`npm run test:e2e:direct` (and CI) skips the slot.';

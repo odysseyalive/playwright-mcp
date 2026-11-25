@@ -8,13 +8,16 @@
  *
  * Spec: /session-method (Consumer 2). DEC-2026-06-08-e2e-test-scaffold-storagestate
  * (amended — the tool was added after the CLI on the discoverability priority).
+ *
+ * 2026-11-25: it also adds the test:e2e scripts to the project's package.json
+ * (addE2eScripts, src/scaffold.ts), so a suite runs through the e2e slot by default.
  */
 
 import path from 'node:path';
 
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { scaffold } from '../scaffold.js';
+import { addE2eScripts, scaffold, E2E_RUN_NOTE } from '../scaffold.js';
 
 const definition: Tool = {
   name: 'session_scaffold_tests',
@@ -23,7 +26,8 @@ const definition: Tool = {
     'freshness-guard setup project + an example spec + README) into a project. The ' +
     'suite reuses a login captured by session_login (its mode-600 storageState) — it ' +
     'never logs in or embeds credentials. Use after capturing a session to freeze a ' +
-    'flow as a runner-executed test. Writes no session data into the project.',
+    'flow as a runner-executed test. Writes no session data into the project. Adds npm scripts ' +
+    '(absent keys only): test:e2e runs the suite through the machine-wide e2e slot, test:e2e:direct without it.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -55,13 +59,14 @@ async function handler(args: Record<string, unknown>): Promise<CallToolResult> {
 
   try {
     const written = scaffold({ session, out, force });
+    const scripts = addE2eScripts(out);
     const text =
       `Scaffolded an authenticated Playwright E2E suite into ${out}:\n` +
       written.map((rel) => `  ${rel}`).join('\n') +
       `\n\nSession: "${session}"\n` +
       `Next: install @playwright/test in that project, capture the login once with ` +
       `session_login({ name: "${session}", … }) (headed:true for 2FA), then ` +
-      `\`npx playwright test\`. The generated README covers CI injection and security.`;
+      `\`npm run test:e2e\`. ${scripts}\n${E2E_RUN_NOTE}\nThe generated README covers CI injection and security.`;
     return { content: [{ type: 'text', text }] };
   } catch (err) {
     return {

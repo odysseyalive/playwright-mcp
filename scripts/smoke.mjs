@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 // Smoke test: start dist/index.js over stdio, list tools, navigate to a data: URL.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { chromeRootDir, procTable, sameProcess } from '../dist/lifetime.js';
 
+const slotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-smoke-slot-'));
+process.on('exit', () => fs.rmSync(slotDir, { recursive: true, force: true }));
 const transport = new StdioClientTransport({
   command: process.execPath, // the Node running this test, not whatever `node` is first on PATH
   args: ['dist/index.js'],
   stderr: 'inherit',
+  // Its own e2e slot directory (src/e2e-slot.ts): the smoke server's render and
+  // its wrapper pointer stay out of the machine's live one.
+  env: { ...getDefaultEnvironment(), PLAYWRIGHT_MCP_E2E_SLOT_DIR: slotDir },
 });
 const client = new Client({ name: 'smoke', version: '0.0.0' });
 await client.connect(transport);

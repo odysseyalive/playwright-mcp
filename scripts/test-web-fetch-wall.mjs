@@ -22,6 +22,9 @@ const sessions = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-wall-'));
 process.on('exit', () => fs.rmSync(sessions, { recursive: true, force: true }));
 process.env.PLAYWRIGHT_MCP_SESSIONS = sessions;
 process.env.PLAYWRIGHT_MCP_READ_PROFILES = path.join(sessions, 'read-profiles');
+// Its own render lane (src/render-lane.ts), never the machine's live one.
+process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR = path.join(sessions, 'e2e-slot');
+const { renderStatus } = await import('../dist/render-lane.js');
 
 const {
   fetchUrl,
@@ -332,8 +335,12 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
       notifyWallWindow(host, { ...o, execFile: (_f, a, _o, done) => (sent.push(a), done(null), {}), env: { DISPLAY: ':0' }, platform: 'linux' });
     };
     const seams = { boundMs: 50, notify };
+    // The render slot is this server's only while a page renders: none is held
+    // through the human wait (2026-11-25, src/render-lane.ts).
+    const heldDuringWall = [];
     const open = () => {
       opened++;
+      heldDuringWall.push(renderStatus().then((r) => r.holders.filter((h) => h.pid === process.pid).length));
       return solve.promise;
     };
     const advice = awaitingHumanAdvice('127.0.0.1', name, WALL_WINDOW_MS);
@@ -341,6 +348,8 @@ test('web_fetch wall handling', { skip: !BROWSER_TESTS && 'set PLAYWRIGHT_MCP_TE
     const first = await fetchUrl({ url: `${base}/w1` }, { trust: 'stdio' }, open, seams);
     assert.equal(first.fetchStatus, 'awaiting-human');
     assert.equal(first.error, advice);
+    assert.deepEqual(await Promise.all(heldDuringWall), [0], 'no render slot held while the window waits');
+    assert.equal((await renderStatus()).holders.length, 0, 'none left behind either');
     // Busy: another fetch finds the window open, gets the same answer at once, and nudges the human.
     const t0 = Date.now();
     const second = await fetchUrl({ url: `${base}/w2` }, { trust: 'stdio' }, open, seams);

@@ -28,6 +28,14 @@ function walk(dir, out = []) {
 }
 
 const scripts = Object.keys(JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).scripts ?? {});
+// templates/ prose is written for the TARGET project, whose package.json gets the
+// e2e scripts the scaffolder adds (E2E_SCRIPTS in src/scaffold.ts, 2026-11-25).
+const templateScripts = [
+  ...readFileSync(join(ROOT, 'src', 'scaffold.ts'), 'utf8')
+    .split('export const E2E_SCRIPTS')[1]
+    .split('};')[0]
+    .matchAll(/'([\w:-]+)':/g),
+].map((m) => m[1]);
 const failures = [];
 
 for (const file of walk(ROOT)) {
@@ -44,7 +52,8 @@ for (const file of walk(ROOT)) {
 
   // 2. `npm run <script>` cited in prose must exist in package.json
   for (const m of text.matchAll(/npm run ([a-z][\w:-]*)/g)) {
-    if (!scripts.includes(m[1])) failures.push(`${rel}: cites \`npm run ${m[1]}\` — not in package.json`);
+    const known = rel.startsWith('templates') ? [...scripts, ...templateScripts] : scripts;
+    if (!known.includes(m[1])) failures.push(`${rel}: cites \`npm run ${m[1]}\` — not in package.json`);
   }
 }
 

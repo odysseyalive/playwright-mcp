@@ -19,6 +19,8 @@
 
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
+import { slotStatus } from '../e2e-slot.js';
+import { renderStatus } from '../render-lane.js';
 import { browserStatus, idleMs } from '../lifetime.js';
 import { pendingWalls } from './web-fetch.js';
 
@@ -29,7 +31,9 @@ const definition: Tool = {
     '(pid, session), kind, profile, age, idle time and memory. Read-only. A browser closes on its own ' +
     `after ${Math.round(idleMs() / 60_000)} min unused and when its server exits; the next call relaunches it. ` +
     'pendingWalls lists bot-wall windows web_fetch opened that wait on the human (host, opened at, cleared, ' +
-    'fetches waiting); once cleared, retry those fetches.',
+    'fetches waiting); once cleared, retry those fetches. e2eSlot shows the machine-wide e2e suite slot: ' +
+    'holder (session/cwd, command, held for, overdue) and the queue; renderLane shows the machine-wide render ' +
+    'slots every browser_* call and web_fetch render takes (holders, waiters by session). Renders never wait for a suite.',
   inputSchema: { type: 'object', properties: {} },
   annotations: { readOnlyHint: true },
 };
@@ -37,6 +41,7 @@ const definition: Tool = {
 async function handler(): Promise<CallToolResult> {
   const rows = await browserStatus();
   const walls = pendingWalls();
+  const [e2eSlot, renderLane] = await Promise.all([slotStatus(), renderStatus()]);
   return {
     content: [
       {
@@ -46,6 +51,8 @@ async function handler(): Promise<CallToolResult> {
             browsers: rows,
             idleCloseAfterSec: Math.round(idleMs() / 1000),
             pendingWalls: walls,
+            e2eSlot,
+            renderLane,
             note: rows.length
               ? 'serverAlive:false marks an owner that is gone; its browsers are reaped on the next pass.'
               : 'no playwright-mcp browser is running',

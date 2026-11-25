@@ -28,6 +28,15 @@ import {
   EgressBlockedError,
 } from '../dist/egress.js';
 
+// Its own e2e slot directory (src/e2e-slot.ts, 2026-11-25): renders here never
+// queue in, or show up in, the machine's live render lane.
+if (!process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR) {
+  const slotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-test-slot-'));
+  process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR = slotDir;
+  process.on('exit', () => fs.rmSync(slotDir, { recursive: true, force: true }));
+}
+
+
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 
 // The guard is remote-only. Nothing in this file may leave the flag set for the

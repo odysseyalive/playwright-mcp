@@ -45,6 +45,10 @@ export const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000';
 export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
+  // Run through `npm run test:e2e`, the suite waits its turn in playwright-mcp's
+  // machine-wide e2e slot, which exports its workers cap (half the cores by
+  // default) here. Unset otherwise: Playwright's own default then applies.
+  workers: Number(process.env.PLAYWRIGHT_MCP_E2E_WORKERS) || undefined,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   reporter: 'list',

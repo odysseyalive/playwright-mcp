@@ -39,8 +39,22 @@ session_login({ name: "__SESSION_NAME__", loginUrl: "…", successSignal: "…",
 Run the suite.
 
 ```bash
-BASE_URL=https://your-app.example npx playwright test
+BASE_URL=https://your-app.example npm run test:e2e
 ```
+
+The `test:e2e` script runs the suite inside playwright-mcp's machine-wide e2e
+slot: one suite at a time across every agent session on this machine, the rest
+queued in order, and an explicit `--workers` above half the cores lowered to that
+cap. A long run can detach and be polled:
+
+```bash
+npm run test:e2e -- --detach tests/checkout.spec.ts
+```
+
+It prints a log path at once. The log's last line becomes `done <exit code>`
+(or `done timeout` if the slot never came free). `npm run test:e2e:direct`
+runs Playwright without the slot, and so does `test:e2e` under `CI` or on a
+machine without playwright-mcp.
 
 CI: point `STORAGE_STATE` at a file materialized from a masked secret; it overrides the
 local session path. The storageState file is a bearer credential — never commit it.

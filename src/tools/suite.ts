@@ -27,8 +27,10 @@ import path from 'node:path';
 
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
+import { HELD_ENV, SlotError, WORKERS_ENV, acquireSlot, capWorkers, heldByAncestor, workersCap, type SlotHandle } from '../e2e-slot.js';
 import { wrapUntrusted } from '../exfil.js';
-import { scaffold, SUITE_TEMPLATE_DIR } from '../scaffold.js';
+import { addE2eScripts, scaffold, SUITE_TEMPLATE_DIR, E2E_RUN_NOTE } from '../scaffold.js';
+import type { ToolContext } from '../tools.js';
 
 const SKILL_REFS = path.join(SUITE_TEMPLATE_DIR, '.claude', 'skills', 'test-suite');
 
@@ -62,7 +64,8 @@ const scaffoldDefinition: Tool = {
     'capture, session-isolation rules, AND a project-local test-suite skill that teaches an ' +
     'AI to run/author/audit the suite, written to both .claude/skills/ (Claude Code) and ' +
     '.agents/skills/ (Codex; Crush reads either). Use when a project needs an e2e ' +
-    'suite built (superset of session_scaffold_tests). Writes only templates — no session ' +
+    'suite built (superset of session_scaffold_tests); adds test:e2e (through the machine-wide e2e slot) and ' +
+    'test:e2e:direct npm scripts when absent. Writes only templates — no session ' +
     'data, no credentials; all project specifics stay in the target repo.',
   inputSchema: {
     type: 'object',
@@ -101,13 +104,15 @@ async function scaffoldHandler(args: Record<string, unknown>): Promise<CallToolR
 
   try {
     const written = scaffold({ session, project, out, force, templateDir: SUITE_TEMPLATE_DIR });
+    const scripts = addE2eScripts(out);
     const text =
       `Scaffolded the e2e suite + methodology pack into ${out}:\n` +
       written.map((rel) => `  ${rel}`).join('\n') +
       `\n\nNext steps:\n` +
       `  1. Fill e2e-suite.config.json (env.up/down = what "test mode" means for this app; may stay empty).\n` +
       `  2. Capture the login once: session_login({ name: "${session}", loginUrl: …, successSignal: …, headed: true }).\n` +
-      `  3. npm i -D @playwright/test && npx playwright install chromium, then BASE_URL=… npx playwright test.\n` +
+      `  3. npm i -D @playwright/test && npx playwright install chromium, then BASE_URL=… npm run test:e2e.\n` +
+      `     ${scripts}\n     ${E2E_RUN_NOTE}\n` +
       `  4. The generated test-suite skill documents the run/author/audit discipline —\n` +
       `     fill its "Project blanks" section with this project's fixtures and conventions.\n` +
       `     It is written twice, .claude/skills/test-suite/ (Claude Code) and .agents/skills/test-suite/\n` +
@@ -132,7 +137,10 @@ const auditDefinition: Tool = {
     'report (reportPath), and get back per-failure dossiers (test, location, error, ' +
     'attachment paths) plus the TEST-DEFECT vs PRODUCT-BUG adjudication rubric. Use when ' +
     'tests fail and you must decide whether to fix the SCRIPT or report a real bug — the ' +
-    'audit discipline fixes e2e scripts only and never papers over product bugs.',
+    'audit discipline fixes e2e scripts only and never papers over product bugs. A run takes the ' +
+    "machine-wide e2e slot first (one suite at a time across every session; the result says how long it waited) " +
+    'and caps an explicit --workers in specs at the slot\'s workers cap. Do not run it while a run you started ' +
+    'yourself (playwright-mcp-slot) still holds the slot: it would wait behind you.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -160,6 +168,12 @@ const auditDefinition: Tool = {
       timeoutMs: {
         type: 'number',
         description: 'Run-mode timeout in ms (default 600000, max 1800000).',
+      },
+      slotWaitMs: {
+        type: 'number',
+        description:
+          'Run mode: how long to wait for the machine-wide e2e slot before giving up with the holder named ' +
+          '(default 1800000, max 14400000). Nothing runs on a timeout.',
       },
     },
     required: ['cwd'],
@@ -266,6 +280,7 @@ function runPlaywright(
   specs: string[],
   reportFile: string,
   timeoutMs: number,
+  ticketId: string,
 ): Promise<{ stderrTail: string }> {
   return new Promise((resolve, reject) => {
     const child = execFile(
@@ -283,6 +298,10 @@ function runPlaywright(
           // suite-scaffolded configs also read PLAYWRIGHT_JSON_OUTPUT.
           PLAYWRIGHT_JSON_OUTPUT_NAME: reportFile,
           PLAYWRIGHT_JSON_OUTPUT: reportFile,
+          // Inside the slot: a project script that calls the wrapper again passes
+          // through, and a generated config reads the workers cap.
+          [HELD_ENV]: ticketId,
+          [WORKERS_ENV]: String(workersCap()),
         },
       },
       (err, _stdout, stderr) => {
@@ -303,7 +322,52 @@ function runPlaywright(
   });
 }
 
-async function auditHandler(args: Record<string, unknown>): Promise<CallToolResult> {
+const SLOT_WAIT_DEFAULT_MS = 30 * 60_000;
+const SLOT_WAIT_MAX_MS = 4 * 3_600_000;
+const SLOT_HEARTBEAT_MS = 8_000; // under the client's 30 s idle cut (see startHeartbeat, src/tools/session.ts)
+
+/**
+ * Take the machine-wide e2e slot for one suite_audit run (src/e2e-slot.ts). The
+ * ticket's pid is this long-lived server, so the dead-pid rule would never free
+ * it: release is the caller's `finally`, and an aborted request leaves the queue.
+ * The heartbeat keeps the call open while it waits, saying who it waits behind.
+ */
+async function takeSuiteSlot(
+  cwd: string,
+  command: string,
+  waitMs: number,
+  ctx?: ToolContext,
+): Promise<{ handle?: SlotHandle; ticketId: string; note: string }> {
+  const parent = await heldByAncestor();
+  if (parent) return { ticketId: parent.id, note: 'E2E slot: already held by this server\'s parent run; no wait.' };
+  let latest = 'waiting for the machine-wide e2e slot';
+  const timer = ctx?.progress ? setInterval(() => ctx.progress!(latest), SLOT_HEARTBEAT_MS) : undefined;
+  timer?.unref();
+  try {
+    const handle = await acquireSlot({
+      command,
+      cwd,
+      via: 'suite_audit',
+      maxWaitMs: waitMs,
+      signal: ctx?.signal,
+      onProgress: (line) => (latest = `e2e slot ${line}`),
+    });
+    const waited = Math.round(handle.waitedMs / 1000);
+    return {
+      handle,
+      ticketId: handle.ticket.id,
+      note: waited >= 1 ? `E2E slot: waited ${waited < 120 ? `${waited}s` : `${Math.round(waited / 60)}m`} (last: ${latest}).` : 'E2E slot: free, no wait.',
+    };
+  } finally {
+    if (timer) clearInterval(timer);
+  }
+}
+
+async function auditHandler(args: Record<string, unknown>, ctx?: ToolContext): Promise<CallToolResult> {
+  let slot: SlotHandle | undefined;
+  // The run's JSON report is read into the result and then removed: one of these
+  // was left in the temp directory per run until 2026-11-25.
+  let reportDir: string | undefined;
   try {
     const cwd = path.resolve(String(args.cwd ?? ''));
     if (!cwd || !fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
@@ -312,6 +376,7 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
 
     let reportRaw: string;
     let ranNote = '';
+    let slotNote = '';
 
     if (args.reportPath) {
       const p = path.resolve(cwd, String(args.reportPath));
@@ -325,13 +390,18 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
       if (!hasConfig) throw new Error(`no playwright.config.* in ${cwd} — wrong project root?`);
 
       const cli = resolvePlaywrightCli(cwd); // throws the install hint before anything is created
-      const specs = Array.isArray(args.specs) ? args.specs.map(String) : [];
+      // An explicit --workers/-j above the slot's cap is lowered to it, as the wrapper does.
+      const capped = capWorkers(['playwright', 'test', ...(Array.isArray(args.specs) ? args.specs.map(String) : [])]);
+      const specs = capped.argv.slice(2);
       const timeoutMs = Math.min(Number(args.timeoutMs) || 600_000, 1_800_000);
-      const reportFile = path.join(
-        fs.mkdtempSync(path.join(os.tmpdir(), 'suite-audit-')),
-        'report.json',
-      );
-      const { stderrTail } = await runPlaywright(cli, cwd, specs, reportFile, timeoutMs);
+      const slotWaitMs = Math.min(Number(args.slotWaitMs) || SLOT_WAIT_DEFAULT_MS, SLOT_WAIT_MAX_MS);
+      const taken = await takeSuiteSlot(cwd, `suite_audit: playwright test ${specs.join(' ')}`.trim(), slotWaitMs, ctx);
+      slot = taken.handle;
+      reportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'suite-audit-'));
+      const reportFile = path.join(reportDir, 'report.json');
+      const { stderrTail } = await runPlaywright(cli, cwd, specs, reportFile, timeoutMs, taken.ticketId);
+      slot?.release();
+      slotNote = `\n${taken.note} ${capped.note}`;
       if (!fs.existsSync(reportFile)) {
         // Two provenances, two parts. The sentence is this server's; the tail is
         // a subprocess's stderr, which carries whatever a spec printed — page
@@ -344,7 +414,7 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
         );
       }
       reportRaw = fs.readFileSync(reportFile, 'utf8');
-      ranNote = `Ran: playwright test${specs.length ? ` ${specs.join(' ')}` : ''} via the project's own CLI ${cli} (cwd ${cwd})`;
+      ranNote = `Ran: playwright test${specs.length ? ` ${specs.join(' ')}` : ''} via the project's own CLI ${cli} (cwd ${cwd})${slotNote}`;
     } else {
       throw new Error(
         'Pass reportPath (parse the last run) or run: true (execute the suite) — ' +
@@ -392,9 +462,17 @@ async function auditHandler(args: Record<string, unknown>): Promise<CallToolResu
     return { content: [{ type: 'text', text }] };
   } catch (err) {
     return {
-      content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+      content: [
+        {
+          type: 'text',
+          text: err instanceof SlotError ? `${err.message} (suite_audit ran nothing.)` : err instanceof Error ? err.message : String(err),
+        },
+      ],
       isError: true,
     };
+  } finally {
+    slot?.release();
+    if (reportDir) fs.rmSync(reportDir, { recursive: true, force: true });
   }
 }
 

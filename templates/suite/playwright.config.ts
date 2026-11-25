@@ -45,7 +45,9 @@ export const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000';
 export default defineConfig({
   testDir: './tests',
   // Serial by default: suites that reconcile against a shared backend (DB rows,
-  // order counters) misattribute state under parallelism. Raise deliberately.
+  // order counters) misattribute state under parallelism. Raise deliberately,
+  // and never past PLAYWRIGHT_MCP_E2E_WORKERS: playwright-mcp's machine-wide e2e
+  // slot (`npm run test:e2e`) exports its workers cap there, half the cores by default.
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,

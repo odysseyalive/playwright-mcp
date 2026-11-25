@@ -23,6 +23,7 @@ const KEY_FILES = [
   path.join('tests', 'global-setup.ts'),
   path.join('tests', 'global-teardown.ts'),
   path.join('tests', 'example.spec.ts'),
+  path.join('tests', 'e2e-slot.mjs'),
   path.join('tests', 'helpers', 'page-integrity.ts'),
   path.join('tests', 'helpers', 'error-capture.ts'),
   path.join('tests', 'helpers', 'session-state.ts'),

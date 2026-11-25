@@ -40,6 +40,15 @@ import { BrowserQueue, browserQueue } from '../dist/queue.js';
 import { isLoopbackUrl, refusedConnection, withLoopbackWait } from '../dist/loopback-wait.js';
 import { createOutwardServer } from '../dist/index.js';
 
+// Its own e2e slot directory (src/e2e-slot.ts, 2026-11-25): renders here never
+// queue in, or show up in, the machine's live render lane.
+if (!process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR) {
+  const slotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-test-slot-'));
+  process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR = slotDir;
+  process.on('exit', () => fs.rmSync(slotDir, { recursive: true, force: true }));
+}
+
+
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const REAL_SKIP = !BROWSER_TESTS && 'opt-in: needs a real chrome (PLAYWRIGHT_MCP_TEST_BROWSER=1)';
 // The scratchpad rule is keyed on a uid, which Windows does not have; there it

@@ -11,7 +11,9 @@ assertion, add a skip, or widen a tolerance to make a PRODUCT-BUG failure pass.
 
 ## Phase 1 — Run and collect
 
-1. From the project root: `npx playwright test [specs]` — or call the playwright-mcp
+1. From the project root: `npm run test:e2e -- [specs]` (it waits for the machine-wide
+   e2e slot, so suites from other sessions never overlap; add `--detach` first for a
+   long run and poll the log it prints until its last line is `done <code>`) — or call the playwright-mcp
    `suite_audit` tool (`{ cwd, specs, run: true }`), which runs the suite and returns
    structured per-failure dossiers (error, location, attachments) ready to adjudicate.
    To triage the LAST run without re-running: `suite_audit({ cwd, reportPath: "test-results/last-run.json" })`.

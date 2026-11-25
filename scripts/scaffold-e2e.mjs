@@ -17,7 +17,7 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { scaffold } from '../dist/scaffold.js';
+import { addE2eScripts, scaffold, E2E_RUN_NOTE } from '../dist/scaffold.js';
 
 function parseArgs(argv) {
   const opts = { session: 'default', out: process.cwd(), force: false };
@@ -56,13 +56,15 @@ function main() {
     const written = scaffold(opts);
     console.log(`Scaffolded an authenticated Playwright E2E suite into ${opts.out}:`);
     for (const rel of written) console.log(`  ${rel}`);
+    const scripts = addE2eScripts(opts.out);
     console.log(
       `\nSession: "${opts.session}"\n\nNext:\n` +
         `  cd ${opts.out}\n` +
         `  npm install -D @playwright/test && npx playwright install chromium\n` +
         `  # capture the login once (from Claude Code):\n` +
         `  #   session_login({ name: "${opts.session}", loginUrl, successSignal, headed: true })\n` +
-        `  BASE_URL=http://localhost:3000 npx playwright test\n\n` +
+        `  BASE_URL=http://localhost:3000 npm run test:e2e\n\n` +
+        `${scripts}\n${E2E_RUN_NOTE}\n\n` +
         `See the generated e2e README for CI injection and security notes.`,
     );
   } catch (err) {

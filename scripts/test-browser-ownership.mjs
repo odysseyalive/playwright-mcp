@@ -30,6 +30,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Its own e2e slot directory (src/e2e-slot.ts, 2026-11-25): renders here never
+// queue in, or show up in, the machine's live render lane.
+if (!process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR) {
+  const slotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-test-slot-'));
+  process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR = slotDir;
+  process.on('exit', () => fs.rmSync(slotDir, { recursive: true, force: true }));
+}
+
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BROWSER_TESTS = process.env.PLAYWRIGHT_MCP_TEST_BROWSER === '1';
 const LINUX = process.platform === 'linux';

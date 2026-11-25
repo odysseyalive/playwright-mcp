@@ -37,6 +37,7 @@ import {
   type LoginResult,
 } from './session.js';
 import { looksLikeSignIn } from '../login-done.js';
+import { withRender } from '../render-lane.js';
 
 const log = (...args: unknown[]) => console.error('[playwright-mcp:web_fetch]', ...args);
 import {
@@ -151,12 +152,12 @@ export async function fetchUrl(
   // has to say what happened and how to get back in. A `wall-<host>` name is a
   // saved clearance, where "it may have lapsed" is the whole story.
   if (opts.session && !opts.session.toLowerCase().startsWith(WALL_SESSION_PREFIX)) {
-    return fetchOnce(opts, sessionWallAdvice(opts.session, wall, trusted && canShowWindow()));
+    return fetchOnce(opts, sessionWallAdvice(opts.session, wall, trusted && canShowWindow()), ctx);
   }
-  if (!trusted || opts.session || !wall) return fetchOnce(opts);
+  if (!trusted || opts.session || !wall) return fetchOnce(opts, undefined, ctx);
 
   const saved = fs.existsSync(sessionFilePath(wall));
-  const first = await fetchOnce(saved ? { ...opts, session: wall } : opts);
+  const first = await fetchOnce(saved ? { ...opts, session: wall } : opts, undefined, ctx);
   // An unreachable read used no clearance: nothing answered to be shown one.
   if (!walled.has(first)) {
     return saved && first.fetchStatus !== 'unreachable'
@@ -221,7 +222,7 @@ export async function fetchUrl(
   // The `wall-<host>` file is kept even when this retry is walled too: it is what a
   // real browser earned, it does no harm, and dropping it would not stop the next
   // fetch from opening the window again either (no file means a wall means a window).
-  const retry = await fetchOnce({ ...opts, session: wall }, solvedStillWalledAdvice());
+  const retry = await fetchOnce({ ...opts, session: wall }, solvedStillWalledAdvice(), ctx);
   return walled.has(retry) ? retry : withNote(retry, `bot wall cleared by the human; saved as "${wall}" for later fetches`);
 }
 
@@ -538,10 +539,30 @@ function withNote(r: FetchResult, note: string): FetchResult {
 }
 
 /**
+ * One render + extract, no wall handling, holding a machine-wide render slot
+ * (src/render-lane.ts) for exactly that long. Every page fetchUrl renders comes
+ * through here, so the slot is released before a bot-wall wait (WALL_WAIT_MS and
+ * the window are fetchUrl's, between two of these calls) and taken again for the
+ * retry. A cache hit renders nothing and takes no slot.
+ */
+async function fetchOnce(opts: FetchOptions, wallAdvice?: string, ctx?: ToolContext): Promise<FetchResult> {
+  const url = canonicalUrl(opts.url);
+  const cached = cache.get(`${url}|links=${opts.links ? 1 : 0}|scope=${opts.linkScope ?? 'outbound'}|session=${opts.session ?? ''}`);
+  if (cached) return cached;
+  // ctx: a cancelled fetch leaves the render queue, and a long wait heartbeats.
+  const { value, note } = await withRender('web_fetch', () => renderOnce(opts, wallAdvice), { signal: ctx?.signal, progress: ctx?.progress });
+  if (!note) return value;
+  // A copy, so the cached result does not carry this call's wait; still walled if it was.
+  const out = withNote(value, note);
+  if (walled.has(value)) walled.add(out);
+  return out;
+}
+
+/**
  * One render + extract, no wall handling. `wallAdvice` replaces the default tail of
  * a session read's wall error (see sessionWallAdvice).
  */
-async function fetchOnce(opts: FetchOptions, wallAdvice?: string): Promise<FetchResult> {
+async function renderOnce(opts: FetchOptions, wallAdvice?: string): Promise<FetchResult> {
   const url = canonicalUrl(opts.url);
   const linkScope: LinkScope = opts.linkScope ?? 'outbound';
   const cacheKey = `${url}|links=${opts.links ? 1 : 0}|scope=${linkScope}|session=${opts.session ?? ''}`;

@@ -6,6 +6,18 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createOutwardServer } from '../dist/index.js';
 import { customTools } from '../dist/tools.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Its own e2e slot directory (src/e2e-slot.ts, 2026-11-25): renders here never
+// queue in, or show up in, the machine's live render lane.
+if (!process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR) {
+  const slotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-test-slot-'));
+  process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR = slotDir;
+  process.on('exit', () => fs.rmSync(slotDir, { recursive: true, force: true }));
+}
+
 
 const upstreamTools = ['browser_navigate', 'browser_snapshot', 'browser_evaluate'].map((name) => ({
   name, description: name, inputSchema: { type: 'object', properties: { url: { type: 'string' } } },

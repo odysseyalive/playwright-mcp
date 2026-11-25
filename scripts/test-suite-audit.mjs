@@ -23,6 +23,12 @@ import { fileURLToPath } from 'node:url';
 
 import { suiteAuditTool } from '../dist/tools/suite.js';
 
+// A run takes the machine-wide e2e slot (src/e2e-slot.ts): its own slot directory,
+// so these tests never queue behind, or block, a real suite on this machine.
+const slotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwmcp-audit-slot-'));
+process.env.PLAYWRIGHT_MCP_E2E_SLOT_DIR = slotDir;
+process.on('exit', () => fs.rmSync(slotDir, { recursive: true, force: true }));
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(HERE, 'fixtures', 'suite');
 
