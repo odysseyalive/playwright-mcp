@@ -1,5 +1,7 @@
 # playwright-mcp
 
+> **Deprecated.** playwright-mcp is no longer developed. It is being replaced by **e2e-proof-mcp**, which does everything this server does and adds local e2e testing for Claude Code and Codex: https://github.com/odysseyalive/e2e-proof-mcp
+
 One install, every Claude Code or Codex project gets a real browser. Page fetching with citations already attached, site debugging with persistent logins, and the full Playwright toolset underneath. Wire it up once at user scope and stop thinking about it.
 
 ## What it is
